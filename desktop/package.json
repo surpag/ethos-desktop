@@ -1,0 +1,18 @@
+{
+  "name": "ethos-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ETHOS 桌面端：Electron 壳 + 本地 Python sidecar",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:web": "node scripts/build-web.mjs",
+    "start": "npm run build && node scripts/start.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "electron": "^33.2.0",
+    "typescript": "^5.7.2"
+  }
+}

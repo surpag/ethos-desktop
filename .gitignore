@@ -1,0 +1,30 @@
+# 依赖与产物
+node_modules/
+.next/
+dist/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.pytest-tmp/
+*.tsbuildinfo
+
+# 运行期数据（桌面端应落在 %APPDATA%\ETHOS，这里挡的是开发期误写）
+*.db
+*.db-shm
+*.db-wal
+workspace-volumes/
+workspace-sync/
+user-skills/
+project-skills/
+conflicts/
+
+# 配置与密钥
+.env
+.env.local
+.env.*.local
+
+# 打包产物
+release/
+build/
