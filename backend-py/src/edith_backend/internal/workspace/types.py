@@ -72,31 +72,6 @@ class BindLocalRootResponse(BaseModel):
     unmerged_files: int = 0
 
 
-class AllowedDomainsRequest(BaseModel):
-    """PUT /internal/workspaces/{id}/allowed-domains 的请求体（沙箱出口白名单）。
-
-    domains 为空 = 清除白名单（恢复全放通）。E2B 硬限制：每沙箱最多 10 个域名。
-    """
-
-    model_config = ConfigDict(
-        alias_generator=to_camel,
-        populate_by_name=True,
-        extra="forbid",
-    )
-
-    user_id: str = Field(..., min_length=1)
-    domains: list[str] = Field(default_factory=list, max_length=10)
-
-
-class AllowedDomainsResponse(BaseModel):
-    """出口白名单当前生效值。"""
-
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-
-    workspace_id: str
-    domains: list[str] = Field(default_factory=list)
-
-
 class GitRemoteRequest(BaseModel):
     """PUT /internal/workspaces/{id}/git-remote 的请求体。
 
@@ -130,11 +105,8 @@ class WorkspaceResponse(BaseModel):
     workspace_id: str
     name: str
     metadata: dict = Field(default_factory=dict)
-    has_volume: bool = False
     # 方案 B：绑定的本地目录（空 = 未绑定）
     local_root: str = ""
-    # 沙箱出口白名单（空 = 全放通）；存于 metadata.allowedDomains
-    allowed_domains: list[str] = Field(default_factory=list)
     # D-a：绑定的 Git 远端仓库地址（空 = 未绑定）；存于 metadata.gitRemoteUrl
     git_remote_url: str = ""
 

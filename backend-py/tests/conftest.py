@@ -39,17 +39,3 @@ def client(tmp_path_factory) -> TestClient:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
-
-
-@pytest.fixture(autouse=True)
-def _isolate_sync_state(tmp_path, monkeypatch):
-    """把同步共识状态重定向到临时目录。
-
-    生产默认落在数据库同级的 workspace-sync/；测试若沿用会污染仓库，
-    且各用例共用同一 workspace_id 而互相干扰（前一个用例写下的共识集合
-    会让后一个用例误判「对侧被删了」）。
-    """
-    from edith_backend.internal.workspace import sync as sync_module
-
-    state_dir = tmp_path / "_sync_state"
-    monkeypatch.setattr(sync_module, "sync_state_dir", lambda: state_dir)

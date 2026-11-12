@@ -428,21 +428,6 @@ def test_workspace_lanes_mutual_exclusion() -> None:
     assert lanes.acquire("u1", "w2", "s1") is True
 
 
-def test_allowed_domains_from_env(monkeypatch: object) -> None:
-    """出口白名单来源：环境变量兜底，逗号/分号/空白分隔，去空。"""
-
-    from edith_backend.internal.sandbox.service import allowed_domains_from_env
-
-    monkeypatch.setenv("EDITH_SANDBOX_ALLOWED_DOMAINS", "pypi.org, files.pythonhosted.org; github.com")
-    assert allowed_domains_from_env() == [
-        "pypi.org",
-        "files.pythonhosted.org",
-        "github.com",
-    ]
-    monkeypatch.setenv("EDITH_SANDBOX_ALLOWED_DOMAINS", "  ")
-    assert allowed_domains_from_env() == []
-
-
 def test_sensitive_path_violation() -> None:
     """P2-6：文件工具对 .git/.env/私钥/凭据文件一律拒绝；普通文件与 .pub 放行。"""
 
@@ -494,80 +479,6 @@ def test_run_command_rejects_git() -> None:
         assert cmds.called == ["echo hi"], cmds.called
 
     asyncio.run(go())
-
-
-def test_e2b_backend_ensure_volume_returns_name(monkeypatch: object) -> None:
-    """M1.5：E2BVolumeBackend.ensure_volume 懒创建并返回 volume_name 供沙箱挂载。"""
-
-    import asyncio
-    from types import SimpleNamespace
-
-    import edith_backend.internal.workspace.volume_backend as vb
-    from edith_backend.internal.workspace.volume_backend import E2BVolumeBackend
-
-    class FakeVolume:
-        def __init__(self, name: str) -> None:
-            self.name = name
-            self.volume_id = "vid-1"
-            self.token = "tok"
-
-    created: list[str] = []
-
-    async def fake_create(**kwargs: object) -> FakeVolume:
-        created.append(kwargs["name"])
-        return FakeVolume(kwargs["name"])
-
-    monkeypatch.setattr(vb, "AsyncVolume", SimpleNamespace(create=fake_create))
-
-    async def fake_load(user_id: str, workspace_id: str) -> None:
-        return None
-
-    async def fake_save(*args: object, **kwargs: object) -> None:
-        return None
-
-    store = SimpleNamespace(load_volume=fake_load, save_volume=fake_save)
-    backend = E2BVolumeBackend(store)  # type: ignore[arg-type]
-
-    name = asyncio.run(backend.ensure_volume("u1", "w1"))
-    assert name == "ws_w1_u1"
-    assert created == ["ws_w1_u1"]
-
-
-def test_e2b_backend_does_not_rebuild_on_connect_failure(monkeypatch: object) -> None:
-    """M1.5 隐患修复：已建卷 connect 失败时上抛，绝不静默重建（重建会丢数据）。"""
-
-    import asyncio
-    from types import SimpleNamespace
-
-    import edith_backend.internal.workspace.volume_backend as vb
-    from edith_backend.internal.workspace.volume_backend import E2BVolumeBackend
-
-    async def fake_connect(volume_id: str) -> None:
-        raise ConnectionError("network blip")
-
-    async def fake_create(**kwargs: object) -> None:
-        raise AssertionError("connect 失败后不应重建卷")
-
-    async def fake_save(*args: object, **kwargs: object) -> None:
-        raise AssertionError("connect 失败后不应覆盖 DB 绑定")
-
-    monkeypatch.setattr(
-        vb,
-        "AsyncVolume",
-        SimpleNamespace(connect=fake_connect, create=fake_create),
-    )
-
-    async def fake_load(user_id: str, workspace_id: str) -> tuple[str, str, str]:
-        return ("vid-1", "ws_abc_user1", "tok")
-
-    store = SimpleNamespace(load_volume=fake_load, save_volume=fake_save)
-    backend = E2BVolumeBackend(store)  # type: ignore[arg-type]
-
-    try:
-        asyncio.run(backend.ensure_volume("u1", "w1"))
-    except ConnectionError:
-        return  # 预期：上抛而非静默重建
-    raise AssertionError("connect 失败应上抛 ConnectionError")
 
 
 def test_git_credentials_roundtrip() -> None:

@@ -2,7 +2,7 @@
 
 对应 wuu `internal/tools/toolkit.go` 的 `nonInteractiveShellEnv`。
 `GIT_TERMINAL_PROMPT=0` 是必须项——否则需要认证的 `git pull` 会挂住等凭据输入，
-任务空转、计费照跑。执行时以 `envs=` 覆盖式合并（E2B 对同名键覆盖、保留其余）。
+任务空转、计费照跑。执行时以 `envs=` 覆盖式合并（按名覆盖、保留其余）。
 """
 
 from __future__ import annotations

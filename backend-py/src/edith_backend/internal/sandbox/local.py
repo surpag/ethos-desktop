@@ -1,10 +1,10 @@
-"""本机沙箱：把 E2B 的文件 / 命令原语换成对本地目录的操作。
+"""本机沙箱：用本地目录实现工具层需要的文件 / 命令原语。
 
-**为什么是"形状兼容"而不是"重新抽象"**
+**契约位置**
 `tools.py` 有一千行，全部通过 `sandbox.files.*` / `sandbox.commands.*` 与沙箱交互。
-只要本类提供同名同形状的 `.files` / `.commands` / `.sandbox_id`，工具层一行都不用改，
-分歧就只存在于 `service.workspace()` 那一个选择点上——这比在每个 `_op_*` 里判后端
-要可靠得多（后者迟早会漏一个）。
+本类就是这套契约的**唯一**实现：`.files` / `.commands` / `.sandbox_id` 三个属性，
+文件项形状见 `types.FileType`。工具层不认识"后端"这个概念，也就不存在
+「换一条路走」的分支要维护。
 
 **安全边界（诚实说明）**
 文件原语做了路径约束：只允许 `WORKSPACE.root`（`/home/user`）之下，`..` 与
@@ -30,16 +30,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from e2b import FileType
-
 from ...config import data_root
 from ..skills.types import SKILLS_PATH
 from ..workspace.layout import WORKSPACE
+from .types import FileType
 
 logger = logging.getLogger(__name__)
 
 # 单次读文件上限：本地磁盘没有网络成本，但没有上限时一次 `files.read` 就能把
-# 几百 MB 塞进上下文。与 E2B 后端的 `SYNC_MAX_FILE_BYTES` 保持同一量级。
+# 几百 MB 塞进上下文。
 MAX_READ_BYTES = 10 * 1024 * 1024
 
 
@@ -53,7 +52,7 @@ class SandboxPathError(PermissionError):
 
 @dataclass
 class LocalEntryInfo:
-    """与 E2B `EntryInfo` 的形状子集对齐（tools.py 只用到这 4 个字段）。"""
+    """目录项：工具层只用到这 4 个字段。"""
 
     name: str
     path: str
@@ -63,7 +62,7 @@ class LocalEntryInfo:
 
 @dataclass
 class LocalCommandResult:
-    """与 E2B `CommandResult` 的形状子集对齐。"""
+    """命令执行结果。"""
 
     stdout: str = ""
     stderr: str = ""
@@ -72,7 +71,7 @@ class LocalCommandResult:
 
 @dataclass
 class LocalCommandInfo:
-    """与 E2B `CommandInfo` 的形状子集对齐。"""
+    """后台进程句柄。"""
 
     pid: int
     cmd: str
@@ -100,7 +99,7 @@ def _safe_segment(raw: str) -> str:
 # ---- 命令执行环境 ----
 #
 # 三条都来自同一个事实：**模型是按 Linux 习惯写命令的**。
-# 它看到的是 `/home/user`、`sed`、`wc -l`、管道；E2B 里这些都成立，本机不成立。
+# 它看到的是 `/home/user`、`sed`、`wc -l`、管道；这些在 Linux 沙箱里天然成立，本机不成立。
 # 所以本地后端的职责不是"尽量能跑"，而是把这三件事补齐，否则每条命令都是试错。
 
 # Git for Windows 自带的 bash 是最好的替代品：POSIX 语义 + 能在 Windows 上跑 exe。
@@ -244,7 +243,7 @@ class LocalSandbox:
     def open(cls, user_id: str, session_id: str) -> LocalSandbox:
         """打开（或重建）本地沙箱。
 
-        与 E2B 的关键差别：目录被外部删掉时这里直接重建，不会像失效的
+        与远端沙箱的关键差别：目录被外部删掉时这里直接重建，不会像失效的
         `sandbox_id` 那样让 `connect` 永远失败。本地模式下「沙箱」就是一个目录，
         重建的代价是零。
         """
@@ -287,10 +286,9 @@ class LocalSandbox:
         `.`（沙箱根本身）。其他绝对路径（`/etc`、`C:\\...`）一律拒绝——
         沙箱的语义就是"只有这一个根"。
 
-        特例：`workspace/{id}/...` 直接落到 `workspace-volumes/{id}/`，**不做同步**。
-        这是本地后端最重要的简化——E2B 后端里沙箱与权威副本是两份，才需要
-        `workspace/sync.py` 那 842 行的推送/回拉/护栏/熔断；本地模式下它们
-        本来就是同一个目录，同步问题从根上不存在。
+        特例：`workspace/{id}/...` 直接落到 `workspace-volumes/{id}/`。
+        这是本地模式最重要的简化——**只有一份文件**。凡是要在"沙箱副本"与
+        权威副本之间搬运、比对、熔断的设计，在这里都没有存在前提。
         """
         raw = (virtual or "").replace("\\", "/").strip()
         if raw.startswith(WORKSPACE.root):
@@ -412,7 +410,7 @@ class LocalSandbox:
         **为什么挂 `workspace/` 而不是逐个 `workspace/{id}`**：接在 `{id}` 上时，
         MSYS 把联接识别成符号链接，于是 `ls -la` 只显示链接本身、
         `find` 默认不进去——这两条都是模型最常用的探查命令。挂在上一层，
-        `workspace/{id}` 就是普通目录，行为与 E2B 的挂载点一致。
+        `workspace/{id}` 就是普通目录，`ls`/`find` 都能正常进入。
         代价是 shell 能看到同级工作区：命令本来就是 `unrestricted`（能读整台机器），
         这不是新增暴露面；文件工具的边界仍由 `resolve()` 与授权层守。
 
@@ -473,7 +471,7 @@ class LocalSandbox:
 
 
 class LocalFiles:
-    """E2B `sandbox.files` 的本机实现。"""
+    """`sandbox.files` 的实现。"""
 
     def __init__(self, sandbox: LocalSandbox) -> None:
         self._sb = sandbox
@@ -508,7 +506,7 @@ class LocalFiles:
             return [self._entry(real)]
 
         entries: list[LocalEntryInfo] = []
-        # depth 语义与 E2B 一致：1 = 只列直接子项，2 = 再往下一层。
+        # depth 语义：1 = 只列直接子项，2 = 再往下一层。
         # 用显式栈而不是递归：深层目录 + 符号链接环不会把栈打爆。
         stack: list[tuple[Path, int]] = [(real, 1)]
         while stack:
@@ -530,7 +528,7 @@ class LocalFiles:
     async def remove(self, path: str) -> None:
         """删除文件或目录（目录递归）。
 
-        E2B 的 `files.remove` 对目录同样是递归的，这里保持一致。
+        `files.remove` 对目录是递归的，这里保持一致。
         调用方（`_prune_empty_parents`）已经先 list 确认空目录才删，
         所以递归删除不会误伤。
         """
@@ -577,7 +575,7 @@ class LocalFiles:
 
 
 class LocalCommands:
-    """E2B `sandbox.commands` 的本机实现。"""
+    """`sandbox.commands` 的实现。"""
 
     def __init__(self, sandbox: LocalSandbox) -> None:
         self._sb = sandbox
@@ -676,7 +674,7 @@ class LocalCommands:
         真实路径只在这里出现一次。
 
         为什么不能靠"让模型用 Windows 路径"绕过：`/home/user` 写在 prompt 里，
-        改成 `D:\\...` 会让同一条规则在云端（E2B）和本地两端都不一样，
+        改成 `D:\\...` 会让同一条规则在不同执行环境里都不一样，
         而且模型对 `/home/user` 的先验远比对一个 UUID 目录强。
         """
         root = WORKSPACE.root

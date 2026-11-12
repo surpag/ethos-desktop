@@ -12,9 +12,6 @@ import posixpath
 import shlex
 from collections.abc import Awaitable, Callable
 
-from e2b import AsyncSandbox, FileType
-from e2b.sandbox.commands.command_handle import CommandExitException
-
 from ..gitops import (
     CloneUrlRejected,
     GitCommandRejected,
@@ -24,8 +21,9 @@ from ..gitops import (
 from ..skills.budget import charge_skill_load
 from ..skills.types import SKILL_FILE, SKILLS_PATH
 from ..tools import COMMAND_ERROR, TOOL_FAILURE, command_stderr_hint, tool_error_result
-from ..workspace.volume_backend import WorkspaceSyncError
+from .local import LocalSandbox
 from .service import Service
+from .types import FileType
 from .workspace import ALLOWED_BASE_DIRS, WORKSPACE, relative_path, workspace_path
 
 logger = logging.getLogger(__name__)
@@ -57,7 +55,7 @@ def _guide(action: str) -> str:
 def _join_argv(command: str, argv: list[str] | None) -> str:
     """把程序名与参数数组合并成完整命令行。
 
-    e2b 2.x 的 `Commands.run(cmd)` 只接收完整命令字符串（旧版 API 才有 `args` 参数），
+    沙箱的命令接口只接收完整命令字符串（没有独立的 `args` 参数），
     因此当模型把参数拆进 `args` 数组时，需在此合并；`argv` 为空时原样返回 command
     （此时模型通常已把完整命令写在 command 里）。
     """
@@ -198,7 +196,7 @@ def _audit_digest(args: dict, limit: int = 300) -> str:
     return f"{text[:limit]}…(len={len(text)})"
 
 
-async def _list_dir_names(sandbox: AsyncSandbox, directory: str) -> list[str]:
+async def _list_dir_names(sandbox: LocalSandbox, directory: str) -> list[str]:
     """列出目录下的条目名（仅用于错误提示）；目录不存在或失败时静默返回空列表。"""
     try:
         entries = await sandbox.files.list(directory)
@@ -219,13 +217,13 @@ def _workspace_root_of(path: str) -> str:
     return "/".join(parts[: idx + 2])
 
 
-async def _prune_empty_parents(sandbox: AsyncSandbox, file_path: str) -> list[str]:
+async def _prune_empty_parents(sandbox: LocalSandbox, file_path: str) -> list[str]:
     """删除文件/目录后回收空父目录，上溯到 workspace/{id} 根为止。
 
     为什么需要：`sandbox_delete_path mp/agent-learn` 只会删掉子目录，父目录 `mp`
     留成空壳，文件列表里这个名字还在 —— 用户与 Agent 都容易误判为「没删掉」。
 
-    安全性：E2B `files.remove` 对目录是**递归删除**的，所以必须先 list 确认为空
+    安全性：`files.remove` 对目录是**递归删除**的，所以必须先 list 确认为空
     才能删；否则会把父目录下其它未参与本次删除的文件一起删掉。
     """
     root = _workspace_root_of(file_path)
@@ -253,7 +251,7 @@ _LARGE_FILE_BYTES = 512 * 1024  # 超过此大小改用 sed 按行读，避免�
 
 
 async def _read_file_slice(
-    sandbox: AsyncSandbox, file_path: str, start_line: int, limit: int
+    sandbox: LocalSandbox, file_path: str, start_line: int, limit: int
 ) -> tuple[list[str], int, int]:
     """读取文件指定行区间，返回 (选中行, 总行数, 结束行)。
 
@@ -402,7 +400,7 @@ class SandboxToolSet:
         if handler is None:
             return json.dumps({"error": f"unknown sandbox tool: {name}", "kind": TOOL_FAILURE})
         if name == "git_remote_branches":
-            # 只读远端查询不依赖沙箱：不该为一次查询去拉 E2B（秒级 + 有成本）
+            # 只读远端查询不依赖沙箱：不该为一次查询去启动沙箱
             try:
                 return json.dumps(
                     await self._op_git_remote_branches(user_id, workspace_id),
@@ -411,19 +409,8 @@ class SandboxToolSet:
             except Exception as exc:  # noqa: BLE001 - 与下方统一错误出口一致
                 return tool_error_result(name, exc)
         try:
-            sandbox = await self._service.workspace(user_id, session_id, workspace_id)
-        except WorkspaceSyncError as exc:
-            # 工作区文件同步未完成：暂时性、可重试，明确提示 Agent 稍后重试，而非拿到空沙箱盲目执行
-            return json.dumps(
-                {
-                    "error": str(exc),
-                    "kind": COMMAND_ERROR,
-                    "retryable": True,
-                    "suggestion": "工作区文件尚未同步到沙箱，请稍后重试；若持续失败，请告知用户检查工作区上传是否完整。",
-                },
-                ensure_ascii=False,
-            )
-        except Exception as exc:  # noqa: BLE001 - E2B 不可用降级：工具结果返回错误，Agent 转纯文本
+            sandbox = await self._service.workspace(user_id, session_id)
+        except Exception as exc:  # noqa: BLE001 - 沙箱不可用降级：工具结果返回错误，Agent 转纯文本
             logger.warning("sandbox unavailable tool=%s user=%s error=%s", name, user_id, exc)
             return json.dumps(
                 {"error": f"sandbox unavailable: {exc}", "kind": TOOL_FAILURE, "retryable": False},
@@ -482,9 +469,6 @@ class SandboxToolSet:
                         },
                         ensure_ascii=False,
                     )
-            # B3：写类工具执行前，先把本地新增/修改推送到沙箱（Agent 看到最新本地代码）
-            if name in _MUTATING_TOOLS and workspace_id:
-                await self._service.sync_local_to_sandbox(user_id, workspace_id, sandbox)
             # git 工具需要工作区根作为 cwd，单独分发（其余工具走统一 handler）
             if name == "git":
                 result = await self._op_git(sandbox, arguments, workspace_id, user_id)
@@ -512,14 +496,6 @@ class SandboxToolSet:
                     workspace_id,
                     _audit_digest(arguments),
                 )
-            # Local 后端：write_file 同时写回本地源，避免 Agent 修改只停留在沙箱副本（双副本分裂）
-            if name == "sandbox_write_file" and workspace_id:
-                await self._service.write_local_workspace_file(
-                    user_id, arguments["path"], arguments["content"]
-                )
-            # B2：写类工具执行后，把沙箱中与本地不同的文件拉回本地（覆盖 run_command 盲区）
-            if name in _MUTATING_TOOLS and workspace_id:
-                await self._service.sync_sandbox_to_local(user_id, workspace_id, sandbox)
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001 - 工具错误转为结果返回（业务错误 → command_error，系统故障 → tool_failure）
             return tool_error_result(name, exc)
@@ -544,7 +520,7 @@ class SandboxToolSet:
     # ---- 文件操作 ----
 
     async def _op_sandbox_list_files(
-        self, sandbox: AsyncSandbox, args: dict, workspace_id: str = ""
+        self, sandbox: LocalSandbox, args: dict, workspace_id: str = ""
     ) -> dict:
         directory = workspace_path(
             args.get("path", ""), allow_root=True, current_workspace_id=workspace_id
@@ -557,7 +533,7 @@ class SandboxToolSet:
                              "size": e.size or 0} for e in entries]}
 
     async def _op_sandbox_read_file(
-        self, sandbox: AsyncSandbox, args: dict, workspace_id: str = ""
+        self, sandbox: LocalSandbox, args: dict, workspace_id: str = ""
     ) -> dict:
         file_path = workspace_path(
             args["path"], allow_root=False, current_workspace_id=workspace_id
@@ -667,7 +643,7 @@ class SandboxToolSet:
         }
 
     async def _op_sandbox_write_file(
-        self, sandbox: AsyncSandbox, args: dict, workspace_id: str = ""
+        self, sandbox: LocalSandbox, args: dict, workspace_id: str = ""
     ) -> dict:
         file_path = workspace_path(
             args["path"], allow_root=False, current_workspace_id=workspace_id
@@ -676,7 +652,7 @@ class SandboxToolSet:
         return {"path": relative_path(file_path), "message": "file saved"}
 
     async def _op_sandbox_make_directory(
-        self, sandbox: AsyncSandbox, args: dict, workspace_id: str = ""
+        self, sandbox: LocalSandbox, args: dict, workspace_id: str = ""
     ) -> dict:
         directory = workspace_path(
             args["path"], allow_root=False, current_workspace_id=workspace_id
@@ -685,7 +661,7 @@ class SandboxToolSet:
         return {"path": relative_path(directory), "message": "directory created"}
 
     async def _op_sandbox_move_path(
-        self, sandbox: AsyncSandbox, args: dict, workspace_id: str = ""
+        self, sandbox: LocalSandbox, args: dict, workspace_id: str = ""
     ) -> dict:
         src = workspace_path(
             args["from"], allow_root=False, current_workspace_id=workspace_id
@@ -697,7 +673,7 @@ class SandboxToolSet:
         return {"path": relative_path(dst), "message": "path moved"}
 
     async def _op_sandbox_delete_path(
-        self, sandbox: AsyncSandbox, args: dict, workspace_id: str = ""
+        self, sandbox: LocalSandbox, args: dict, workspace_id: str = ""
     ) -> dict:
         file_path = workspace_path(
             args["path"], allow_root=False, current_workspace_id=workspace_id
@@ -713,7 +689,7 @@ class SandboxToolSet:
 
     # ---- 进程操作 ----
 
-    async def _op_sandbox_run_command(self, sandbox: AsyncSandbox, args: dict) -> dict:
+    async def _op_sandbox_run_command(self, sandbox: LocalSandbox, args: dict) -> dict:
         command = (args.get("command") or "").strip()
         if not command:
             raise ValueError("command is required")
@@ -732,18 +708,16 @@ class SandboxToolSet:
         timeout = args.get("timeoutMs") or DEFAULT_COMMAND_TIMEOUT_MS
         if timeout < 1:
             raise ValueError("command timeout must be positive")
-        try:
-            result = await sandbox.commands.run(
-                _join_argv(command, args.get("args")),
-                envs=args.get("envs"),
-                cwd=WORKSPACE.work_path(),
-                timeout=timeout / 1000,
-            )
-        except CommandExitException as exc:
-            # 非零退出是命令的**业务结果**（git 非仓库=128、cat 找不到文件等），
-            # 不是系统故障。E2B 的 commands.run 会把非零退出抛成异常，这里转回结果，
-            # 否则会被 tool_error_result 误判为 tool_failure（retryable=False）并触发熔断。
-            result = exc
+        # 非零退出是命令的**业务结果**（git 非仓库=128、cat 找不到文件等），不是系统故障：
+        # `commands.run` 直接返回带 exit_code 的结果对象，不抛异常。下面的判定只在
+        # `exitCode != 0` 时把 kind 标成 command_error（retryable=True），不能当成
+        # tool_failure —— 那会 retryable=False 并触发熔断，一次拼错路径就打断整轮。
+        result = await sandbox.commands.run(
+            _join_argv(command, args.get("args")),
+            envs=args.get("envs"),
+            cwd=WORKSPACE.work_path(),
+            timeout=timeout / 1000,
+        )
         stdout, stdout_truncated = _shorten(result.stdout or "")
         stderr, stderr_truncated = _shorten(result.stderr or "")
         resp = {"exitCode": result.exit_code or 0, "stdout": stdout, "stderr": stderr,
@@ -760,7 +734,7 @@ class SandboxToolSet:
                 resp["suggestion"] = suggestion
         return resp
 
-    async def _op_sandbox_start_process(self, sandbox: AsyncSandbox, args: dict) -> dict:
+    async def _op_sandbox_start_process(self, sandbox: LocalSandbox, args: dict) -> dict:
         command = (args.get("command") or "").strip()
         if not command:
             raise ValueError("command is required")
@@ -772,13 +746,13 @@ class SandboxToolSet:
         pid = handle.pid if hasattr(handle, "pid") else 0
         return {"pid": pid, "logPath": ""}
 
-    async def _op_sandbox_list_processes(self, sandbox: AsyncSandbox, args: dict) -> dict:
+    async def _op_sandbox_list_processes(self, sandbox: LocalSandbox, args: dict) -> dict:
         processes = await sandbox.commands.list()
         return {"processes": [{"pid": p.pid, "command": p.cmd, "args": p.args or [],
                                "cwd": relative_path(p.cwd) if p.cwd and p.cwd.startswith(WORKSPACE.root) else (p.cwd or ""),
                                "tag": p.tag or ""} for p in processes]}
 
-    async def _op_sandbox_kill_process(self, sandbox: AsyncSandbox, args: dict) -> dict:
+    async def _op_sandbox_kill_process(self, sandbox: LocalSandbox, args: dict) -> dict:
         pid = args.get("pid") or 0
         if pid == 0:
             raise ValueError("process ID is required")
@@ -788,7 +762,7 @@ class SandboxToolSet:
     # ---- git（只读 + clone + 本地写，M2/M3）----
 
     async def _op_git(
-        self, sandbox: AsyncSandbox, args: dict, workspace_id: str, user_id: str = ""
+        self, sandbox: LocalSandbox, args: dict, workspace_id: str, user_id: str = ""
     ) -> dict:
         """执行 git 命令：白名单 + SSRF + 非交互 env + 提交身份 + 输出脱敏（见 ..gitops）。
 

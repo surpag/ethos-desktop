@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 
 from edith_backend.internal.agentrun.configuration import (
     append_uploads,
@@ -11,11 +10,6 @@ from edith_backend.internal.agentrun.configuration import (
 )
 from edith_backend.internal.userconfig.mcp import MCPServer
 from edith_backend.internal.userconfig.mcp_runtime import MCPToolContext, _toolset_name
-from edith_backend.internal.volume.trace import (
-    token_fingerprint,
-    trace_enabled,
-    user_fingerprint,
-)
 
 
 def test_message_with_uploads_empty() -> None:
@@ -71,25 +65,3 @@ def test_mcp_tool_context_execute_unknown() -> None:
     context = MCPToolContext()
     result = asyncio.run(context.execute("no_such_tool", {}))
     assert "unknown MCP tool" in result
-
-
-def test_user_fingerprint_deterministic() -> None:
-    assert user_fingerprint("user_abc") == user_fingerprint("user_abc")
-    assert len(user_fingerprint("user_abc")) == 12
-
-
-def test_user_fingerprint_hides_plaintext() -> None:
-    assert user_fingerprint("user_3Hm1pmVlyWo1rW9BYe0kY6ja3DM") != "user_3Hm1pmVlyWo1rW9BYe0kY6ja3DM"
-
-
-def test_token_fingerprint_hex() -> None:
-    digest = token_fingerprint("secret-token")
-    assert len(digest) == 64
-    assert digest != "secret-token"
-
-
-def test_trace_enabled_default_false() -> None:
-    os.environ.pop("EDITH_E2B_DEBUG_HTTP", None)
-    assert trace_enabled() is False
-
-

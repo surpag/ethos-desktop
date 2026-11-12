@@ -10,8 +10,6 @@ const SESSION_KEY = "ethos.sessionId";
 type Workspace = {
   workspaceId: string;
   name: string;
-  // 沙箱出口白名单（空 = 全放通）；存于 metadata.allowedDomains，最多 10 个
-  allowedDomains?: string[];
   // D-a：绑定的 Git 远端仓库地址（空 = 未绑定）
   gitRemoteUrl?: string;
 };
@@ -22,7 +20,6 @@ export function WorkspaceSettings() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [instruction, setInstruction] = useState("");
-  const [domains, setDomains] = useState("");
   const [gitRemote, setGitRemote] = useState("");
   const [message, setMessage] = useState("");
 
@@ -39,7 +36,6 @@ export function WorkspaceSettings() {
       const match = value.workspaces.find((w) => w.workspaceId === saved);
       if (match) {
         setSelectedId(match.workspaceId);
-        setDomains((match.allowedDomains ?? []).join(", "));
         setGitRemote(match.gitRemoteUrl ?? "");
         void loadInstruction(match.workspaceId);
       }
@@ -61,39 +57,9 @@ export function WorkspaceSettings() {
     setSelectedId(workspaceId);
     localStorage.setItem(STORAGE_KEY, workspaceId);
     const match = workspaces.find((w) => w.workspaceId === workspaceId);
-    setDomains((match?.allowedDomains ?? []).join(", "));
     setGitRemote(match?.gitRemoteUrl ?? "");
     void loadInstruction(workspaceId);
     setMessage("已切换工作区，聊天将自动带上该工作区指令。");
-  }
-
-  async function saveDomains() {
-    if (!selectedId) return;
-    const list = domains
-      .split(/[,;\s]+/)
-      .map((d) => d.trim())
-      .filter(Boolean);
-    const response = await fetch(
-      `/api/workspaces/${encodeURIComponent(selectedId)}/allowed-domains`,
-      {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ domains: list }),
-      },
-    );
-    if (!response.ok) {
-      const body = (await response.json().catch(() => null)) as { message?: string } | null;
-      setMessage(body?.message ?? "保存白名单失败：请检查域名格式与数量（最多 10 个）。");
-      return;
-    }
-    setWorkspaces((current) =>
-      current.map((w) => (w.workspaceId === selectedId ? { ...w, allowedDomains: list } : w)),
-    );
-    setMessage(
-      list.length
-        ? `白名单已保存（${list.length} 个域名），下一次沙箱连接时生效。`
-        : "白名单已清空，沙箱恢复全放通。",
-    );
   }
 
   async function saveGitRemote() {
@@ -225,26 +191,6 @@ export function WorkspaceSettings() {
                 清空
               </button>
             </div>
-
-            <label className="block text-xs font-medium text-muted">
-              沙箱出口白名单（可选，最多 10 个域名，逗号分隔；留空 = 全放通）
-              <input
-                className="ui-field mt-2 h-9 w-full px-3 text-sm"
-                placeholder="pypi.org, files.pythonhosted.org, *.github.com"
-                value={domains}
-                spellCheck={false}
-                onChange={(event) => setDomains(event.target.value)}
-              />
-            </label>
-            <p className="text-[11px] leading-4 text-muted">
-              配置后沙箱只能访问这些域名（HTTP/HTTPS）。用于限制 Agent 联网范围、
-              防止数据外泄；安装依赖请记得放行对应源（如 pypi.org、registry.npmjs.org）。
-              下一次沙箱连接时生效。
-            </p>
-            <button className="ui-button-secondary" type="button" onClick={() => void saveDomains()}>
-              <Save className="size-4" />
-              保存白名单
-            </button>
 
             <label className="block text-xs font-medium text-muted">
               Git 远端仓库（可选；如 https://github.com/you/repo.git）

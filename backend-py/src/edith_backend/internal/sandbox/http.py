@@ -20,7 +20,7 @@ MAX_UPLOAD_SIZE = 50 << 20
 
 
 def _local_entries(relative: str, directory: Path) -> list[dict]:
-    """把本地目录扫成与 E2B list_files 相同的响应结构（P0 本地直读）。"""
+    """把本地目录扫成与列表接口一致的响应结构。"""
     entries: list[dict] = []
     try:
         children = sorted(directory.iterdir(), key=lambda p: p.name.lower())
@@ -70,7 +70,7 @@ class HTTP:
 
         @router.get("/internal/sandbox/files")
         async def list_files(userId: str = "", sessionId: str = "", path: str = "") -> dict:
-            # P0 优化：Local 后端下 workspace/{id}/... 直接读本地磁盘（毫秒级），绕开 E2B。
+            # workspace/{id}/... 直接读本地磁盘（毫秒级），不必走路径解析。
             # 但只在本地**确实存在**该目录时才直读；否则回落读沙箱——这样「克隆进沙箱、
             # 还没同步回后端」的文件也能在文件面板里看到。
             local_dir = await self.service.local_workspace_path(userId, path)

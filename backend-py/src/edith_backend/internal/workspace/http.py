@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from pathlib import Path
 
 from fastapi import APIRouter, File, Query, UploadFile, status
@@ -21,8 +20,6 @@ from ..http_utils import EDITHError
 from .memory_store import WorkspaceMemoryStore
 from .store import DuplicateWorkspace, WorkspaceStore
 from .types import (
-    AllowedDomainsRequest,
-    AllowedDomainsResponse,
     BindLocalRootRequest,
     BindLocalRootResponse,
     GitRemoteRequest,
@@ -38,41 +35,12 @@ from .types import (
     WorkspaceRenameRequest,
     WorkspaceResponse,
 )
-from .volume_backend import LocalVolumeBackend
 from .volume_service import WorkspaceVolumeService
 
 logger = logging.getLogger(__name__)
 
 MAX_FILE_BYTES = 50 * 1024 * 1024  # 单文件 50MB（对齐现有上传）
 MAX_TOTAL_BYTES = 200 * 1024 * 1024  # 单次请求总大小上限
-
-# 沙箱出口白名单的硬限制（E2B 服务端超限直接 400 且不可提额）
-MAX_ALLOWED_DOMAINS = 10
-
-# 允许的域名形态：普通域名，或单层通配 `*.example.com`（apex 需单独写）
-_DOMAIN_RE = re.compile(
-    r"^(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$"
-)
-
-
-def _normalize_domains(raw: list[str]) -> list[str]:
-    """规范化并校验出口白名单：小写、去空、去重、限 10 个、格式须为域名或 *.域名。"""
-    seen: dict[str, None] = {}
-    for item in raw:
-        domain = item.strip().lower().rstrip(".")
-        if not domain:
-            continue
-        if not _DOMAIN_RE.match(domain):
-            raise EDITHError(400, "invalid_domain", f"invalid domain: {item!r}")
-        seen[domain] = None
-    domains = list(seen)
-    if len(domains) > MAX_ALLOWED_DOMAINS:
-        raise EDITHError(
-            400,
-            "too_many_domains",
-            f"at most {MAX_ALLOWED_DOMAINS} domains per sandbox (E2B limit)",
-        )
-    return domains
 
 # 方案 B：允许绑定的本地目录白名单（os.pathsep 分隔；未配置则放行并告警）
 _ALLOWED_LOCAL_ROOTS = [
@@ -114,8 +82,6 @@ def _detect_local_root_prefix(
     （报告、缓存…），卷根就有多个条目，探测退化，前缀错判成 ""，整棵旧副本被原样搬平。
     """
     backend = volume_service.backend
-    if not isinstance(backend, LocalVolumeBackend):
-        return ""
     legacy = backend.legacy_dir(workspace_id)
     if not legacy.is_dir():
         return ""
@@ -154,7 +120,6 @@ def build_workspace_router(
             name=name,
             metadata=req.metadata or {},
             local_root=local_root or "",
-            allowed_domains=(req.metadata or {}).get("allowedDomains") or [],
             git_remote_url=(req.metadata or {}).get("gitRemoteUrl") or "",
         )
 
@@ -169,9 +134,7 @@ def build_workspace_router(
                     workspace_id=row["workspaceId"],
                     name=row["name"],
                     metadata=row["metadata"],
-                    has_volume=row["hasVolume"],
                     local_root=row["localRoot"],
-                    allowed_domains=row["metadata"].get("allowedDomains") or [],
                     git_remote_url=row["metadata"].get("gitRemoteUrl") or "",
                 )
                 for row in rows
@@ -198,7 +161,7 @@ def build_workspace_router(
         workspace_id: str,
         req: WorkspaceRenameRequest,
     ):
-        """本次新增：重命名工作区。返回更新后的工作区（含 has_volume）。"""
+        """本次新增：重命名工作区。返回更新后的工作区。"""
         name = req.name.strip()
         if not name:
             raise EDITHError(400, "invalid_request", "name is required")
@@ -206,16 +169,13 @@ def build_workspace_router(
         if not updated:
             raise EDITHError(404, "not_found", "workspace not found")
         record = await store.get(req.user_id, workspace_id)
-        volume = await store.load_volume(req.user_id, workspace_id)
         if record is None:
             raise EDITHError(404, "not_found", "workspace not found")
         return WorkspaceResponse(
             workspace_id=workspace_id,
             name=name,
             metadata=record["metadata"],
-            has_volume=volume is not None,
             local_root=record.get("localRoot", "") or "",
-            allowed_domains=record["metadata"].get("allowedDomains") or [],
             git_remote_url=record["metadata"].get("gitRemoteUrl") or "",
         )
 
@@ -265,35 +225,6 @@ def build_workspace_router(
             merged_files=outcome.merged_files,
             unmerged_files=outcome.unmerged_files,
         )
-
-    @router.put(
-        "/internal/workspaces/{workspace_id}/allowed-domains",
-        response_model=AllowedDomainsResponse,
-    )
-    async def set_allowed_domains(
-        workspace_id: str, req: AllowedDomainsRequest
-    ):
-        """设置/清除沙箱出口白名单（存于 metadata.allowedDomains）。
-
-        生效时机：下一次沙箱连接——SandboxService 每次连接都会核对并下发策略
-        （update_network 整体替换）。domains 为空 = 清除白名单（恢复全放通）。
-        """
-        record = await store.get(req.user_id, workspace_id)
-        if record is None:
-            raise EDITHError(404, "not_found", "workspace not found")
-        domains = _normalize_domains(req.domains)
-        updated = await store.update_metadata(
-            req.user_id, workspace_id, {"allowedDomains": domains}
-        )
-        if updated is None:
-            raise EDITHError(404, "not_found", "workspace not found")
-        logger.info(
-            "workspace %s egress allowlist set to %d domains: %s",
-            workspace_id,
-            len(domains),
-            domains,
-        )
-        return AllowedDomainsResponse(workspace_id=workspace_id, domains=domains)
 
     @router.put(
         "/internal/workspaces/{workspace_id}/git-remote",

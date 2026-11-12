@@ -57,9 +57,6 @@ from .internal.usage import new_module as new_usage_module
 from .internal.userconfig import new_module as new_userconfig_module
 from .internal.userconfig.mcp_http import build_mcp_router
 from .internal.userconfig.mcp_runtime import MCPRuntime
-from .internal.volume import Service as VolumeService
-from .internal.volume import Store as VolumeStore
-from .internal.volume import create_schema as create_volume_schema
 from .internal.webadapter import Adapter
 from .internal.workspace import (
     WorkspaceMemoryStore,
@@ -71,9 +68,6 @@ from .internal.workspace import (
 )
 from .internal.workspace import (
     create_schema as create_workspace_schema,
-)
-from .internal.workspace import (
-    new_backend as new_workspace_volume_backend,
 )
 
 # 日志基础配置：模块级一次配好，所有 logger 统一格式并携带 request_id
@@ -127,7 +121,6 @@ async def lifespan(app: FastAPI):
     config.load_environment()
     db = await open_database(config.database_path())
     await create_session_schema(db)
-    await create_volume_schema(db)
     await create_workspace_schema(db)
     await create_sandbox_schema(db)
     await create_cronjob_schema(db)
@@ -154,17 +147,11 @@ async def lifespan(app: FastAPI):
     run_plans = RunPlanRegistry()
     conversations = new_conversation_module(session_store, usage.reader, plan_store)
 
-    volumes = VolumeService(VolumeStore(db))
     workspaces = WorkspaceStore(db)
-    # 桌面端必须与 sandbox 后端一致（local）：本地沙箱把 `workspace/{id}`
-    # 直接映射到 `workspace-volumes/{id}`。若卷后端仍是 e2b，那个目录永远是空的，
-    # 表现为"Agent 看不到任何工作区文件"——而两边各自的日志都显示正常。
-    workspace_backend = new_workspace_volume_backend(
-        os.getenv("EDITH_WORKSPACE_VOLUME_BACKEND")
-        or ("local" if config.is_desktop() else "e2b"),
-        workspaces,
-    )
-    workspace_volumes = WorkspaceVolumeService(workspaces, workspace_backend)
+    # 工作区文件就是磁盘上的一个目录：未绑定用户目录时落在
+    # `<data_root>/workspace-volumes/{id}`，绑定后读写直连用户目录本身。
+    # 本地沙箱把 `workspace/{id}` junction 到同一个位置，所以两边看到的是同一份文件。
+    workspace_volumes = WorkspaceVolumeService(workspaces)
     workspace_memories = WorkspaceMemoryStore(db)
 
     # Skill：一份目录，没有作用域。内置 Skill 在启动时铺进去（目标已存在就跳过，
@@ -174,17 +161,7 @@ async def lifespan(app: FastAPI):
     seed_builtin(skills_root)
     skills = SkillsCatalog(skills_root)
 
-    sandboxes = SandboxService(
-        db,
-        os.getenv("EDITH_E2B_TEMPLATE", "default"),
-        volumes,
-        workspaces,
-        workspace_volumes,
-        # 桌面端默认本机沙箱；显式设置 EDITH_SANDBOX_BACKEND 可覆盖（调试用）。
-        # 云端不设这个变量 → e2b，行为与上游一致。
-        backend=os.getenv("EDITH_SANDBOX_BACKEND")
-        or ("local" if config.is_desktop() else "e2b"),
-    )
+    sandboxes = SandboxService(db, workspaces, workspace_volumes)
     async def _git_identity(user_id: str) -> tuple[str, str]:
         """解析用户的 git 提交身份：用户设置优先，留空回退平台默认。"""
         settings = await users.settings.load(user_id)

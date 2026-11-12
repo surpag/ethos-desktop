@@ -12,7 +12,7 @@ import asyncio
 from pathlib import Path
 
 from edith_backend.internal.workspace.http import _detect_local_root_prefix
-from edith_backend.internal.workspace.sync import merge_dir_add_only, plan_merge
+from edith_backend.internal.workspace.merge import merge_dir_add_only, plan_merge
 from edith_backend.internal.workspace.volume_backend import LocalVolumeBackend
 from edith_backend.internal.workspace.volume_service import (
     BindOutcome,

@@ -59,7 +59,7 @@ def load_environment() -> None:
 
     文件位置由本文件路径推导，**不依赖进程 cwd**：原先按 `./.env`、`../.env`
     找，从仓库根目录启动时只能看到根 `.env`，读不到 `backend-py/.env` 里的
-    E2B / COS / DB 路径等配置，行为随启动目录漂移。顺序保持「backend-py 优先」，
+    COS / DB 路径等配置，行为随启动目录漂移。顺序保持「backend-py 优先」，
     与 dotenv 的 override=False 配合：先加载者生效。
     """
     backend_root = project_root()
@@ -103,11 +103,3 @@ def database_path() -> str:
 def runtime_address() -> str:
     """HTTP 监听地址，对应 Go 版 EDITH_ADDR。"""
     return os.getenv("EDITH_ADDR", "127.0.0.1:8080")
-
-
-def sandbox_template() -> str:
-    """E2B Sandbox 模板，必填配置（阶段 5 使用）。"""
-    template = os.getenv("EDITH_E2B_TEMPLATE", "")
-    if not template:
-        raise RuntimeError("EDITH_E2B_TEMPLATE 是必填配置")
-    return template

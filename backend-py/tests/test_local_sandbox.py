@@ -122,7 +122,7 @@ def test_list_depth_and_type(sandbox: LocalSandbox) -> None:
         assert {e.name for e in deep} == {"a.txt", "sub", "b.txt"}
 
         entry = next(e for e in shallow if e.name == "sub")
-        from e2b import FileType
+        from edith_backend.internal.sandbox.types import FileType
 
         assert entry.type == FileType.DIR
         # 回给模型的路径必须是虚拟路径，不能泄漏本机磁盘路径
@@ -318,7 +318,7 @@ def test_service_local_backend_registers_and_reuses(tmp_path, monkeypatch) -> No
     import aiosqlite
 
     from edith_backend.internal.sandbox.schema import create_schema as create_sandbox_schema
-    from edith_backend.internal.sandbox.service import Service
+    from edith_backend.internal.sandbox.service import SandboxNotFound, Service
 
     monkeypatch.setenv("ETHOS_DATA_DIR", str(tmp_path))
 
@@ -326,7 +326,7 @@ def test_service_local_backend_registers_and_reuses(tmp_path, monkeypatch) -> No
         db = await aiosqlite.connect(":memory:")
         db.row_factory = aiosqlite.Row
         await create_sandbox_schema(db)
-        service = Service(db, "unused-template", None, backend="local")  # type: ignore[arg-type]
+        service = Service(db)
 
         first = await service.workspace("u1", "s1")
         assert isinstance(first, LocalSandbox)
@@ -362,7 +362,7 @@ def test_service_local_existing_without_open_raises(tmp_path, monkeypatch) -> No
     import aiosqlite
 
     from edith_backend.internal.sandbox.schema import create_schema as create_sandbox_schema
-    from edith_backend.internal.sandbox.service import Service
+    from edith_backend.internal.sandbox.service import SandboxNotFound, Service
 
     monkeypatch.setenv("ETHOS_DATA_DIR", str(tmp_path))
 
@@ -370,9 +370,11 @@ def test_service_local_existing_without_open_raises(tmp_path, monkeypatch) -> No
         db = await aiosqlite.connect(":memory:")
         db.row_factory = aiosqlite.Row
         await create_sandbox_schema(db)
-        service = Service(db, "unused-template", None, backend="local")  # type: ignore[arg-type]
+        service = Service(db)
 
-        with pytest.raises(FileNotFoundError):
+        # 必须抛 SandboxNotFound 而不是 FileNotFoundError：HTTP 层只把前者
+        # 映射成 404，后者会漏成 500——同一个原因两种状态码。
+        with pytest.raises(SandboxNotFound):
             await service.existing_workspace("ghost", "session")
 
         assert not (tmp_path / "sandbox" / "ghost").exists()

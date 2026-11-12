@@ -1,8 +1,8 @@
 """工作区实体的 SQLite 访问器：用户命名，系统生成 workspace_id。
 
 对应 `docs/p1-workspace-volume-design.md`：
-- workspaces 含 metadata（文件清单）与 volume_id/volume_token（懒创建 Volume）
-- 删除工作区时级联删除指令 + 通过回调销毁 Volume（解耦 E2B）
+- workspaces 含 metadata（文件清单）与 local_root（绑定的本地目录）
+- 删除工作区时级联删除指令 + 通过回调清理磁盘目录
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ class DuplicateWorkspace(Exception):
 
 
 class WorkspaceStore:
-    """提供工作区实体的创建、查询、Volume 绑定与级联删除。"""
+    """提供工作区实体的创建、查询、本地目录绑定与级联删除。"""
 
     def __init__(self, db: aiosqlite.Connection) -> None:
         self._db = db
@@ -118,7 +118,7 @@ class WorkspaceStore:
     async def list(self, user_id: str) -> list[dict]:
         """列出用户全部工作区（按创建时间），metadata 解析为 dict。"""
         async with self._db.execute(
-            "SELECT workspace_id, name, metadata, volume_id, local_root FROM workspaces "
+            "SELECT workspace_id, name, metadata, local_root FROM workspaces "
             "WHERE user_id = ? ORDER BY created_at, workspace_id",
             (user_id,),
         ) as cursor:
@@ -128,8 +128,7 @@ class WorkspaceStore:
                     "workspaceId": r[0],
                     "name": r[1],
                     "metadata": self._parse_metadata(r[2]),
-                    "hasVolume": bool(r[3]),
-                    "localRoot": r[4] or "",
+                    "localRoot": r[3] or "",
                 }
                 for r in rows
             ]
@@ -165,75 +164,7 @@ class WorkspaceStore:
             "sessionId": row[4] or "",
         }
 
-    # ---- Volume 绑定 ----
-
-    async def save_volume(
-        self,
-        user_id: str,
-        workspace_id: str,
-        volume_id: str,
-        volume_name: str,
-        volume_token: str,
-    ) -> None:
-        """绑定 Volume 到工作区（首次上传时懒创建）。"""
-        await self._db.execute(
-            "UPDATE workspaces SET volume_id = ?, volume_name = ?, volume_token = ? "
-            "WHERE user_id = ? AND workspace_id = ?",
-            (volume_id, volume_name, volume_token, user_id, workspace_id),
-        )
-        await self._db.commit()
-
-    async def load_volume(
-        self, user_id: str, workspace_id: str
-    ) -> tuple[str, str, str] | None:
-        """返回 (volume_id, volume_name, volume_token) 或 None（未创建 Volume）。"""
-        async with self._db.execute(
-            "SELECT volume_id, volume_name, volume_token FROM workspaces "
-            "WHERE user_id = ? AND workspace_id = ?",
-            (user_id, workspace_id),
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row is None or row[0] is None:
-            return None
-        return row[0], row[1], row[2]
-
-    async def clear_volume(self, user_id: str, workspace_id: str) -> None:
-        """清空 Volume 绑定（销毁或连接失败后）。"""
-        await self._db.execute(
-            "UPDATE workspaces SET volume_id = NULL, volume_name = NULL, volume_token = NULL "
-            "WHERE user_id = ? AND workspace_id = ?",
-            (user_id, workspace_id),
-        )
-        await self._db.commit()
-
-    async def update_name(
-        self, user_id: str, workspace_id: str, name: str
-    ) -> bool:
-        """重命名工作区（本次新增）。返回是否更新成功（不存在/归属不符返回 False）。"""
-        async with self._db.execute(
-            "UPDATE workspaces SET name = ? "
-            "WHERE user_id = ? AND workspace_id = ?",
-            (name, user_id, workspace_id),
-        ) as cursor:
-            updated = cursor.rowcount > 0
-        await self._db.commit()
-        return updated
-
-    async def list_mounts(self, user_id: str) -> list[tuple[str, str]]:
-        """列出用户已绑定 Volume 的工作区，供 Sandbox 挂载。
-
-        返回 [(volume_name, workspace_id), ...]——E2B 挂载按 Volume 名称
-        （volume_mounts 的 key 是挂载路径，value 是 Volume 名称/对象）。
-        """
-        async with self._db.execute(
-            "SELECT volume_name, workspace_id FROM workspaces "
-            "WHERE user_id = ? AND volume_name IS NOT NULL",
-            (user_id,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-            return [(r[0], r[1]) for r in rows]
-
-    # ---- 删除（级联 + 销毁 Volume 回调） ----
+    # ---- 删除（级联 + 存储清理回调） ----
 
     async def delete(
         self,
@@ -241,16 +172,14 @@ class WorkspaceStore:
         workspace_id: str,
         on_destroy_volume: object | None = None,
     ) -> bool:
-        """删除工作区并级联删除其项目指令；有 Volume 时先调用销毁回调。
+        """删除工作区并级联删除其项目指令；先调用存储清理回调。
 
-        on_destroy_volume: async callable (user_id, workspace_id, volume_id|None)
-        -> None，由调用方注入（如 WorkspaceVolumeService.on_delete），解耦
-        E2B 依赖便于测试。volume_id 可能为 None（Local 后端无 Volume 概念）。
+        on_destroy_volume: async callable (user_id, workspace_id) -> None，
+        由调用方注入（`WorkspaceVolumeService.on_delete`）。名字沿用历史——
+        它现在的职责是"清掉工作区在磁盘上的目录"。
         """
-        record = await self.load_volume(user_id, workspace_id)
         if on_destroy_volume is not None:
-            volume_id = record[0] if record is not None else None
-            await on_destroy_volume(user_id, workspace_id, volume_id)  # type: ignore[misc]
+            await on_destroy_volume(user_id, workspace_id)  # type: ignore[misc]
 
         async with self._db.execute(
             "DELETE FROM workspaces WHERE user_id = ? AND workspace_id = ?",

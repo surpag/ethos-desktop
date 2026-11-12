@@ -1,8 +1,11 @@
 """workspace 模块的表结构：workspaces + project_memories。
 
 对应 `docs/p1-workspace-volume-design.md`：
-- workspaces 含 volume_id/volume_token（懒创建 Volume 的持久化字段）
+- workspaces 含 local_root（绑定的本地目录，方案 B）
 - project_memories 存项目指令（kind='user'）与自动记忆（kind='auto'）
+
+旧库可能还留有 volume_id / volume_name / volume_token 三列（远端卷时代的字段）。
+本模块不再读写它们；SQLite 允许多出未使用的列，因此不做破坏性的删列迁移。
 """
 
 from __future__ import annotations
@@ -15,9 +18,6 @@ _STATEMENTS = [
         user_id      TEXT NOT NULL,
         name         TEXT NOT NULL,
         metadata     TEXT NOT NULL DEFAULT '{}',
-        volume_id    TEXT,
-        volume_name  TEXT,
-        volume_token TEXT,
         local_root   TEXT,
         local_root_prefix TEXT,
         session_id   TEXT,
@@ -57,7 +57,7 @@ async def create_schema(db: aiosqlite.Connection) -> None:
 
 
 async def _migrate(db: aiosqlite.Connection) -> None:
-    """幂等迁移：旧库（projects 表 / project_id 列 / 缺 volume 列）升级。"""
+    """幂等迁移：旧库（projects 表 / project_id 列 / 缺列）升级。"""
     # 1. 旧 projects 表存在 → 复制数据到 workspaces，再删除旧表
     cursor = await db.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='projects'"
@@ -81,7 +81,7 @@ async def _migrate(db: aiosqlite.Connection) -> None:
             "ALTER TABLE project_memories RENAME COLUMN project_id TO workspace_id"
         )
 
-    # 3. workspaces 缺列 → 逐个补（metadata / volume_id / volume_token）
+    # 3. workspaces 缺列 → 逐个补
     cursor = await db.execute("PRAGMA table_info(workspaces)")
     rows = await cursor.fetchall()
     await cursor.close()
@@ -90,12 +90,6 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         await db.execute(
             "ALTER TABLE workspaces ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'"
         )
-    if "volume_id" not in columns:
-        await db.execute("ALTER TABLE workspaces ADD COLUMN volume_id TEXT")
-    if "volume_name" not in columns:
-        await db.execute("ALTER TABLE workspaces ADD COLUMN volume_name TEXT")
-    if "volume_token" not in columns:
-        await db.execute("ALTER TABLE workspaces ADD COLUMN volume_token TEXT")
     # 本地目录绑定（方案 B：workspace 直接以用户本地目录为存储根）
     if "local_root" not in columns:
         await db.execute("ALTER TABLE workspaces ADD COLUMN local_root TEXT")

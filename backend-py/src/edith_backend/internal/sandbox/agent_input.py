@@ -7,9 +7,8 @@ from __future__ import annotations
 
 import posixpath
 
-from e2b import FileType
-
 from .service import Service
+from .types import FileType
 from .workspace import WORKSPACE
 
 

@@ -39,10 +39,9 @@ electron (desktop/dist/main.js)
 ```
 %APPDATA%\ETHOS\
 ├── edith-v2.db          会话 / 消息 / 计划 / trace
-├── workspace-volumes/   工作区文件权威副本
-├── user-skills/         用户级 Skill
-├── project-skills/      项目级 Skill
-└── workspace-sync/      同步状态（本地沙箱落地后应消失）
+├── skills/              Skill（用户可直接编辑的普通文件）
+├── workspace-volumes/   工作区文件（未绑定本地目录时落这里）
+└── sandbox/             每会话的沙箱目录（uploads / work / artifacts + 两个联接）
 ```
 
 由 `backend-py/.../config.py` 的 `data_root()` 单点推导；Electron 也把
@@ -67,7 +66,7 @@ cd desktop && npm install && npm start
 
 ### 环境变量
 
-桌面端**不需要 `.env`**。数据目录、沙箱后端、认证模式均由 `desktop/src/main.ts`
+桌面端**不需要 `.env`**。数据目录、沙箱、认证模式均由 `desktop/src/main.ts`
 在 spawn 时注入；模型 API Key 走应用内「设置 → 模型」，写进数据库。
 `backend-py/.env.example` 只对云端部署和脱离壳调试后端有意义。
 
@@ -102,7 +101,7 @@ ETHOS_DESKTOP=1 ETHOS_DATA_DIR="$APPDATA/ETHOS-dev" \
 
 删掉的东西：`resolver.py`（407 行裁决）、`storage/`（约 1800 行：作用域存储、冲突快照、
 LWW、事务、校验）、`migrate.py`（527 行迁移工具）、`overview.md` 索引、B2/B3 Skill 同步、
-`edith.yaml` 展示元数据。**`sync.py` 保留**——E2B 后端仍在用它的 workspace 同步。
+`edith.yaml` 展示元数据。
 
 ## 当前进度
 
@@ -110,29 +109,31 @@ LWW、事务、校验）、`migrate.py`（527 行迁移工具）、`overview.md`
 |---|---|---|
 | M0 | 壳能跑：standalone + sidecar + 数据目录 | 完成 |
 | M1 | 本地沙箱：`sandbox/` 换成本机实现，11 个原语 | 完成 |
-| M2 | Skill 单层化；本地后端下所有同步路径短路 | 完成 |
+| M2 | Skill 单层化 | 完成 |
+| M2.5 | 删 E2B 后端与工作区同步：`sync.py`、`volume/`、出口白名单 | 完成 |
 | M3 | 桌面化：keychain、托盘、退出清理 | 未开始 |
 | M4 | 分发：隔离、签名、自动更新 | 未开始 |
 
 ## 本地沙箱（M1）
 
-`backend-py/src/edith_backend/internal/sandbox/local.py` 提供与 E2B `AsyncSandbox`
-**形状兼容**的 `LocalSandbox`（`.files` / `.commands` / `.sandbox_id`）。所以
-`tools.py` 那一千行工具代码一行都没改——后端分歧只存在于 `Service.workspace()`
-的一个 `if` 上。
+`backend-py/src/edith_backend/internal/sandbox/local.py` 是工具层文件 / 命令原语的
+**唯一**实现（`.files` / `.commands` / `.sandbox_id`）。没有"后端"这个概念：
+远端沙箱连同它的工作区同步、Volume 生命周期、出口白名单一起删掉了——留在代码里
+就是一条看起来能走、实际走不通的路。
 
 虚拟路径映射（`LocalSandbox.resolve`）：
 
 | 模型看到的路径 | 实际落点 |
 |---|---|
 | `/home/user/work/a.txt` | `%APPDATA%\ETHOS\sandbox\{user}\{session}\work\a.txt` |
-| `/home/user/workspace/{id}/…` | `%APPDATA%\ETHOS\workspace-volumes\{id}\…`（**零拷贝，不同步**） |
-| `/home/user/skills/…` | `%APPDATA%\ETHOS\skills\…`（**零拷贝，不同步**） |
+| `/home/user/workspace/{id}/…` | `%APPDATA%\ETHOS\workspace-volumes\{id}\…`（**零拷贝**） |
+| `/home/user/skills/…` | `%APPDATA%\ETHOS\skills\…`（**零拷贝**） |
 
-后两行是本地模式最重要的简化：E2B 后端里沙箱与权威副本是两份，才需要
-`workspace/sync.py` 那 842 行的推送/回拉/护栏/熔断；本地模式下它们本来就是
-同一个目录，同步问题从根上不存在。所以 `sync.py` 在 `local` 后端下全程短路
-（判定放在方法首行，不在三个调用点各写一遍）。
+后两行是这份代码最重要的前提：**磁盘上只有一份文件**。文件原语做路径翻译，
+`run_command` 靠目录联接看到同一个位置，两边读写的是同一片字节。
+
+于是「把副本同步过去」这件事没有存在前提——原实现那 842 行的推送 / 回拉 / 三道护栏 /
+熔断 / 删除传播，处理的是"沙箱在远端、权威副本在本地"的两份副本问题。这里没有第二份。
 
 ### 四件"看起来能用、实际不能用"的事
 

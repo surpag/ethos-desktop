@@ -14,7 +14,6 @@ dependencies = [
     "pyyaml>=6.0",
     "aiosqlite>=0.22.1",
     "openai>=1.0",
-    "e2b>=2.0",
     "croniter>=6.0",
     "tzdata>=2024.1",
     "python-multipart>=0.0.9",

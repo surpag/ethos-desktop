@@ -1,7 +1,6 @@
 """链路追踪（trace）模块的数据结构与常量。
 
-与 `internal/volume/trace.py` 无关系——后者是 E2B HTTP 调试开关，本包是
-「一次 run 的分步耗时/异常记录」。
+记录「一次 run 的分步耗时/异常」。
 
 设计依据：`docs/trace-eval-design.md` §3。
 """

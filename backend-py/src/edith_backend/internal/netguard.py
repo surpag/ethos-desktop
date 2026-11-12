@@ -4,8 +4,8 @@
 都必须先过这里，否则就是 SSRF 入口，最坏可以读到云上实例凭据。
 
 放在 `internal/` 顶层单文件而不是某个业务模块里，是因为它被 gitops 与 models
-共用；若长在 gitops 下，models 导入时会被迫连带加载 e2b（gitops 包 __init__
-依赖 executor），把一个纯字符串校验变成一条重依赖。
+共用；若长在 gitops 下，models 导入时会被迫连带加载整个 gitops 包，把一个纯字符串
+校验变成一条重依赖。
 """
 
 from __future__ import annotations

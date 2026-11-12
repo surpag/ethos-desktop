@@ -1,4 +1,4 @@
-"""sandbox 模块：按用户和会话隔离的 E2B 工作区及其 Agent 工具。
+"""sandbox 模块：按用户和会话隔离的工作区目录及其 Agent 工具。
 
 对应 Go 版 internal/sandbox。
 """

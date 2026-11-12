@@ -213,19 +213,16 @@ def test_executor_quotes_args_and_blocks_bad_clone() -> None:
 
 def test_executor_treats_nonzero_exit_as_result() -> None:
     """git 非零退出（非仓库/冲突）应是正常结果而非异常，且 stderr 同样脱敏。"""
-    from e2b.sandbox.commands.command_handle import CommandExitException
-
-    class Raiser:
-        async def run(self, cmd: str, **kwargs) -> None:
-            raise CommandExitException(
+    class NonZero:
+        async def run(self, cmd: str, **kwargs) -> SimpleNamespace:
+            return SimpleNamespace(
                 stderr="fatal: unable to access 'https://x-access-token:ghp_LEAKED@github.com/o/r.git/'\n",
                 stdout="",
                 exit_code=128,
-                error="authentication failed",
             )
 
     async def go():
-        result = await run_git(SimpleNamespace(commands=Raiser()), "/w", "status", [])
+        result = await run_git(SimpleNamespace(commands=NonZero()), "/w", "status", [])
         assert result["exitCode"] == 128
         assert "ghp_LEAKED" not in result["stderr"]
         assert "<redacted>" in result["stderr"]

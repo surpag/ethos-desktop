@@ -1,10 +1,8 @@
-"""工作区 Volume 服务：门面，按后端实现（E2B / 本地）代理写入与销毁。
+"""工作区文件服务：门面，负责写入、本地目录绑定与销毁。
 
-对应 `docs/p1-workspace-volume-design.md`：
-- 懒创建：首次上传文件才创建持久化存储（E2B Volume 或本地目录）
-- 写入：委托 VolumeBackend（Volume 内相对路径）
-- 销毁：删除工作区时调用（通过 WorkspaceStore.delete 的 on_destroy_volume 回调注入）
-E2B 依赖收敛在 volume_backend.py，便于单测 mock 与本地开发。
+对应 `docs/p1-workspace-volume-design.md` 的懒创建语义：首次上传文件才在磁盘上
+建目录。存储只有一个实现（本地目录），所以这里不做后端选择——留一个 `VolumeBackend`
+抽象加一次 `isinstance` 判断，只会让人以为还有另一条路。
 """
 
 from __future__ import annotations
@@ -13,8 +11,9 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from .merge import merge_dir_add_only, plan_merge
 from .store import WorkspaceStore
-from .volume_backend import LocalVolumeBackend, VolumeBackend
+from .volume_backend import LocalVolumeBackend
 
 logger = logging.getLogger(__name__)
 
@@ -28,26 +27,25 @@ class BindOutcome:
 
 
 class WorkspaceVolumeService:
-    """工作区文件存储的门面：按后端实现代理写入、同步与销毁。"""
+    """工作区文件存储的门面。"""
 
-    def __init__(self, store: WorkspaceStore, backend: VolumeBackend) -> None:
+    def __init__(
+        self, store: WorkspaceStore, backend: LocalVolumeBackend | None = None
+    ) -> None:
         self._store = store
-        self._backend = backend
-        # 标记需要重新同步到沙箱的 workspace_id（文件写入后置 dirty，sync 成功后清除）
-        self._dirty: set[str] = set()
+        self._backend = backend or LocalVolumeBackend()
         # 已从 DB 加载过 local_root 的 workspace_id（避免每次读都查库）
         self._local_root_loaded: set[str] = set()
 
-    # 本次新增：暴露后端实例，供 Sandbox 层判断是否可本地直读（P0 性能优化）
+    # 暴露后端实例：文件面板与 sandbox 层要直接解析本地路径
     @property
-    def backend(self) -> VolumeBackend:
-        """当前工作区存储后端（E2BVolumeBackend / LocalVolumeBackend）。"""
+    def backend(self) -> LocalVolumeBackend:
         return self._backend
 
     async def write_files(
         self, user_id: str, workspace_id: str, files: list[tuple[str, bytes]]
     ) -> int:
-        """写入一批文件到工作区存储（路径为 Volume 内相对路径）。"""
+        """写入一批文件到工作区目录（路径为工作区内相对路径）。"""
         if not files:
             return 0
         written = await self._backend.write_files(user_id, workspace_id, files)
@@ -56,8 +54,6 @@ class WorkspaceVolumeService:
             await self._store.update_files_metadata(
                 user_id, workspace_id, written_paths
             )
-            # 文件已写入本地：标记该 workspace 需要重新同步到沙箱（dirty）
-            self._dirty.add(workspace_id)
         logger.info(
             "wrote %d files to workspace %s (%s total)",
             written,
@@ -66,27 +62,15 @@ class WorkspaceVolumeService:
         )
         return written
 
-    async def sync_to_sandbox(self, sandbox, workspace_id: str) -> None:
-        """同步指定 workspace 到沙箱（Local 后端用；E2B 后端 no-op），成功后清除 dirty 标记。"""
-        await self._backend.sync_workspace_to_sandbox(workspace_id, sandbox)
-        self._dirty.discard(workspace_id)
-
-    async def ensure_volume(self, user_id: str, workspace_id: str) -> str | None:
-        """确保工作区有持久化 Volume（E2B 懒创建），返回 volume_name；Local 返回 None。"""
-        return await self._backend.ensure_volume(user_id, workspace_id)
-
-    # ---- 方案 B：本地目录绑定（B1a）----
+    # ---- 本地目录绑定（B1a）----
 
     async def load_and_bind_local_root(
         self, user_id: str, workspace_id: str
     ) -> str | None:
-        """从 DB 读取 workspace 的 local_root 并注册到后端（仅 Local 后端）。
+        """从 DB 读取 workspace 的 local_root 并注册到后端。
 
-        注册后 LocalVolumeBackend 以该本地目录为存储根，读写直连，
-        彻底绕开 workspace-volumes/{id}/ 副本。
+        注册后读写直连该本地目录，彻底绕开 workspace-volumes/{id}/ 副本。
         """
-        if not isinstance(self._backend, LocalVolumeBackend):
-            return None
         if workspace_id in self._local_root_loaded:
             return self.local_root_of(workspace_id)
         self._local_root_loaded.add(workspace_id)
@@ -111,7 +95,7 @@ class WorkspaceVolumeService:
         *,
         merge_existing: bool = False,
     ) -> BindOutcome:
-        """给已有 workspace 绑定本地目录（方案 B）。
+        """给已有 workspace 绑定本地目录。
 
         绑定后该 workspace 读写直连 local_root。旧副本（workspace-volumes/{id}，即未绑定
         期间的产物）**默认不合并**——绑定一个既有目录不应附带全量文件迁移；调用方如需旧
@@ -122,10 +106,7 @@ class WorkspaceVolumeService:
         """
         await self._store.bind_local_root(user_id, workspace_id, local_root, prefix)
         self._local_root_loaded.add(workspace_id)
-        if not isinstance(self._backend, LocalVolumeBackend):
-            return BindOutcome()
         self._backend.bind_local_root(workspace_id, local_root, prefix)
-        from .sync import merge_dir_add_only, plan_merge
 
         legacy = self._backend.legacy_dir(workspace_id)
         dst = Path(local_root)
@@ -136,45 +117,33 @@ class WorkspaceVolumeService:
 
     def local_root_prefix_of(self, workspace_id: str) -> str:
         """返回已注册的本地目录前缀（未绑定返回 ""）。"""
-        if not isinstance(self._backend, LocalVolumeBackend):
-            return ""
         return self._backend.local_root_prefix_of(workspace_id)
 
     def local_root_of(self, workspace_id: str) -> str | None:
         """返回已注册的本地目录（未绑定返回 None）。"""
-        if not isinstance(self._backend, LocalVolumeBackend):
-            return None
         root = self._backend.local_root_of(workspace_id)
         return str(root) if root else None
 
-    def is_dirty(self, workspace_id: str) -> bool:
-        """该 workspace 是否有新写入、待同步到沙箱的文件。"""
-        return workspace_id in self._dirty
-
     async def on_delete(
-        self, user_id: str, workspace_id: str, volume_id: str | None
+        self, user_id: str, workspace_id: str, volume_id: str | None = None
     ) -> None:
-        """删除工作区时调用：销毁后端存储（E2B 按 volume_id，Local 按 workspace_id）。"""
-        if volume_id:
-            # E2B 后端：volume_id 即远端 Volume id
-            try:
-                await self._backend.destroy(user_id, workspace_id)
-            except Exception as exc:  # noqa: BLE001 - 销毁失败不影响删除
-                logger.warning(
-                    "failed to destroy volume %s: %s", volume_id, exc
-                )
-        else:
-            # Local 后端：无 volume_id，按 workspace_id 清理本地目录
+        """删除工作区时调用：清理本地目录（绑定的是用户目录时只解绑）。
+
+        `volume_id` 是历史签名（曾用于区分远端卷 id），保留参数只为不改调用方；
+        本地存储不看它。
+        """
+        try:
             await self._backend.destroy(user_id, workspace_id)
+        except Exception as exc:  # noqa: BLE001 - 销毁失败不影响删除
+            logger.warning("failed to destroy workspace storage %s: %s", workspace_id, exc)
 
     async def destroy(self, user_id: str, workspace_id: str) -> None:
-        """销毁工作区存储并清空绑定。"""
+        """销毁工作区存储（绑定的是用户目录时只解绑，不删用户文件）。"""
         await self._backend.destroy(user_id, workspace_id)
-        await self._store.clear_volume(user_id, workspace_id)
 
     @staticmethod
     def is_safe_rel_path(rel_path: str) -> bool:
-        """Volume 内相对路径安全校验：拒绝绝对路径与 .. 穿越。"""
+        """工作区内相对路径安全校验：拒绝绝对路径与 .. 穿越。"""
         if not rel_path or rel_path.startswith("/"):
             return False
         return ".." not in rel_path.split("/")

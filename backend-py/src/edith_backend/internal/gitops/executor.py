@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import shlex
 
-from e2b.sandbox.commands.command_handle import CommandExitException
-
 from .env import git_identity_env, non_interactive_env
 from .policy import GitCommandRejected, validate_git_command
 from .redact import redact_git_output
@@ -38,9 +36,9 @@ async def run_git(
     后者在 BLOCKED_COMMIT_FLAGS 内被禁）。
     allow_remote=True 才放行 push/pull/fetch —— 只应由 runner 沙箱的调用方设置。
 
-    git 大量合法场景以**非零退出码**表达（非仓库=128、冲突=1…），E2B 的 commands.run
-    会把非零退出抛成 CommandExitException（它同时是 CommandResult 子类，带 exit_code /
-    stdout / stderr）——这里统一转回结果，交由上层按 exit_code 判断。
+    git 大量合法场景以**非零退出码**表达（非仓库=128、冲突=1…），所以这里
+    **不能**把非零退出当异常：`commands.run` 返回带 exit_code 的结果对象，
+    由上层按 exit_code 判断。
     """
     validate_git_command(subcmd, args, allow_remote=allow_remote)
     if subcmd == "clone" and args:
@@ -50,15 +48,12 @@ async def run_git(
     envs = non_interactive_env()
     if identity is not None:
         envs.update(git_identity_env(*identity))
-    try:
-        result = await sandbox.commands.run(
-            command,
-            cwd=workspace_path,
-            envs=envs,
-            timeout=timeout,
-        )
-    except CommandExitException as exc:
-        result = exc  # 非零退出 = 正常 git 结果，不是 gitops 层故障
+    result = await sandbox.commands.run(
+        command,
+        cwd=workspace_path,
+        envs=envs,
+        timeout=timeout,
+    )
     return {
         "exitCode": result.exit_code or 0,
         "stdout": redact_git_output(result.stdout or ""),
