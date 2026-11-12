@@ -1,11 +1,11 @@
 "use client";
 
-import { BookOpenText, Sparkles, UserRound } from "lucide-react";
+import { FolderOpen, Sparkles } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import type { SkillListItem, SkillsResponse } from "@/lib/skills/type";
 
-// Skills 负责展示当前用户实际可用的公共和用户 Skills。
+// 展示当前数据目录里的 Skill。只有一层：`skills/<名字>/SKILL.md`。
 export function Skills() {
   const [skills, setSkills] = useState<SkillsResponse | null>(null);
   const [message, setMessage] = useState("");
@@ -32,35 +32,49 @@ export function Skills() {
         <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-accent-soft text-accent"><Sparkles className="size-4" /></span>
         <div>
           <h2 className="text-sm font-semibold text-ink">Skills</h2>
-          <p className="mt-1 text-xs leading-5 text-muted">Agent 当前可使用的工作方法与领域知识。</p>
+          <p className="mt-1 text-xs leading-5 text-muted">
+            Agent 会按需读取这些工作方法。目录 <span className="font-mono">skills/</span> 与沙箱里的
+            <span className="font-mono"> /home/user/skills</span> 是同一个位置——放进去的文件下一轮就生效。
+          </p>
         </div>
       </div>
 
       {message && <p className="p-5 text-sm text-muted">{message}</p>}
       {!message && !skills && <p className="p-5 text-sm text-muted">加载中…</p>}
-      {skills && <div className="space-y-5 p-5">
-        <SkillGroup title="公共 Skills" items={skills.system} emptyMessage="暂无公共 Skills。" />
-        <SkillGroup title="用户 Skills" items={skills.custom} emptyMessage="还没有用户 Skills。" />
+      {skills && <div className="space-y-3 p-5">
+        {skills.status === "missing" && (
+          <p className="rounded-lg bg-surface-subtle px-3 py-4 text-sm text-muted">
+            还没有 Skill 目录。让 Agent 建一个，或手动往 <span className="font-mono">skills/</span> 里放。
+          </p>
+        )}
+        {skills.status === "partial" && (
+          <p className="rounded-lg bg-surface-subtle px-3 py-4 text-xs leading-5 text-muted">
+            部分 Skill 无法解析：{skills.reason}
+          </p>
+        )}
+        {skills.skills.length === 0 && skills.status === "ok" && (
+          <p className="rounded-lg bg-surface-subtle px-3 py-4 text-sm text-muted">目录是空的。</p>
+        )}
+        {skills.skills.length > 0 && (
+          <div className="grid gap-2 sm:grid-cols-2">
+            {skills.skills.map((skill) => <SkillCard key={skill.path || skill.name} skill={skill} />)}
+          </div>
+        )}
       </div>}
     </section>
   );
 }
 
-function SkillGroup({ title, items, emptyMessage }: { title: string; items: SkillListItem[]; emptyMessage: string }) {
-  const Icon = title === "公共 Skills" ? BookOpenText : UserRound;
+function SkillCard({ skill }: { skill: SkillListItem }) {
   return (
-    <div>
-      <h3 className="flex items-center gap-2 text-xs font-semibold tracking-wide text-ink"><Icon className="size-3.5 text-faint" />{title}</h3>
-      {items.length === 0
-        ? <p className="mt-2 rounded-lg bg-surface-subtle px-3 py-4 text-sm text-muted">{emptyMessage}</p>
-        : <div className="mt-2 grid gap-2 sm:grid-cols-2">
-          {items.map((skill) => (
-            <article className="rounded-xl border border-border bg-surface px-4 py-3.5 transition-colors hover:border-border-strong hover:bg-surface-subtle" key={skill.name}>
-              <h4 className="font-mono text-xs font-semibold text-ink">{skill.name}</h4>
-              <p className="mt-2 text-sm leading-6 text-muted">{skill.description}</p>
-            </article>
-          ))}
-        </div>}
-    </div>
+    <article className="rounded-xl border border-border bg-surface px-4 py-3.5 transition-colors hover:border-border-strong hover:bg-surface-subtle">
+      <h4 className="font-mono text-xs font-semibold text-ink">{skill.name}</h4>
+      <p className="mt-2 text-sm leading-6 text-muted">{skill.description}</p>
+      {skill.path && (
+        <p className="mt-2 flex items-center gap-1.5 font-mono text-[11px] text-faint">
+          <FolderOpen className="size-3" />{skill.path}
+        </p>
+      )}
+    </article>
   );
 }

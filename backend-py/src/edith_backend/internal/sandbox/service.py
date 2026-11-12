@@ -10,23 +10,17 @@ import os
 import re
 from collections.abc import Collection
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import aiosqlite
 from e2b import ALL_TRAFFIC, AsyncSandbox
 from e2b.sandbox.sandbox_api import SandboxLifecycle
 
-from ..skills.types import SCOPE_PROJECT, SCOPE_USER
 from ..volume.service import Service as VolumeService
-from ..volume.types import CUSTOM_SKILLS_PATH
 from ..workspace.layout import WORKSPACE
 from ..workspace.store import WorkspaceStore
 from ..workspace.volume_backend import LocalVolumeBackend
 from ..workspace.volume_service import WorkspaceVolumeService
 from .local import LocalSandbox
-
-if TYPE_CHECKING:  # 仅类型标注：运行期由 main.py 注入实例
-    from ..skills.storage import SkillScopeStores, SkillStorageService
 
 CONNECT_TIMEOUT_MS = 60 * 10
 logger = logging.getLogger(__name__)
@@ -53,7 +47,6 @@ class Service:
         volumes: VolumeService,
         workspaces: WorkspaceStore | None = None,
         workspace_volumes: WorkspaceVolumeService | None = None,
-        skill_scopes: SkillScopeStores | None = None,
         backend: str = "e2b",
     ) -> None:
         self._db = db
@@ -61,21 +54,12 @@ class Service:
         # 后端选择：`e2b`（远端微 VM）或 `local`（本机目录，桌面端）。
         # 只影响「怎么拿到沙箱」——两边的返回形状一致，工具层不需要知道这件事。
         self._backend = (backend or "e2b").strip().lower()
-        # 与 `skills.storage` / `workspace.volume_backend` 的做法一致：
-        # 启动就把实际生效的后端打出来。否则"为什么工具还在连远端"
+        # 启动就把实际生效的后端打出来。否则「为什么工具还在连远端」
         # 只能靠读环境变量猜。
         logger.info("sandbox backend: %s", self._backend)
         self._volumes = volumes
         self._workspaces = workspaces
         self._workspace_volumes = workspace_volumes
-        # Skill 存储的作用域分发点（用户级 / 项目级）。只收门面而不是两个门面：
-        # 作用域的选择规则必须只有一处，否则「什么时候才算项目级」会在调用点各写一遍。
-        self._scopes = skill_scopes
-        self._skills = skill_scopes.user() if skill_scopes is not None else None
-        # 需要在下一次拿到沙箱时补一次 pull 的会话。键里带 workspace_id 是必须的：
-        # 回拉项目级要知道拉哪个工作区的权威副本，而「挂起时刻的工作区」与
-        # 「兑现时刻请求里带的工作区」未必是同一个（会话可以换绑工作区）。
-        self._skills_pending: set[tuple[str, str, str]] = set()
         # B3 快路径：{workspace_id}:{sandbox_id} → 本地目录指纹（未变化则跳过逐文件远端比对）
         self._b3_fingerprints: dict[str, tuple] = {}
         # 出口策略：{sandbox_id: (domains...)}，已下发过的策略（避免每次连接重复 update_network）
@@ -218,8 +202,13 @@ class Service:
         """把文件内容写回本地工作区源（Agent 修改落地）。
 
         仅 Local 后端且路径位于 workspace/{id}/ 下时生效；其余（E2B 后端 / uploads 等
-        沙箱独有目录）返回 False，调用方静默跳过。用于 sandbox_write_file 的双写。
+        沙箱独有目录）返回 False，调用方静默跳过。
+
+        `local` 沙箱后端下直接返回 False：写入路径与本地权威副本是同一个目录，
+        `sandbox_write_file` 已经落盘，不需要再写第二遍。
         """
+        if self._backend == "local":
+            return False
         local_path = await self.local_workspace_path(user_id, relative)
         if local_path is None or local_path.is_dir():
             return False
@@ -228,11 +217,19 @@ class Service:
         return True
 
     # ---- 方案 B（B2/B3）：与本地目录增量同步 ----
+    #
+    # **这两个方法在 `local` 沙箱后端下是 no-op**。本地沙箱的 `workspace/{id}`
+    # 直接映射到权威副本目录（同一份文件，不是副本），同步没有可搬运的东西；
+    # 硬跑一遍只会把每个文件读出来再写回同一个位置。
+    # 判定放在方法首行而不是调用点：调用点有三处（工具执行前 / 后、拿沙箱时），
+    # 分散判断必然漏掉一处，而漏掉的那处不会报错，只会白跑。
 
     async def sync_sandbox_to_local(
         self, user_id: str, workspace_id: str, sandbox: AsyncSandbox
     ) -> int:
         """B2：把沙箱中与本地不同的文件拉回本地目录（覆盖 run_command 写文件盲区）。"""
+        if self._backend == "local":
+            return 0
         if self._workspace_volumes is None or not workspace_id:
             return 0
         local_root = await self._workspace_volumes.load_and_bind_local_root(
@@ -257,6 +254,8 @@ class Service:
         self, user_id: str, workspace_id: str, sandbox: AsyncSandbox
     ) -> int:
         """B3：把本地新增/修改的文件推送到沙箱（工具调用前 / 用户发消息时）。"""
+        if self._backend == "local":
+            return 0
         if self._workspace_volumes is None or not workspace_id:
             return 0
         local_root = await self._workspace_volumes.load_and_bind_local_root(
@@ -293,169 +292,6 @@ class Service:
             logger.warning("B3 sync failed ws=%s: %s", workspace_id, exc)
             return 0
 
-    # ---- Skill：权威副本 ↔ 沙箱运行副本（按作用域分发） ----
-
-    @property
-    def skills(self) -> SkillStorageService | None:
-        """用户级 Skill 存储门面（未配置时为 None，全部钩子自动跳过）。"""
-        return self._skills
-
-    def _scope_service(
-        self, scope: str, workspace_id: str
-    ) -> SkillStorageService | None:
-        """取某个作用域的存储门面；该作用域在本上下文不成立时返回 None。
-
-        「不成立」只有两种，都不是错误：
-        - 没有注入作用域存储（测试 / 精简部署）；
-        - 项目级没有 workspace 上下文（纯聊天会话本来就只有用户级 Skill）。
-
-        项目级**结构性不可用**时（`e2b` 后端只支持按用户挂载）也返回 None：
-        那种后端每次调用都返回 `unavailable` 而不抛错，接在这里等于给每次工具调用
-        加一次空跑 + 一行日志。不可用的原因由 resolver 的 `ScopeReport` 上报，
-        同步钩子不该成为第二个（更吵的）真相来源。
-        """
-        if self._scopes is None:
-            return None
-        if scope == SCOPE_USER:
-            return self._scopes.user()
-        if scope != SCOPE_PROJECT:
-            return None
-        key = (workspace_id or "").strip()
-        if not key or not self._scopes.project_supported():
-            return None
-        return self._scopes.project(key)
-
-    async def _push_scope(
-        self, scope: str, user_id: str, workspace_id: str, sandbox: AsyncSandbox
-    ) -> None:
-        """把一个作用域的权威副本推到沙箱（后端内部走指纹快路径）。
-
-        失败只告警：Skill 缺一个文件不该让整次工具调用失败；状态与原因由存储门面
-        写日志，不会静默。作用域之间**各自独立 try**——两者目录与状态文件都相互
-        独立，共用一个 try 会让「项目级出问题」变成「用户级也不推」。
-        """
-        service = self._scope_service(scope, workspace_id)
-        if service is None:
-            return
-        try:
-            await service.push(user_id, sandbox)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "push %s skills failed user=%s ws=%s error=%s",
-                scope,
-                user_id[:12],
-                workspace_id[:12],
-                exc,
-            )
-
-    async def _push_skills(
-        self, user_id: str, workspace_id: str, sandbox: AsyncSandbox
-    ) -> None:
-        """把用户级（以及有工作区上下文时的项目级）权威副本推到沙箱。"""
-        await self._push_scope(SCOPE_USER, user_id, workspace_id, sandbox)
-        if (workspace_id or "").strip():
-            await self._push_scope(SCOPE_PROJECT, user_id, workspace_id, sandbox)
-
-    async def _pull_scope(
-        self, scope: str, user_id: str, workspace_id: str, sandbox: AsyncSandbox
-    ) -> None:
-        service = self._scope_service(scope, workspace_id)
-        if service is None:
-            return
-        try:
-            await service.pull(user_id, sandbox)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "pull %s skills failed user=%s ws=%s error=%s",
-                scope,
-                user_id[:12],
-                workspace_id[:12],
-                exc,
-            )
-
-    async def pull_skills(
-        self,
-        user_id: str,
-        workspace_id: str,
-        sandbox: AsyncSandbox,
-        scopes: Collection[str] | None = None,
-    ) -> None:
-        """沙箱 → 权威副本（覆盖 run_command / 脚本落盘等 write_file 之外的写入）。
-
-        `scopes` 是工具层判定「本次调用改了哪一层」的结果：命中就只拉命中的那层，
-        避免一次写 `skills/custom` 顺带触发项目级的整棵树比对。None 表示全拉。
-        """
-        wanted = scopes if scopes is not None else (SCOPE_USER, SCOPE_PROJECT)
-        for scope in (SCOPE_USER, SCOPE_PROJECT):
-            if scope not in wanted:
-                continue
-            await self._pull_scope(scope, user_id, workspace_id, sandbox)
-
-    def mark_skill_pull_pending(
-        self, user_id: str, session_id: str, workspace_id: str = ""
-    ) -> None:
-        """登记「本会话有一次 Skill 写入尚未回拉」，下次拿沙箱时补上。
-
-        记下**当时**的 workspace_id：会话可以换绑工作区，用兑现时刻的上下文去猜
-        会拉错项目的权威副本。空 workspace 表示「只可能有用户级变更」。
-        """
-        if self._scopes is None:
-            return
-        self._skills_pending.add(
-            (user_id, session_id, (workspace_id or "").strip())
-        )
-
-    def _pending_workspaces(self, user_id: str, session_id: str) -> list[str]:
-        """该会话挂起的工作区列表（去重，保持插入顺序无关）。"""
-        found = {
-            ws
-            for (uid, sid, ws) in self._skills_pending
-            if uid == user_id and sid == session_id
-        }
-        return sorted(found)
-
-    def _take_pending(self, user_id: str, session_id: str) -> list[str]:
-        """摘掉该会话的挂起标记并返回需要回拉的工作区列表。
-
-        先摘再拉：沙箱连不上时这一轮的内容只能留在沙箱里，但标记不能留着——
-        留着会让下一次拿沙箱时重复回拉一次已经不再存在的写入。
-        """
-        found = self._pending_workspaces(user_id, session_id)
-        for ws in found:
-            self._skills_pending.discard((user_id, session_id, ws))
-        return found
-
-    async def _drain_skill_pending(
-        self, user_id: str, session_id: str, sandbox: AsyncSandbox
-    ) -> None:
-        """兑现挂起的回拉。顺序：先拉（吸收沙箱改动）再推（本地权威覆盖）。"""
-        for workspace_id in self._take_pending(user_id, session_id):
-            await self.pull_skills(user_id, workspace_id, sandbox)
-
-    async def flush_skill_sync(self, user_id: str, session_id: str) -> None:
-        """run 收尾兜底：把本轮最后一次未回拉的 Skill 写入落地。
-
-        这是「不依赖写类工具钩子」的机制保证——即使 Agent 用 `python x.py` 之类
-        完全不含 skills 字样的命令改了 Skill，只要本轮用过沙箱，收尾时也会回拉一次。
-        代价：一次 `existing_workspace` 连接（仅在该会话有挂起标记时发生）。
-
-        不需要 `workspace_id` 参数：挂起标记里已经记了「当时是哪个工作区」。
-        """
-        if not self._pending_workspaces(user_id, session_id):
-            return
-        try:
-            sandbox = await self.existing_workspace(user_id, session_id)
-        except Exception as exc:  # noqa: BLE001 - 沙箱已被回收：本轮内容只能留在沙箱里
-            self._take_pending(user_id, session_id)
-            logger.warning(
-                "flush skills skipped (sandbox unavailable) user=%s session=%s error=%s",
-                user_id[:12],
-                session_id[:12],
-                exc,
-            )
-            return
-        await self._drain_skill_pending(user_id, session_id, sandbox)
-
     async def _sync_workspace_files(
         self,
         workspace: AsyncSandbox,
@@ -471,7 +307,11 @@ class Service:
 
         全量推送失败（WorkspaceSyncError）上抛，让工具执行层感知「工作区文件尚未同步完成」，
         避免 Agent 拿到不完整的沙箱视图后盲目执行命令。
+
+        `local` 沙箱后端下 no-op（同 B2/B3：路径直连权威副本）。
         """
+        if self._backend == "local":
+            return
         if self._workspace_volumes is None or not workspace_id:
             return
         bound = bool(
@@ -491,12 +331,15 @@ class Service:
     ) -> LocalSandbox:
         """本机沙箱：目录即沙箱，没有远端资源、没有 volume 挂载、没有同步。
 
-        与 e2b 分支的共同点只有两件事——登记 `user_sandboxes`（UI 的沙箱面板和
-        `existing_workspace` 都读它）、以及把 Skill 权威副本铺进去。其余
-        （出口白名单、volume 挂载、B2/B3 同步）在本地语义下都不存在。
+        与 e2b 分支唯一剩下的共同点是登记 `user_sandboxes`（UI 的沙箱面板和
+        `existing_workspace` 都读它）。出口白名单、volume 挂载、文件同步在本地
+        语义下都不存在。
 
-        `workspace/{id}` 由 `LocalSandbox.resolve` 直接映射到权威副本目录，
-        所以这里**刻意不调用** `_sync_workspace_files`。
+        两条路径都由 `LocalSandbox` 直接映射到宿主目录，所以这里**刻意不调用**
+        `_sync_workspace_files`：
+        - `workspace/{id}` → `<data_root>/workspace-volumes/{id}`
+        - `skills`         → `<data_root>/skills`
+        是同一个目录，不是副本。同步在这里没有可搬运的东西。
         """
         sandbox = LocalSandbox.open(user_id, session_id)
 
@@ -514,11 +357,6 @@ class Service:
                 (sandbox.sandbox_id, user_id, session_id),
             )
         await self._db.commit()
-
-        # Skill：顺序与 e2b 分支一致——先兑现上一轮挂起的回拉，再把权威副本推上去。
-        # 本地模式下 push 仍是"写文件到沙箱目录"，走的是存储门面的指纹快路径。
-        await self._drain_skill_pending(user_id, session_id, sandbox)  # type: ignore[arg-type]
-        await self._push_skills(user_id, workspace_id, sandbox)  # type: ignore[arg-type]
         return sandbox
 
     async def workspace(
@@ -547,32 +385,15 @@ class Service:
             # 出口策略：先建沙箱、后收紧的场景在这里补发（带 memo，不重复下发）
             await self._ensure_network_policy(workspace, user_id, workspace_id)
             await self._sync_workspace_files(workspace, workspace_id, user_id=user_id)
-            # Skill：先兑现上轮挂起的回拉，再把权威副本推到沙箱。
-            # 必须独立于 workspace_id —— 纯聊天会话（无工作区）同样要能创建/读取用户级 Skill；
-            # 项目级只在有工作区时参与，由 `_push_skills` 内部判定。
-            await self._drain_skill_pending(user_id, session_id, workspace)
-            await self._push_skills(user_id, workspace_id, workspace)
             return workspace
 
         # volume_mounts: key = 挂载路径，value = Volume 名称/对象。
         # 与 SDK 签名 Dict[path, Union[AsyncVolume, str]] 一致（SDK 内部 name=vol.name）。
+        # Skill 不再需要挂载：桌面端 `/home/user/skills` 由 LocalSandbox 直接
+        # junction 到数据目录，走不到 e2b 这条路径。
         volume_mounts: dict[str, str] = {}
 
-        # 1. 用户 Skills：存储后端决定「挂载」还是「稍后同步」
-        #    - E2B 后端：返回 MountSpec，挂到 /home/user/skills/custom
-        #    - Local 后端：返回 None（沙箱目录随后由 push 填充）
-        skill_mount = (
-            await self._skills.mount_spec(user_id) if self._skills is not None else None
-        )
-        if skill_mount is not None:
-            volume_mounts[skill_mount.path] = skill_mount.name
-        elif self._skills is None:
-            # 兼容路径：没有注入存储门面时退回旧的「直接问 Volume 服务」
-            user_mount = await self._volumes.mount_for_user(user_id)
-            if user_mount is not None:
-                volume_mounts[CUSTOM_SKILLS_PATH] = user_mount.name
-
-        # 2. 确保当前工作区有持久化 Volume（懒创建，否则 git clone 会落到沙箱临时盘、跨会话丢失），
+        # 确保当前工作区有持久化 Volume（懒创建，否则 git clone 会落到沙箱临时盘、跨会话丢失），
         #    再挂载该用户全部已建卷的工作区。
         if self._workspace_volumes is not None and workspace_id:
             try:
@@ -618,8 +439,6 @@ class Service:
         await self._sync_workspace_files(
             workspace, workspace_id, force=True, user_id=user_id
         )
-        # 新沙箱是空盘：把 Skill 全量推一遍（Local 后端靠这一步跨会话生效）
-        await self._push_skills(user_id, workspace_id, workspace)
         await self._db.execute(
             "INSERT INTO user_sandboxes (user_id, session_id, sandbox_id) VALUES (?, ?, ?)",
             (user_id, session_id, workspace.sandbox_id),

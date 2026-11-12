@@ -33,6 +33,7 @@ from typing import Any
 from e2b import FileType
 
 from ...config import data_root
+from ..skills.types import SKILLS_PATH
 from ..workspace.layout import WORKSPACE
 
 logger = logging.getLogger(__name__)
@@ -251,10 +252,13 @@ class LocalSandbox:
         root.mkdir(parents=True, exist_ok=True)
         # 平铺目录先建好：模型第一次 `ls` 时不该看到"目录不存在"。
         # `workspace/` 刻意不在这里建——它是挂载点（联接），由
-        # `_ensure_workspace_mount` 在首次解析工作区路径时创建。
+        # `_ensure_workspace_mount` 在首次解析工作区路径时创建（需要 workspace_id）。
+        # `skills/` 是固定挂载点，不依赖任何参数，所以这里就能建。
         for name in (WORKSPACE.uploads, WORKSPACE.work, WORKSPACE.artifacts):
             (root / name).mkdir(parents=True, exist_ok=True)
-        return cls(root, f"local-{_safe_segment(user_id)}-{_safe_segment(session_id)}")
+        sandbox = cls(root, f"local-{_safe_segment(user_id)}-{_safe_segment(session_id)}")
+        sandbox._ensure_skills_mount()
+        return sandbox
 
     @classmethod
     def attach(cls, user_id: str, session_id: str) -> LocalSandbox:
@@ -320,6 +324,11 @@ class LocalSandbox:
         parts = normalized.split("/")
         if parts and parts[0] == WORKSPACE.workspace and len(parts) >= 2:
             return self._resolve_workspace_volume(parts[1], parts[2:], virtual)
+        # `skills` 同样是一个虚拟挂载点（指向 `<data_root>/skills`）。
+        # 必须在这里分流：下面的 `is_relative_to(base)` 会跟随联接后的真实路径，
+        # 而真实路径不在沙箱根下，否则每个 Skill 读写都会被判成越界。
+        if normalized == SKILLS_PATH or normalized.startswith(SKILLS_PATH + "/"):
+            return self._resolve_skills(normalized, virtual)
 
         base = self._root.resolve()
         target = base if normalized == "." else (base / normalized).resolve()
@@ -340,6 +349,55 @@ class LocalSandbox:
         target = (base / normalized).resolve()
         if target != base and not target.is_relative_to(base):
             raise SandboxPathError(f"路径解析后越出工作区根: {virtual} → {target}")
+        return target
+
+    def _resolve_skills(self, normalized: str, virtual: str) -> Path:
+        """`skills/…` → `<data_root>/skills/…`（权威副本，零拷贝）。"""
+        base = self._ensure_skills_mount()
+        rest = normalized[len(SKILLS_PATH) :].lstrip("/")
+        if not rest:
+            return base
+        target_normalized = posixpath.normpath(rest)
+        if target_normalized == ".." or target_normalized.startswith("../"):
+            raise SandboxPathError(f"路径不能上溯到 skills 之外: {virtual}")
+        target = (base / target_normalized).resolve()
+        if target != base and not target.is_relative_to(base):
+            raise SandboxPathError(f"路径解析后越出 skills 根: {virtual} → {target}")
+        return target
+
+    def _ensure_skills_mount(self) -> Path:
+        """让 `{root}/skills` 指向 `<data_root>/skills`。
+
+        与 workspace 挂载同一套理由：文件原语可以自己翻译路径，但 `run_command`
+        跑的是真实进程，只认文件系统。少了这个联接，`ls skills` 看到空目录而
+        `sandbox_read_file` 能读到内容——两个视图分裂，模型会反复重试同一件事。
+
+        挂在 `skills` 而不是逐个子目录：MSYS 把 junction 识别成符号链接后
+        `ls -la` 只显示链接本身、`find` 默认不进去；挂在父层则 `skills/<name>`
+        就是普通目录。
+        """
+        target = (data_root() / SKILLS_PATH).resolve()
+        target.mkdir(parents=True, exist_ok=True)
+
+        mount = self._root / SKILLS_PATH
+        if _is_link(mount):
+            return target
+        if mount.exists():
+            # 与 workspace 同样的保守处理：非空实体目录不删（可能已有真实文件）
+            try:
+                mount.rmdir()
+            except OSError:
+                logger.warning(
+                    "skills mount skipped: %s 是非空实体目录，shell 看不到 Skill", mount
+                )
+                return target
+
+        if not _make_link(mount, target):
+            logger.warning(
+                "skills mount failed: %s → %s（文件工具仍正常，shell 看不到 Skill）",
+                mount,
+                target,
+            )
         return target
 
     def _ensure_workspace_mount(self, workspace_id: str) -> Path:
@@ -398,6 +456,13 @@ class LocalSandbox:
         if resolved != volumes and resolved.is_relative_to(volumes):
             rel = resolved.relative_to(volumes).as_posix()
             return posixpath.join(WORKSPACE.root, WORKSPACE.workspace, rel)
+
+        # Skill 同理：真实路径在数据目录下，必须还原成 `skills/…`，
+        # 否则模型拿到一个它无法再次传入的绝对路径（下一条命令必然失败）。
+        skills = (data_root() / SKILLS_PATH).resolve()
+        if resolved != skills and resolved.is_relative_to(skills):
+            rel = resolved.relative_to(skills).as_posix()
+            return posixpath.join(WORKSPACE.root, SKILLS_PATH, rel)
 
         base = self._root.resolve()
         try:

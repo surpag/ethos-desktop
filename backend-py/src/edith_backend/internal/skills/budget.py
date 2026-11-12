@@ -1,48 +1,33 @@
-"""Skill 的两层预算（设计稿第十节 / D10）。
+"""Skill 的两层预算。
 
-为什么预算必须两层
-------------------
-只限索引：模型拿到"还有 200 个 Skill"的线索后，可以把正文一个个读进上下文——
-首轮 prompt 很小，第三轮就爆。只限加载：首轮 system prompt 本身已经超了。
-两层各自堵一条路，缺一层等于没做。
+两层各自堵一条路，缺一层等于没做：
 
-本模块只放**纯策略**（怎么截、怎么算），不碰 prompt 渲染、不碰沙箱：
-- L1 `plan_index()`：给定每条摘要的字符成本，决定哪些进 system prompt、哪些被省略。
-- L2 `SkillLoadBudget`：单 run 内已加载几个 Skill、累计多少字节，以及这次读要不要拒。
+- **L1 索引预算**：只限加载的话，首轮 system prompt 本身就可能已经超了——
+  一个装了上百个 Skill 的目录，光清单就能吃掉几千 token。
+- **L2 加载预算**：只限索引的话，模型拿到「还有 200 个 Skill」的线索后可以把
+  正文一个个读进上下文，首轮很小、第三轮就爆。
+
+这套策略与租户无关，所以桌面版原样保留。
 
 L1 为什么是纯函数
 ----------------
-截断必须是**确定性**的：同一份磁盘内容，两次 run 得到的注入文本必须逐字符相同，
+截断必须**确定性**：同一份磁盘内容，两次 run 得到的注入文本必须逐字符相同，
 否则 system prompt 前缀每次都在变，跨 run 的缓存复用直接归零（实测 94.8% → 0%）。
-所以这里不接受任何"按使用频率/最近使用"的输入——那天然是跨 run 变化的。
+所以这里不接受任何「按使用频率 / 最近使用」的输入——那天然是跨 run 变化的。
 """
+
 from __future__ import annotations
 
 import os
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
-from .types import SCOPE_PLATFORM, SCOPE_PROJECT, SCOPE_USER
-
 # --------------------------------------------------------------------------
 # L1：Discovery 索引预算（进 System Prompt 的摘要）
 # --------------------------------------------------------------------------
 
-#: 索引总预算（字符）。单一旋钮：改它一处即可整体缩放。
 _INDEX_BUDGET_ENV = "SKILL_INDEX_BUDGET_CHARS"
 _DEFAULT_INDEX_BUDGET = 4000
-
-#: 各作用域的份额比例。默认值下正好是 1000 / 1500 / 1500 = 4000（设计稿 10.1）。
-#: 用比例而不是绝对值：预算被调大/调小时不必再改三个数，份额自动同比缩放。
-_SCOPE_SHARE = {
-    SCOPE_PLATFORM: 0.25,
-    SCOPE_PROJECT: 0.375,
-    SCOPE_USER: 0.375,
-}
-
-#: 截断的固定顺序 = 注入的固定顺序。溢出额度按这个顺序补给被截断的层，
-#: 于是「谁能用剩余额度」也是确定的（换个顺序，同样的数据会截出不同结果）。
-INDEX_ORDER = (SCOPE_PLATFORM, SCOPE_PROJECT, SCOPE_USER)
 
 
 def index_budget_chars() -> int:
@@ -61,82 +46,40 @@ def index_budget_chars() -> int:
 class IndexPlan:
     """L1 的裁决结果。
 
-    `kept` 是**原下标**（保持调用方给的顺序）：调用方据此拼文本，本模块不关心
-    每行长什么样，也就不会与渲染格式耦合。
+    `kept` / `omitted` 都是**原下标**：调用方据此拼文本，本模块不关心每行长什么样，
+    也就不会与渲染格式耦合。
     """
 
     kept: list[int] = field(default_factory=list)
-    #: (scope, name)，按截断顺序，供"已省略 N 个"与 trace 使用
-    omitted: list[tuple[str, str]] = field(default_factory=list)
+    omitted: list[int] = field(default_factory=list)
 
     @property
     def omitted_count(self) -> int:
         return len(self.omitted)
 
 
-def plan_index(costs: list[tuple[str, str, int]]) -> IndexPlan:
-    """按份额截断，返回保留项与被省略项。
+def plan_index(costs: list[int]) -> IndexPlan:
+    """按顺序截断，返回保留项与被省略项的原下标。
 
-    `costs` 是 `(scope, name, 字符成本)`，**顺序即注入顺序**（平台 → 项目 → 用户，
-    层内按 name 升序）。这里不做排序：排序是调用方的责任，重复排一次会让
-    「同一份数据的输出」依赖两处实现对顺序的理解一致。
+    两点刻意设计：
 
-    两轮分配，解决「一层用不完、另一层被自己的份额挤死」：
-
-    1. **按份额**：每层先拿到自己那份的**下限保障**（防止一个大列表把别人挤没）；
-    2. **溢出再分配**：把没用完的份额汇成公共额度，按固定顺序（优先级降序）补给
-       被截断的层。没有第二轮的话，用户有 50 个 Skill、平台只有 1 个时，用户层会被
-       按 1500 截到 ~15 条，而另外 2500 字符的额度直接浪费——那不是预算，是配额僵化。
-
-    所以份额是**下限**而不是上限：高优先层在第二轮仍可吃掉公共额度。这与
-    「平台优先于项目优先于用户」的裁决一致——不应该出现"平台还有内容没列出来，
-    而用户层的第 30 条先进了 prompt"这种与优先级相反的分配。
-
-    成本本身超过预算的单项不会被"部分保留"：截断以**条目**为单位，
-    半个 Skill 的摘要比没有更糟（模型会以为描述就到那里为止）。
+    - **截断以条目为单位**：半个 Skill 的摘要比没有更糟，模型会以为描述就到那里
+      为止，从而错过一个本该读的 Skill。
+    - **超预算的单项直接计入 omitted 并继续尝试后面的**：单项成本超过总预算时，
+      跳过它比「整份清单只留一条」更诚实——但这种情况本身说明描述写得太长，
+      所以调用方会把 omitted 写进 trace。
     """
     budget = index_budget_chars()
-    # 份额用整数减法而不是浮点累加：浮点会让「刚刚好等于份额」的边界抖动
-    shares = {scope: int(budget * ratio) for scope, ratio in _SCOPE_SHARE.items()}
-
-    by_scope: dict[str, list[int]] = {scope: [] for scope in INDEX_ORDER}
-    for index, (scope, _name, _cost) in enumerate(costs):
-        by_scope.setdefault(scope, []).append(index)
-
-    used = {scope: 0 for scope in INDEX_ORDER}
     kept: list[int] = []
-    deferred: dict[str, list[int]] = {scope: [] for scope in INDEX_ORDER}
-
-    for scope in INDEX_ORDER:
-        limit = shares.get(scope, 0)
-        for index in by_scope.get(scope, ()):
-            cost = costs[index][2]
-            if used[scope] + cost <= limit:
-                used[scope] += cost
-                kept.append(index)
-            else:
-                deferred[scope].append(index)
-
-    # 未知作用域不进 `INDEX_ORDER` 也就不占份额、不会被保留：它们会落进 `omitted`。
-    # 这是诚实的降级（"有个东西没进 prompt，且它叫什么"），而不是悄悄塞进某个层。
-
-    pool = sum(max(0, shares[scope] - used[scope]) for scope in INDEX_ORDER)
-    for scope in INDEX_ORDER:
-        for index in deferred.get(scope, ()):
-            cost = costs[index][2]
-            if pool >= cost:
-                pool -= cost
-                kept.append(index)
-            else:
-                break  # 该层剩余项按顺序全丢，不再跳着捡（跳着捡会让"被省略"不可解释）
-
-    omitted: list[tuple[str, str]] = []
-    kept_set = set(kept)
-    for index, (scope, name, _cost) in enumerate(costs):
-        if index not in kept_set:
-            omitted.append((scope, name))
-
-    kept.sort()  # 恢复调用方给的顺序（注入顺序 = 优先级，不能因为两轮分配被打乱）
+    omitted: list[int] = []
+    used = 0
+    for index, cost in enumerate(costs):
+        cost = max(0, int(cost))
+        if used + cost <= budget:
+            used += cost
+            kept.append(index)
+        else:
+            omitted.append(index)
     return IndexPlan(kept=kept, omitted=omitted)
 
 
@@ -156,7 +99,8 @@ WARN_RATIO = 0.8
 class SkillLoadBudget:
     """单 run 的 Skill 加载账本。
 
-    两个指标必须分开记，理由见设计稿 10.2：
+    两个指标必须分开记：
+
     - **数量**按「不同的 Skill 数」计——否则分页读完一个 100KB 的 SKILL.md 会被
       当成 5 个 Skill 而误杀；
     - **体积**按「累计返回字节」计——否则反复读同一段就能绕过上下文预算。
@@ -167,9 +111,9 @@ class SkillLoadBudget:
 
     max_skills: int = MAX_SKILLS_PER_RUN
     max_bytes: int = MAX_SKILL_BYTES_PER_RUN
-    #: skill 标识（沙箱内目录，如 `skills/custom/demo`）→ 累计返回字节
+    #: skill 标识（沙箱内目录，如 `skills/demo`）→ 累计返回字节
     loaded: dict[str, int] = field(default_factory=dict)
-    #: 被硬拒绝的次数：用于发现"模型在硬撞配额"
+    #: 被硬拒绝的次数：用于发现「模型在硬撞配额」
     denied: int = 0
 
     @property
@@ -221,7 +165,7 @@ class SkillLoadBudget:
         return ChargeDecision(allowed=True, reason="", message=warning)
 
     def snapshot(self) -> dict[str, object]:
-        """trace 用的快照（键名与设计稿 10.2 对齐）。"""
+        """trace 用的快照。"""
         return {
             "loadedSkills": self.loaded_skills,
             "loadedBytes": self.loaded_bytes,
@@ -281,7 +225,6 @@ def charge_skill_load(key: str, size: int) -> ChargeDecision | None:
 
 
 __all__ = [
-    "INDEX_ORDER",
     "MAX_SKILLS_PER_RUN",
     "MAX_SKILL_BYTES_PER_RUN",
     "WARN_RATIO",

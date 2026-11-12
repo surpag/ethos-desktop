@@ -2,14 +2,13 @@ import { currentUserId } from "@/lib/auth/current-user";
 
 const runtimeURL = process.env.EDITH_RUNTIME_URL ?? "http://127.0.0.1:8080";
 
-// GET /api/skills 只把当前 Clerk 用户的身份注入 Go Runtime。
+// GET /api/skills 转发到 Runtime。桌面端只有一份 Skill 目录，没有作用域参数——
+// 认证仍然过一遍 `currentUserId()`，是为了云端部署时这条路由不至于变成公开接口。
 export async function GET(request: Request) {
   const userId = await currentUserId();
   if (!userId) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
-  const url = new URL("/internal/skills", runtimeURL);
-  url.searchParams.set("userId", userId);
-  return forward(url, request);
+  return forward(new URL("/internal/skills", runtimeURL), request);
 }
 
 async function forward(url: string | URL, request?: Request) {

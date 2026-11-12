@@ -48,12 +48,7 @@ from .internal.session.constraint_store import ConstraintStore
 from .internal.session.plan_store import RunPlanStore
 from .internal.skills import HTTP as SkillsHTTP
 from .internal.skills import Catalog as SkillsCatalog
-from .internal.skills.storage import (
-    SkillScopeStores,
-    SkillStorageService,
-    new_skill_backend,
-    workspace_access_checker,
-)
+from .internal.skills import seed_builtin
 from .internal.systemtools import SystemToolSet
 from .internal.tools import ToolRegistry
 from .internal.trace import Store as TraceStore
@@ -172,19 +167,12 @@ async def lifespan(app: FastAPI):
     workspace_volumes = WorkspaceVolumeService(workspaces, workspace_backend)
     workspace_memories = WorkspaceMemoryStore(db)
 
-    # 用户 Skill 存储：默认本地目录（E2B Volumes 仍是 private beta，未开通会 403）。
-    # 上层（catalog / sandbox / agentrun）只依赖门面，切换后端不需要改业务代码。
-    skill_storage = SkillStorageService(
-        new_skill_backend(os.getenv("EDITH_USER_SKILLS_BACKEND", "local"), volumes)
-    )
-    # 作用域分发点：项目级要绑定 workspace，且**必须**带归属判定器
-    # （`workspace/store.exists` —— 只回 bool，不区分"不存在"与"不属于你"）。
-    # 不传判定器时项目级 fail-closed：读返回 unavailable、写拒绝且不建目录。
-    skill_scopes = SkillScopeStores(
-        os.getenv("EDITH_USER_SKILLS_BACKEND", "local"),
-        user_service=skill_storage,
-        access_checker=workspace_access_checker(workspaces),
-    )
+    # Skill：一份目录，没有作用域。内置 Skill 在启动时铺进去（目标已存在就跳过，
+    # 用户改过的内容不会被升级覆盖回去）。目录本身由 LocalSandbox junction 到
+    # 沙箱的 `/home/user/skills`，所以这里只负责「宿主机上有什么」。
+    skills_root = config.data_root() / "skills"
+    seed_builtin(skills_root)
+    skills = SkillsCatalog(skills_root)
 
     sandboxes = SandboxService(
         db,
@@ -192,7 +180,6 @@ async def lifespan(app: FastAPI):
         volumes,
         workspaces,
         workspace_volumes,
-        skill_scopes=skill_scopes,
         # 桌面端默认本机沙箱；显式设置 EDITH_SANDBOX_BACKEND 可覆盖（调试用）。
         # 云端不设这个变量 → e2b，行为与上游一致。
         backend=os.getenv("EDITH_SANDBOX_BACKEND")
@@ -209,7 +196,6 @@ async def lifespan(app: FastAPI):
         sandboxes, _git_identity, git_push.push, git_push.remote_info
     )
     sandbox_input = SandboxAgentInput(sandboxes)
-    skills = SkillsCatalog(skill_storage)
     cron_jobs = await new_cronjob_module(db, users.settings)
     images = await new_images_module(
         db,
@@ -234,7 +220,6 @@ async def lifespan(app: FastAPI):
             store=session_store,
             usage=usage.recorder,
             skills=skills,
-            skill_scopes=skill_scopes,
             images=images.agent_input,
             files=sandbox_input,
             mcp=mcp_runtime,
@@ -245,7 +230,6 @@ async def lifespan(app: FastAPI):
             tool_definitions=tools.tool_definitions(),
             tool_executor=tools,
             traces=traces,
-            skill_flush=sandboxes.flush_skill_sync,
         )
     )
     gateway = new_gateway_service(users.bindings, agent_runs)
@@ -260,7 +244,7 @@ async def lifespan(app: FastAPI):
     app.include_router(build_instruction_router(workspace_memories))
     app.include_router(build_memory_router(workspace_memories))
     app.include_router(conversations.http.router)
-    app.include_router(SkillsHTTP(skills, skill_scopes).router)
+    app.include_router(SkillsHTTP(skills).router)
     app.include_router(SandboxHTTP(sandboxes).router)
     app.include_router(GitopsHTTP(git_push).router)
     app.include_router(cron_jobs.http.router)

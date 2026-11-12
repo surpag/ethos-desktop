@@ -22,13 +22,7 @@ from ..gitops import (
     run_git,
 )
 from ..skills.budget import charge_skill_load
-from ..skills.types import (
-    CUSTOM_PATH,
-    PROJECT_PATH,
-    SCOPE_PROJECT,
-    SCOPE_USER,
-    SYSTEM_PATH,
-)
+from ..skills.types import SKILL_FILE, SKILLS_PATH
 from ..tools import COMMAND_ERROR, TOOL_FAILURE, command_stderr_hint, tool_error_result
 from ..workspace.volume_backend import WorkspaceSyncError
 from .service import Service
@@ -99,96 +93,27 @@ _PATH_FIELDS: dict[str, tuple[str, ...]] = {
 # 审计摘要要跳过的"大字段"（文件内容），避免把正文写进日志
 _BULKY_ARG_KEYS = {"content", "data"}
 
-# Skill 在沙箱中的相对前缀（与 skills/types 的 CUSTOM_PATH / PROJECT_PATH 一致）。
-# 写类工具是否"可能改了 Skill"的判定分两层：
-#   ① 精确：路径参数落在 skills/custom 或 skills/project/{ws} 下
-#      （write_file / mkdir / move / delete）
-#   ② 启发式：run_command 的命令文本里出现 skills/custom、skills/project、
-#      skill-creator 或 SKILL.md
-# 两层都不命中时**不能**断定没改（例如 `python build_skills.py`），
-# 因此登记一次「挂起回拉」，由下一次拿沙箱或 run 收尾兜底（两种作用域一起拉）。
-_USER_SCOPE_COMMAND_MARKERS = ("skills/custom", "skill-creator", "SKILL.md")
-_PROJECT_SCOPE_COMMAND_MARKERS = ("skills/project",)
-
-
-def _command_text(arguments: dict) -> str:
-    """把 run_command 的 command + argv 拼成可搜索文本。"""
-    command = str(arguments.get("command") or "")
-    argv = arguments.get("argv") or []
-    if isinstance(argv, (list, tuple)):
-        command = " ".join([command, *(str(a) for a in argv)])
-    return command
-
-
-def _scopes_of_path(raw: object) -> frozenset[str]:
-    """一个路径参数落在哪个 Skill 作用域下（可能不属于任何作用域）。"""
-    if not isinstance(raw, str):
-        return frozenset()
-    path = raw.replace("\\", "/")
-    if path == CUSTOM_PATH or path.startswith(CUSTOM_PATH + "/"):
-        return frozenset({SCOPE_USER})
-    if path == PROJECT_PATH or path.startswith(PROJECT_PATH + "/"):
-        return frozenset({SCOPE_PROJECT})
-    return frozenset()
-
-
-_SKILL_ENTRY_FILE = "SKILL.md"
-
-
 def skill_body_key(raw: object) -> str:
-    """若该路径是**某个 Skill 的正文**（`.../{skill_dir}/SKILL.md`），返回 Skill 目录键。
+    """若该路径是**某个 Skill 的正文**（`skills/{dir}/SKILL.md`），返回 Skill 目录键。
 
-    只认三种形状（与设计稿 10.2「命中 `skills/**/SKILL.md` 时累加」对齐）：
-    `skills/system/{dir}/SKILL.md`、`skills/custom/{dir}/SKILL.md`、
-    `skills/project/{ws}/{dir}/SKILL.md`。
+    只认这一种形状：`scripts/` 与 `references/` 是按需片段，把整个目录都计入
+    会把正常使用误伤（读一个 30KB 的 references 就撞掉一半额度）。
 
-    为什么不宽一点（比如 `skills/**` 下任意文件都算）：`references/` 与 `scripts/`
-    是**按需片段**，把整目录都计入会把正常使用误伤（读一个 30KB 的 references 就
-    撞掉一半额度）。这条残余风险在设计稿 10.2 里是明确接受并写明的，不是遗漏。
-
-    键用**目录**而不是 Skill 名：同名的平台版与项目版是两个不同的 Skill，
-    按名字合并会让「读两个同名 Skill」被算成一个。
+    键用**目录名**而不是 frontmatter 里的 name：两者可以不同，而磁盘路径永远是
+    目录名——按 name 记账会让同一份正文被算成两个 Skill。
     """
     if not isinstance(raw, str):
         return ""
     path = raw.replace("\\", "/").strip("/")
-    if not path.endswith("/" + _SKILL_ENTRY_FILE):
+    # 模型传绝对路径（`/home/user/skills/...`）和相对路径都合法，统一成相对形式。
+    if path.startswith("home/user/"):
+        path = path[len("home/user/") :]
+    if not path.endswith("/" + SKILL_FILE):
         return ""
-    parent = path[: -len(_SKILL_ENTRY_FILE) - 1]  # 去掉 `/SKILL.md`
-    # 用户级 / 平台级：skills/{system|custom}/{dir}
-    for root in (SYSTEM_PATH, CUSTOM_PATH):
-        if parent.startswith(root + "/") and "/" not in parent[len(root) + 1 :]:
-            return parent
-    # 项目级：skills/project/{workspace_id}/{dir}
-    if parent.startswith(PROJECT_PATH + "/"):
-        rest = parent[len(PROJECT_PATH) + 1 :]
-        if len(rest.split("/")) == 2:
-            return parent
+    parent = path[: -len(SKILL_FILE) - 1]  # 去掉 `/SKILL.md`
+    if parent.startswith(SKILLS_PATH + "/") and "/" not in parent[len(SKILLS_PATH) + 1 :]:
+        return parent
     return ""
-
-
-def _touched_skill_scopes(name: str, arguments: dict) -> frozenset[str]:
-    """该次工具调用可能改动了哪些作用域的 Skill（空集 = 判断不出）。
-
-    返回值是**可能改动的全部作用域**，不是"最可能的一个"：多拉一层的代价是本地
-    一次树比对，漏拉一层的代价是这轮写入没落地（下一轮索引里看不到，用户以为丢了）。
-
-    为什么必须区分作用域而不是笼统地"可能改了 Skill"：两层各有独立的权威副本与
-    共识集合（D7），无差别地全拉会把项目级的整棵树也比对一遍——每次写用户级
-    Skill 都多一次远端 list。
-    """
-    if name == "sandbox_run_command":
-        text = _command_text(arguments)
-        found: set[str] = set()
-        if any(marker in text for marker in _USER_SCOPE_COMMAND_MARKERS):
-            found.add(SCOPE_USER)
-        if any(marker in text for marker in _PROJECT_SCOPE_COMMAND_MARKERS):
-            found.add(SCOPE_PROJECT)
-        return frozenset(found)
-    scopes: set[str] = set()
-    for key in _PATH_FIELDS.get(name, ()):
-        scopes |= _scopes_of_path(arguments.get(key))
-    return frozenset(scopes)
 
 
 def _complete_workspace_path(path: str, workspace_id: str) -> str:
@@ -526,11 +451,9 @@ class SandboxToolSet:
                             "suggestion": (
                                 "只能访问当前工作区内的文件。工作区内相对路径"
                                 "（如 docs/report.md）会自动补全到当前工作区；"
-                                "项目级 Skill 用 skills/project/<目录>/SKILL.md"
-                                "（省略 workspace_id 时自动补当前工作区）。"
+                                "平台 Skill 用 skills/<目录>/SKILL.md。"
                                 "若本条报的是「without a workspace context」，"
-                                "说明本次会话没有绑定工作区：项目级不可用，"
-                                "请改用用户级 skills/custom/<目录>/SKILL.md，"
+                                "说明本次会话没有绑定工作区，"
                                 "或让用户先在顶部选择一个工作区。"
                             ),
                         },
@@ -571,11 +494,10 @@ class SandboxToolSet:
                     arguments, user_id, session_id, workspace_id
                 )
             elif name in _FILE_TOOLS:
-                # 文件类工具把「当前会话的工作区」一起交给 _op_*：
-                # 路径校验（workspace_path）要用它判定越权、补全 `workspace` /
-                # `skills/project` 缺省的 ID 段。与上面的 _scope_violation 必须是同一个
-                # 上下文——曾经只给了校验、没给执行层，导致 skills/project/{ws}/…
-                # 被误判成「没有 workspace 上下文」，项目级 Skill 永远写不进去。
+                # 文件类工具把「当前会话的工作区」一起交给 _op_*：路径校验
+                # （workspace_path）要用它判定越权、补全 `workspace` 缺省的 ID 段。
+                # 授权层与执行层必须是同一个上下文——曾经只给了校验、没给执行层，
+                # 报出来的两条错互相矛盾。
                 result = await handler(sandbox, arguments, workspace_id)
             else:
                 result = await handler(sandbox, arguments)
@@ -598,20 +520,6 @@ class SandboxToolSet:
             # B2：写类工具执行后，把沙箱中与本地不同的文件拉回本地（覆盖 run_command 盲区）
             if name in _MUTATING_TOOLS and workspace_id:
                 await self._service.sync_sandbox_to_local(user_id, workspace_id, sandbox)
-            # Skill：写类工具可能改了任一层作用域的 Skill。命中就立刻回拉命中的那层
-            # （本轮结果马上可见）；判断不出则挂起（带当时的 workspace_id），
-            # 交给下一次拿沙箱 / run 收尾兜底。
-            # 注意这里**不带 workspace_id 条件**：没有工作区的会话同样有用户级 Skill。
-            if name in _MUTATING_TOOLS:
-                touched = _touched_skill_scopes(name, arguments)
-                if touched:
-                    await self._service.pull_skills(
-                        user_id, workspace_id, sandbox, scopes=touched
-                    )
-                else:
-                    self._service.mark_skill_pull_pending(
-                        user_id, session_id, workspace_id
-                    )
             return json.dumps(result, ensure_ascii=False)
         except Exception as exc:  # noqa: BLE001 - 工具错误转为结果返回（业务错误 → command_error，系统故障 → tool_failure）
             return tool_error_result(name, exc)

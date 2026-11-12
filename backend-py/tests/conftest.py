@@ -19,20 +19,21 @@ from edith_backend.main import app
 
 @pytest.fixture(scope="session")
 def client(tmp_path_factory) -> TestClient:
-    db_path = tmp_path_factory.mktemp("data") / "edith-test.db"
-    previous = os.environ.get("EDITH_DB_PATH")
+    data_dir = tmp_path_factory.mktemp("data")
+    db_path = data_dir / "edith-test.db"
+    previous_db = os.environ.get("EDITH_DB_PATH")
     os.environ["EDITH_DB_PATH"] = str(db_path)
-    # 用户 Skill 本地根目录同样重定向：默认 `user-skills/` 是相对 CWD 的，
-    # 测试沿用会往仓库里写用户数据（且各用例互相干扰）。
-    previous_skills = os.environ.get("EDITH_USER_SKILLS_DIR")
-    os.environ["EDITH_USER_SKILLS_DIR"] = str(db_path.parent / "user-skills")
+    # 整个数据根一起重定向：`data_root()` 底下还有 `skills/` 与 `workspace-volumes/`，
+    # 少设这一条时它们会写进仓库（skills 尤其隐蔽——看起来像"用户建的东西"）。
+    previous_root = os.environ.get("ETHOS_DATA_DIR")
+    os.environ["ETHOS_DATA_DIR"] = str(data_dir)
     try:
         with TestClient(app) as c:
             yield c
     finally:
         for name, value in (
-            ("EDITH_DB_PATH", previous),
-            ("EDITH_USER_SKILLS_DIR", previous_skills),
+            ("EDITH_DB_PATH", previous_db),
+            ("ETHOS_DATA_DIR", previous_root),
         ):
             if value is None:
                 os.environ.pop(name, None)

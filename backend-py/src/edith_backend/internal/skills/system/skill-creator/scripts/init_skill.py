@@ -37,7 +37,7 @@ def quoted(value):
     return json.dumps(value, ensure_ascii=False)
 
 
-def create_skill(name, root, resources, display_name, short_description):
+def create_skill(name, root, resources):
     """创建 Skill 文件和资源目录。"""
     skill_path = Path(root) / name
     if skill_path.exists():
@@ -45,7 +45,7 @@ def create_skill(name, root, resources, display_name, short_description):
     skill_path.mkdir(parents=True)
 
     title = " ".join(part.capitalize() for part in name.split("-"))
-    description = short_description or f"用于 {title} 相关任务的工作方法。"
+    description = f"用于 {title} 相关任务的工作方法。"
     skill_md = (
         "---\n"
         f"name: {name}\n"
@@ -57,12 +57,6 @@ def create_skill(name, root, resources, display_name, short_description):
     )
     (skill_path / "SKILL.md").write_text(skill_md, encoding="utf-8")
 
-    metadata = display_name or title
-    (skill_path / "edith.yaml").write_text(
-        f"display_name: {quoted(metadata)}\n"
-        f"short_description: {quoted(description)}\n",
-        encoding="utf-8",
-    )
     for resource in resources:
         (skill_path / resource).mkdir()
     return skill_path
@@ -73,16 +67,10 @@ def main():
     parser.add_argument("skill_name", help="Skill 名称，会规范化为小写连字符格式")
     parser.add_argument(
         "--path",
-        default="/home/user/skills/custom",
-        help=(
-            "Skill 根目录。用户级用默认值 /home/user/skills/custom；"
-            "项目级传 /home/user/skills/project/<真实 workspace-id>"
-            "（没有工作区时不要建项目级，也不要用占位符）"
-        ),
+        default="/home/user/skills",
+        help="Skill 根目录，默认 /home/user/skills（与宿主数据目录是同一个目录）",
     )
     parser.add_argument("--resources", default="", help="可选目录: scripts,references,assets")
-    parser.add_argument("--display-name", default="", help="edith.yaml 中的展示名称")
-    parser.add_argument("--short-description", default="", help="edith.yaml 中的展示说明")
     args = parser.parse_args()
 
     name = normalize_name(args.skill_name)
@@ -94,21 +82,13 @@ def main():
         return 1
     try:
         resources = parse_resources(args.resources)
-        skill_path = create_skill(
-            name,
-            args.path,
-            resources,
-            args.display_name,
-            args.short_description,
-        )
+        skill_path = create_skill(name, args.path, resources)
     except (OSError, ValueError) as error:
         print(f"错误: {error}", file=sys.stderr)
         return 1
 
-    print(f"已创建 EDITH Skill: {skill_path}")
+    print(f"已创建 Skill: {skill_path}")
     print("下一步: 编辑 SKILL.md，完成后运行 quick_validate.py 校验格式。")
-    # 不要提示跑 sync_overview.py：索引由服务端扫描目录派生，
-    # 在沙箱里生成 overview.md 只会造出一份与权威索引无关的假索引。
     return 0
 
 

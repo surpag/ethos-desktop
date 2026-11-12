@@ -81,13 +81,36 @@ ETHOS_DESKTOP=1 ETHOS_DATA_DIR="$APPDATA/ETHOS-dev" \
   .venv/Scripts/python.exe -m uvicorn edith_backend.main:app --port 8080
 ```
 
+## Skill（M2）
+
+云端版按 platform / user / project 三层存放，再用解析器裁决「谁覆盖谁」——那是
+多租户的必需品。桌面端只有一个用户、一份目录，三层退化成三个子文件夹，裁决链
+永远只有参与者一人。所以这里砍到只剩一句话：**一个目录，扫它**。
+
+```text
+%APPDATA%\ETHOS\skills\<名字>\SKILL.md     ⇄  /home/user/skills/<名字>/SKILL.md
+```
+
+- **加载**：每轮对话扫一遍目录，取 frontmatter 的 `name` + `description` 渲染成清单，
+  追加到 System Prompt **末尾**（放前面会让前缀缓存每次失效）。正文不进 prompt。
+- **读取**：模型用 `sandbox_read_file` 按需读。同一轮最多 3 个 Skill、累计 60KB，
+  超了返回结构化错误而不是抛异常（模型能据此改用片段读）。
+- **预算**：清单 4000 字符封顶，按条目截断，被截掉的在文本里写明「还有 N 个未列出」——
+  不说的话模型会认为目录里只有这些，得出「那个 Skill 不存在」这种虚构结论。
+- **内置**：`current-time`、`skill-creator` 在启动时铺进数据目录，**目标已存在的跳过**。
+  用户改过的内置 Skill 不会被升级覆盖回去。
+
+删掉的东西：`resolver.py`（407 行裁决）、`storage/`（约 1800 行：作用域存储、冲突快照、
+LWW、事务、校验）、`migrate.py`（527 行迁移工具）、`overview.md` 索引、B2/B3 Skill 同步、
+`edith.yaml` 展示元数据。**`sync.py` 保留**——E2B 后端仍在用它的 workspace 同步。
+
 ## 当前进度
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | M0 | 壳能跑：standalone + sidecar + 数据目录 | 完成 |
 | M1 | 本地沙箱：`sandbox/` 换成本机实现，11 个原语 | 完成 |
-| M2 | 删同步：`workspace/sync.py` 在本地后端下 no-op | 未开始 |
+| M2 | Skill 单层化；本地后端下所有同步路径短路 | 完成 |
 | M3 | 桌面化：keychain、托盘、退出清理 | 未开始 |
 | M4 | 分发：隔离、签名、自动更新 | 未开始 |
 
@@ -104,10 +127,12 @@ ETHOS_DESKTOP=1 ETHOS_DATA_DIR="$APPDATA/ETHOS-dev" \
 |---|---|
 | `/home/user/work/a.txt` | `%APPDATA%\ETHOS\sandbox\{user}\{session}\work\a.txt` |
 | `/home/user/workspace/{id}/…` | `%APPDATA%\ETHOS\workspace-volumes\{id}\…`（**零拷贝，不同步**） |
+| `/home/user/skills/…` | `%APPDATA%\ETHOS\skills\…`（**零拷贝，不同步**） |
 
-第二行是本地模式最重要的简化：E2B 后端里沙箱与权威副本是两份，才需要
+后两行是本地模式最重要的简化：E2B 后端里沙箱与权威副本是两份，才需要
 `workspace/sync.py` 那 842 行的推送/回拉/护栏/熔断；本地模式下它们本来就是
-同一个目录，同步问题从根上不存在。
+同一个目录，同步问题从根上不存在。所以 `sync.py` 在 `local` 后端下全程短路
+（判定放在方法首行，不在三个调用点各写一遍）。
 
 ### 四件"看起来能用、实际不能用"的事
 

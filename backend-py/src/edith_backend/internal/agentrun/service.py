@@ -23,7 +23,6 @@ from ..session.constraint_store import ConstraintStore, constraints_enabled
 from ..session.plan_store import RunPlanStore
 from ..session.store import SessionStore, WorkspaceSessionConflict
 from ..skills.catalog import Catalog as SkillsCatalog
-from ..skills.storage import SkillScopeStores
 from ..trace import (
     CANCELED,
     DEGRADE_MCP,
@@ -74,9 +73,6 @@ class Dependencies:
     store: SessionStore
     usage: Recorder
     skills: SkillsCatalog | None = None
-    # 作用域分发点：解析器要读项目级 Skill 时按 workspace_id 取门面。
-    # 不传时项目层按「未配置」上报（不是报错）——纯聊天会话本来就没有项目级。
-    skill_scopes: SkillScopeStores | None = None
     images: object | None = None
     files: object | None = None
     mcp: object | None = None
@@ -89,9 +85,6 @@ class Dependencies:
     tool_definitions: list[dict] = field(default_factory=list)
     tool_executor: object | None = None
     traces: TraceStore | None = None
-    # run 收尾兜底：把本轮沙箱里最后一次未回拉的用户 Skill 写入落地。
-    # 放在这里而不是写死在 agentrun 内部，是为了不让「调度层」认识 sandbox/skills。
-    skill_flush: Callable[[str, str], Awaitable[None]] | None = None
 
 
 @dataclass
@@ -118,7 +111,6 @@ class Service:
             deps.mcp,
             deps.memories,
             deps.constraints,
-            deps.skill_scopes,
         )
         self.store = deps.store
         self.constraints = deps.constraints
@@ -144,7 +136,6 @@ class Service:
         self.memories = deps.memories
         # trace 落盘器；为 None 时打点全部空转（可作总开关）
         self.traces = deps.traces
-        self.skill_flush = deps.skill_flush
 
     async def run(self, request: Request) -> tuple[Stream | None, Error | None]:
         """按「会话准入 → 配置聚合 → 记录用量 → 启动流式执行」启动一次任务。"""
@@ -611,14 +602,6 @@ class Service:
         finally:
             if mcp_tools is not None:
                 await mcp_tools.close()
-            # 用户 Skill 兜底回拉：本轮若有用「工具钩子判断不出」的方式改过 Skill
-            # （如 `python build_skills.py`），在这里落地；否则下一轮索引里看不到它。
-            # 放在收尾最前面：它读的是沙箱现状，越早越接近「本轮结束时」。
-            if self.skill_flush is not None:
-                try:
-                    await self.skill_flush(request.user_id, request.session_id)
-                except Exception:
-                    logger.warning("flush user skills on run end failed", exc_info=True)
             # 计划生命周期跟着 run 走：无论正常收尾、取消还是异常，都要关掉，
             # 否则注册表里会留下一条「活跃计划」，下次同会话的 run 只能覆盖它。
             if self.plans is not None:

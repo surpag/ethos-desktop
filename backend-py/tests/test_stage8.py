@@ -6,15 +6,9 @@ import asyncio
 import os
 
 from edith_backend.internal.agentrun.configuration import (
+    append_uploads,
     message_with_uploads,
-    run_instruction,
 )
-from edith_backend.internal.skills.resolver import (
-    SCOPE_PLATFORM,
-    ResolvedCatalog,
-    ResolvedEntry,
-)
-from edith_backend.internal.skills.types import SkillSummary
 from edith_backend.internal.userconfig.mcp import MCPServer
 from edith_backend.internal.userconfig.mcp_runtime import MCPToolContext, _toolset_name
 from edith_backend.internal.volume.trace import (
@@ -22,25 +16,6 @@ from edith_backend.internal.volume.trace import (
     trace_enabled,
     user_fingerprint,
 )
-
-
-def _resolved(platform: list[SkillSummary] | None = None) -> ResolvedCatalog:
-    """构造一个只含平台层的解析结果（项目级/用户条目在 golden 用例里覆盖）。
-
-    B2-3 起 `ResolvedCatalog` 不再携带索引原文（`user_overview` 已删除）：注入统一
-    从 `entries` 渲染，于是"索引里有的东西"与"注入里有的东西"不可能各说一套。
-    """
-    entries = [
-        ResolvedEntry(
-            name=s.name,
-            description=s.description,
-            scope=SCOPE_PLATFORM,
-            sandbox_path=f"skills/system/{s.dir_name or s.name}",
-            source_dir=s.dir_name or s.name,
-        )
-        for s in platform or []
-    ]
-    return ResolvedCatalog(entries=entries)
 
 
 def test_message_with_uploads_empty() -> None:
@@ -59,22 +34,24 @@ def test_message_with_uploads_only_files() -> None:
     assert result == "附件：\n- `a.txt`"
 
 
-def test_run_instruction_with_uploads() -> None:
-    instruction = run_instruction(_resolved(), ["uploads/a.txt"])
+def test_append_uploads_without_text() -> None:
+    instruction = append_uploads("", ["uploads/a.txt"])
     assert "本次用户上传文件" in instruction
     assert "uploads/a.txt" in instruction
     assert "uploads/ 读取" in instruction
 
 
-def test_run_instruction_skill_plus_uploads() -> None:
-    summaries = [SkillSummary(name="current-time", description="获取当前时间")]
-    instruction = run_instruction(_resolved(summaries), ["uploads/a.txt"])
+def test_append_uploads_keeps_skill_block() -> None:
+    """Skill 段落与上传清单是拼接而不是互相覆盖——两者都属于「本次运行的上下文」。"""
+    instruction = append_uploads("## Skill\n- `current-time`", ["uploads/a.txt"])
+    assert instruction.startswith("## Skill")
     assert "current-time" in instruction
     assert "本次用户上传文件" in instruction
 
 
-def test_run_instruction_no_uploads() -> None:
-    assert run_instruction(_resolved(), []) == ""
+def test_append_uploads_no_files_is_identity() -> None:
+    assert append_uploads("## Skill\n- x", []) == "## Skill\n- x"
+    assert append_uploads("", []) == ""
 
 
 def test_mcp_toolset_name_normalization() -> None:
