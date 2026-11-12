@@ -70,21 +70,21 @@
 | `..http_utils`（`EDITHError`） | 业务错误异常，抛出后由全局异常处理器转为 `{"type","message"}` JSON 响应 |
 | 外部 SDK：`fastapi`（`APIRouter`、`StreamingResponse`）、`pydantic`（`BaseModel`、`ConfigDict`、`Field`、`alias_generators.to_camel`） | HTTP 路由框架与请求体校验/序列化 |
 
-装配关系（`main.py` 组合根）：`gateway = new_gateway_service(users.bindings, agent_runs)` → `web = Adapter(gateway)` → `app.include_router(web.router)`（`main.py` 第 99~100、112 行）。
+装配关系（`main.py` 组合根）：`gateway = new_gateway_service(agent_runs)` → `web = Adapter(gateway)` → `app.include_router(web.router)`。
 
 ### ② 数据流向
 
 一次典型"Web 流式消息"业务流转：
 
 ```
-Web BFF（Clerk 注入 userId）
+Web BFF（服务端注入 userId）
    │  POST /internal/gateway/messages:stream  (JSON, camelCase)
    ▼
 adapter.py stream_message
    │  解析 MessageRequest → 构造 gateway.IncomingMessage(channel="web", ...)
    ▼
 gateway.Service.run()
-   │  web 为可信渠道 → 不做 bindings 身份转换，直接以 external_user_id 为 user_id
+   │  web 在白名单内 → 直接以 external_user_id 为 user_id
    │  （gateway/service.py _is_trusted_channel：web、cron 均可信）
    ▼
 agentrun.Service.run() → 返回 Stream(asyncio.Queue[Event | None])
@@ -121,7 +121,7 @@ Web BFF / 前端（按 camelCase 字段读取事件）
 ### ① 核心业务逻辑要点
 
 1. **协议适配**：模块只关心 HTTP/JSON/SSE 与 Gateway 中性调用的互相转换，不感知 Agent 内部逻辑。
-2. **可信渠道直通**：`WEB_CHANNEL = "web"` 属于可信渠道（`gateway/service.py` `_is_trusted_channel`），Gateway 不做 bindings 身份转换，直接用 `external_user_id` 作为 EDITH `user_id`；`userId` 必须由 Web BFF 从 Clerk 注入（`types.py` 文档注释），浏览器不能自行提供。
+2. **渠道直通**：`WEB_CHANNEL = "web"` 在 gateway 的渠道白名单内，直接用 `external_user_id` 作为 EDITH `user_id`；`userId` 必须由 Web BFF 在服务端注入，浏览器不能自行提供。
 3. **SSE 序列化契约**：`Event.model_dump_json(exclude_none=True, by_alias=True)` 输出 camelCase（`assistantId` / `blockId` / `toolCallId` / `sessionUsage` 等），与 Go 版 `agentstream.Event` 的 json tag 保持一致，前端按 camelCase 读取；`exclude_none=True` 省略空字段（对齐 Go 的 `omitempty`）。
 4. **SSE 响应头**：`media_type="text/event-stream"`，并设置 `Cache-Control: no-cache, no-transform` 与 `X-Accel-Buffering: no`（防止 Nginx 缓冲导致流不实时），与 Go 版 `stream.go` 一致。
 5. **事件流终止**：`Stream.open(after)` 返回的异步迭代器以 `None` 哨兵结束（对应 Go 版 channel 关闭），消费到即 `break` 关闭 SSE 流。
@@ -131,7 +131,7 @@ Web BFF / 前端（按 camelCase 字段读取事件）
 
 ### ② 配置项
 
-**无**。`adapter.py` / `types.py` 未读取任何环境变量或配置；组合根 `main.py` 读取的 `EDITH_E2B_TEMPLATE`（sandbox）、`EDITH_COS_*`（images）等属于其他模块，与本模块无关。
+**无**。`adapter.py` / `types.py` 未读取任何环境变量或配置。
 
 ### ③ 异常处理
 

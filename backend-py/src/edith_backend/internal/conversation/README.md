@@ -82,7 +82,7 @@
 web-v1 前端
    │  GET /api/conversations 或 /api/conversations/{sessionId}
    ▼
-web-v1 BFF（Clerk 认证取 userId，转发到 EDITH_RUNTIME_URL，默认 http://127.0.0.1:8080）
+web-v1 BFF（服务端解析 userId，转发到 EDITH_RUNTIME_URL，默认 http://127.0.0.1:8080）
    │  GET /internal/conversations?userId=...
    │  GET /internal/conversations/{session_id}?userId=...
    ▼
@@ -114,7 +114,7 @@ conversation/history.py
 
 **被谁调用**：
 
-- web-v1 BFF 代理：`web-v1/app/api/conversations/route.ts`（会话列表）与 `web-v1/app/api/conversations/[sessionId]/route.ts`（会话详情）——Clerk 认证后把 `userId` 拼入 query 转发到 runtime。
+- web-v1 BFF 代理：`web-v1/app/api/conversations/route.ts`（会话列表）与 `web-v1/app/api/conversations/[sessionId]/route.ts`（会话详情）——服务端把 `userId` 拼入 query 转发到 runtime。
 - 组合根：`main.py` 中 `conversations = new_conversation_module(session_store, usage.reader)` 后 `app.include_router(conversations.http.router)` 注册到 FastAPI 应用。
 
 **内部方法调用链**：`main.py` → `new_module` → `History(store, usage)`、`HTTP(history)` → HTTP handler 调 `history.list` / `history.get` → `store.list_sessions` / `store.get_records` + `usage.session_summary`。
@@ -133,7 +133,7 @@ conversation/history.py
 
 ### 4.2 配置项
 
-**无**。本模块代码未读取任何环境变量或配置（`EDITH_E2B_TEMPLATE`、`EDITH_COS_*` 等是组合根 `main.py` 中 sandbox/images 等其他模块的配置；运行监听地址由组合根 `config` 模块管理）。前端 BFF 侧另有 `EDITH_RUNTIME_URL`（web-v1 配置，不属于本模块）。
+**无**。本模块代码未读取任何环境变量或配置（运行监听地址由组合根 `config` 模块管理）。前端 BFF 侧另有 `EDITH_RUNTIME_URL`（web-v1 配置，不属于本模块）。
 
 ### 4.3 异常处理
 

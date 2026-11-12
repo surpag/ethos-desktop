@@ -170,16 +170,16 @@ class WorkspaceStore:
         self,
         user_id: str,
         workspace_id: str,
-        on_destroy_volume: object | None = None,
+        on_destroy_storage: object | None = None,
     ) -> bool:
         """删除工作区并级联删除其项目指令；先调用存储清理回调。
 
-        on_destroy_volume: async callable (user_id, workspace_id) -> None，
-        由调用方注入（`WorkspaceVolumeService.on_delete`）。名字沿用历史——
-        它现在的职责是"清掉工作区在磁盘上的目录"。
+        on_destroy_storage: async callable (user_id, workspace_id) -> None，
+        由调用方注入（`WorkspaceVolumeService.on_delete`），职责是清掉工作区
+        在磁盘上的目录。
         """
-        if on_destroy_volume is not None:
-            await on_destroy_volume(user_id, workspace_id)  # type: ignore[misc]
+        if on_destroy_storage is not None:
+            await on_destroy_storage(user_id, workspace_id)  # type: ignore[misc]
 
         async with self._db.execute(
             "DELETE FROM workspaces WHERE user_id = ? AND workspace_id = ?",

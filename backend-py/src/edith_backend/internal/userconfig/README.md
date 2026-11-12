@@ -4,22 +4,19 @@
 
 **模块名**：`userconfig`（Python 包路径：`edith_backend.internal.userconfig`）
 
-**一句话定位**：管理每个用户的 Agent 设置（人格、默认模型、时区）、模型供应商密钥、外部渠道账号到 Clerk 用户的绑定，以及 MCP 服务配置与运行时工具连接；是其他业务模块（models / cronjob / agentrun / gateway）共用的用户级底层能力模块。
-
-**对应 Go 版源码路径**：`backend-v2/internal/userconfig/`（对照文件：`bindings.go`、`mcp.go`、`mcp_headers.go`、`mcp_http.go`、`mcp_runtime.go`、`mcp_validation.go`、`module.go`、`providers.go`、`routes.go`、`schema.go`、`settings.go`、`settings_http.go`、`types.go`）。
+**一句话定位**：管理本机用户的 Agent 设置（人格、默认模型、时区）、模型供应商密钥、MCP 服务配置与运行时工具连接，以及 Git 凭据；是其他业务模块（models / cronjob / agentrun）共用的用户级底层能力模块。
 
 **文件清单**（文件名 + 一句话职责）：
 
 | 文件 | 职责 |
 | --- | --- |
-| `__init__.py` | 包导出面：对外公开 `Module`、`new_module` 及各子能力类（`Settings`/`Providers`/`Bindings`/`MCP`/`HTTP`）与常用类型。 |
+| `__init__.py` | 包导出面：`Module`、`new_module` 及各子能力类（`Settings`/`Providers`/`MCP`/`HTTP`）与常用类型。 |
 | `module.py` | 组装入口：`new_module(db, default_model_id)` 先建表、再创建各子能力并组装 HTTP（对应 Go 版 `module.go` 的 `Module` 与 `New`）。 |
-| `schema.py` | 表结构：本模块拥有的 6 张表的 DDL（`users`、`user_agents`、`user_providers`、`user_mcp_servers`、`user_mcp_headers`、`user_channel_bindings`）。 |
-| `store.py` | 持久化辅助：`ensure_user()` 确保用户记录存在，首次访问建立空白用户（对应 Go 版 `bindings.go` 中的 `ensureUser`）。 |
+| `schema.py` | 表结构：`users`、`user_agents`、`user_providers`、`user_mcp_servers`、`user_mcp_headers`、`user_git_credentials`。 |
+| `store.py` | 持久化辅助：`ensure_user()` 确保用户记录存在，首次访问建立空白用户。 |
 | `types.py` | 类型定义：内部类型用 dataclass、HTTP 契约用 Pydantic（camelCase 对齐 Go 版 json tag）。 |
 | `settings.py` | 用户 Agent 设置（人格 / 默认模型 / 时区）的读写。 |
 | `providers.py` | 用户模型供应商密钥的读写与「只暴露状态」的查询。 |
-| `bindings.py` | 外部渠道账号到 Clerk 用户的映射（绑定 / 查询）。 |
 | `mcp.py` | MCP 服务配置的读写与输入安全校验（URL/传输方式/Header 校验）。 |
 | `mcp_http.py` | MCP 服务配置的 HTTP 管理路由（`build_mcp_router` 工厂函数）。 |
 | `mcp_runtime.py` | MCP 运行时：连接用户启用的 MCP 服务、注册工具、执行工具调用。 |
@@ -34,7 +31,7 @@
 | --- | --- | --- |
 | 组装层 | `module.py` | `Module` 聚合各子能力；`new_module()` 是唯一入口工厂。 |
 | HTTP 边界层 | `http.py`、`mcp_http.py` | 定义 `APIRouter`，做参数校验与异常→`EDITHError` 映射，不含业务 SQL。 |
-| 服务层（领域能力） | `settings.py`、`providers.py`、`bindings.py`、`mcp.py`、`mcp_runtime.py` | 业务规则与持久化读写；`mcp_runtime.py` 负责对外部 MCP 服务的连接。 |
+| 服务层（领域能力） | `settings.py`、`providers.py`、`mcp.py`、`mcp_runtime.py`、`gitcredentials.py` | 业务规则与持久化读写；`mcp_runtime.py` 负责对外部 MCP 服务的连接。 |
 | 数据访问层 | 各服务类内部 + `schema.py` + `store.py` | 各服务类持有 `aiosqlite.Connection` 直接执行 SQL；`schema.py` 建表；`store.py` 提供 `ensure_user` 公共辅助。 |
 | 类型定义层 | `types.py`、`mcp.py`（内嵌 dataclass/Pydantic 模型） | 内部流转用 dataclass，HTTP 进出用 Pydantic（camelCase）。 |
 
@@ -46,7 +43,7 @@
 | --- | --- | --- |
 | 依赖注入（构造器注入） | 所有服务类 `__init__(self, db)`；`HTTP.__init__(settings, providers, default_model_id)`；`Module.__init__(...)` | 数据库连接与依赖对象由调用方（`new_module`、`main.py`）注入，模块内部不自行创建。 |
 | 工厂函数 | `module.py: new_module()`；`mcp_http.py: build_mcp_router(mcp)` | 统一创建整模块 / 创建 MCP 路由。 |
-| 仓储式封装 | `Settings`、`Providers`、`MCP`、`Bindings` | 每个类封装一类实体的增删改查，隐藏 SQL 与表结构细节。 |
+| 仓储式封装 | `Settings`、`Providers`、`MCP`、`GitCredentials` | 每个类封装一类实体的增删改查，隐藏 SQL 与表结构细节。 |
 | 适配器 | `mcp_runtime.py`（`_connect_server`、`MCPToolContext`） | 把官方 `mcp` SDK（`ClientSession`、`sse_client`、`streamable_http_client`）适配为内部统一工具上下文，并将 MCP 工具定义转换为 OpenAI function-calling 格式。 |
 | 策略分派（简单分支） | `mcp_runtime._connect_server`：按 `server.transport`（`"sse"` / `"streamable"`）选择不同客户端 | 传输方式策略化，新增传输只需增加分支。 |
 | DTO / 契约分离 | `types.py`、`mcp.py` | 内部 dataclass（`AgentSettings`、`MCPServer` 等）与对外 Pydantic 模型（`SettingsRequest`/`SettingsResponse`、`MCPServerRequest`/`MCPServerResponse`）分离，`alias_generator=to_camel` 对齐 Go json tag。 |
@@ -56,9 +53,9 @@
 
 | 名称 | 所在文件 | 职责 / 关键签名 |
 | --- | --- | --- |
-| `new_module(db, default_model_id) -> Module` | `module.py` | 模块入口：校验 db、`create_schema`、装配 `Settings/Providers/Bindings/MCP/HTTP`。 |
-| `Module` | `module.py` | 能力集合：`settings`、`providers`、`bindings`、`mcp`、`http` 五个公开字段。 |
-| `create_schema(db)` | `schema.py` | 执行 6 张表的 `CREATE TABLE IF NOT EXISTS`。 |
+| `new_module(db, default_model_id) -> Module` | `module.py` | 模块入口：校验 db、`create_schema`、装配 `Settings/Providers/MCP/HTTP/GitCredentials`。 |
+| `Module` | `module.py` | 能力集合：`settings`、`providers`、`mcp`、`http`、`git_credentials`。 |
+| `create_schema(db)` | `schema.py` | 执行各表 `CREATE TABLE IF NOT EXISTS` 与幂等补列/清表。 |
 | `ensure_user(db, user_id)` | `store.py` | `INSERT OR IGNORE INTO users`，保证用户记录存在。 |
 | `Settings.load / save` | `settings.py` | 读/写 `user_agents` 表（personality、default_model_id、timezone），`save` 用 UPSERT。 |
 | `Settings.load_personality / load_default_model_id / load_timezone` | `settings.py` | 便捷读取，均基于 `load()`。 |
@@ -66,8 +63,6 @@
 | `Providers.list_statuses(user_id)` | `providers.py` | 返回 `list[ProviderStatus]`（`provider_id` + `has_api_key`），**只暴露状态、不暴露密钥**。 |
 | `Providers.save(user_id, credentials)` | `providers.py` | UPSERT 供应商密钥；`api_key is None` 的项跳过（不覆盖）。 |
 | `Providers.load_api_key(user_id, provider_id) -> str` | `providers.py` | 服务端读取明文密钥供 Agent 运行使用；未找到抛 `LookupError`。 |
-| `Bindings.bind(channel, external_user_id, clerk_user_id)` | `bindings.py` | UPSERT 渠道绑定到 `user_channel_bindings`。 |
-| `Bindings.to_clerk_user_id(channel, external_user_id) -> tuple[str\|None, bool]` | `bindings.py` | 渠道账号→Clerk 用户查询，未绑定时 `found=False`。 |
 | `MCP.list / create / update / delete` | `mcp.py` | `user_mcp_servers` + `user_mcp_headers` 的增删改查；`update` 仅 upsert 提交的 header（值为 None 的不覆盖），`delete` 级联删除 headers。 |
 | `_validate_input(input_, require_header_values)` | `mcp.py` | MCP 输入安全校验（名称、transport 白名单、URL 协议与本地地址、header 名/去重/必填值）。 |
 | `HTTP` | `http.py` | 用户设置 + 供应商密钥的 HTTP 边界；`_write_settings` 组装响应（默认模型兜底 `default_model_id or self.default_model_id`）。 |
@@ -120,12 +115,11 @@ agentrun/configuration.py: Configuration.load(request)
 运行中：模型经 MCPToolContext.execute(prefixed_name, args) 调用远端工具
 ```
 
-**流程 3：渠道消息绑定解析（gateway → userconfig）**
+**流程 3：渠道消息身份（gateway，不经 userconfig）**
 ```
 gateway/service.py: Gateway.run(msg)
-   非可信渠道：bindings.to_clerk_user_id(channel, external_user_id)
-       ├─ 未绑定 → Error("identity_not_bound")
-       └─ 已绑定 → 得到 clerk_user_id，作为 AgentRun 的 user_id
+   渠道白名单：web / cron 之外的渠道一律 invalid_request；
+   放行的渠道直接用 external_user_id 作为 AgentRun 的 user_id。
 ```
 
 **流程 4：cronjob 时区读写（cronjob → userconfig）**
@@ -161,7 +155,6 @@ models/http.py: GET /internal/available-models ──▶ providers.list_statuses
 | `Settings.save_timezone` / `load_timezone` | `cronjob/http.py:57`、`cronjob/schedule_rules.py:33` | 定时任务时区维护。 |
 | `Providers.load_api_key` | `agentrun/configuration.py:74` | AgentRun 读取密钥。 |
 | `Providers.list_statuses` | `models/http.py:42` | `/internal/available-models` 过滤可用模型。 |
-| `Bindings.to_clerk_user_id` | `gateway/service.py:37` | 渠道身份解析。 |
 | `MCPRuntime.open_tools` | `agentrun/configuration.py:116` | 本次运行的 MCP 工具上下文。 |
 | `MCP.*`（list/create/update/delete） | `mcp_http.build_mcp_router` | HTTP 管理接口的后端服务。 |
 | `new_module(db, DEFAULT_MODEL_ID)` | `main.py:59` | 组合根装配；随后 `users.http.router`、`build_mcp_router(users.mcp)` 注册路由，`MCPRuntime(users.mcp)` 供 agentrun 使用。 |
@@ -182,20 +175,19 @@ models/http.py: GET /internal/available-models ──▶ providers.list_statuses
 4. **MCP 工具命名空间隔离**：`_toolset_name` 生成 `{清洗后的服务名}_{8位短id}` 前缀，工具重命名为 `{toolset}__{原名}`，避免多服务同名工具冲突；`execute` 按前缀名查回原名调用 `session.call_tool`。
 5. **MCP 运行时降级策略**：`open_tools` 逐个连接启用服务，单个服务连接失败只 `logger.warning` 并跳过，不影响本次运行其他服务；关闭时逐个 `__aexit__` 并吞掉关闭异常。
 6. **工具调用结果规范化**：`MCPToolContext.execute` 把 `CallToolResult` 文本内容拼接返回；`is_error=True` 或未知工具名时返回 `{"error": ...}` JSON 字符串。
-7. **绑定语义**：`user_channel_bindings` 以 `(channel, external_user_id)` 为联合主键，重复绑定走 UPSERT 覆盖归属。
-8. **级联清理**：删除 MCP 服务时同步删除其 headers（`mcp.delete`）；`mcp.create` 只插入有值的 header。
+7. **级联清理**：删除 MCP 服务时同步删除其 headers（`mcp.delete`）；`mcp.create` 只插入有值的 header。
 
 ### ② 配置项
 
 **无**。本模块所有文件均未读取环境变量或应用配置（未发现 `os.getenv` / `config` 引用）；模块所需的唯一外部参数 `default_model_id` 由组合根 `main.py:59` 注入（来源为 `models.DEFAULT_MODEL_ID = minimax.m3`，见 `internal/models/catalog.py`）。
 
-> 说明：`EDITH_E2B_TEMPLATE` 等环境变量属于 sandbox 模块（`main.py:66`），与本模块无关。
+> 说明：模块整体的数据根目录（`ETHOS_DATA_DIR` / 桌面 `%APPDATA%\ETHOS`）由 `config.data_root()` 决定，属于组合根，与本模块无关。
 
 ### ③ 异常处理
 
 | 异常类型 | 抛出位置 | 处理策略 |
 | --- | --- | --- |
-| `ValueError` | `bind`/`to_clerk_user_id`、`Settings`/`Providers`/`MCP.create` 的参数校验 | 由调用方捕获映射：`gateway/service.py:40` 捕获转 `Error("internal_error", ...)`；其余为防御性校验（正常情况下不会触发）。 |
+| `ValueError` | `Settings`/`Providers`/`MCP.create` 的参数校验 | 防御性校验（正常情况下不会触发），HTTP 层映射为 400。 |
 | `InvalidMCPServer` | `mcp.py:_validate_input` | HTTP 层（`mcp_http.py`）捕获转 `EDITHError(400, "invalid_mcp_server", msg)`。 |
 | `MCPServerNotFound` | `mcp.update` / `mcp.delete`（rowcount==0） | HTTP 层转 `EDITHError(404, "mcp_server_not_found", ...)`。 |
 | `LookupError`（密钥缺失） | `providers.load_api_key` | `agentrun/configuration.py:75` 捕获转 `Error("invalid_request", ...)`。 |
@@ -224,4 +216,4 @@ models/http.py: GET /internal/available-models ──▶ providers.list_statuses
 | `user_providers` | `(user_id, provider_id)` | 用户供应商密钥（api_key 明文仅服务端可读）。 |
 | `user_mcp_servers` | `server_id` | MCP 服务配置（name / url / transport / enabled / 时间戳）。 |
 | `user_mcp_headers` | `(server_id, header_name)` | MCP 请求头（值密文与否由上层决定，当前为明文存储）。 |
-| `user_channel_bindings` | `(channel, external_user_id)` | 外部渠道账号 → Clerk 用户映射。 |
+| `user_git_credentials` | `(user_id, provider)` | Git 推送凭据（token 混淆后落库）。 |

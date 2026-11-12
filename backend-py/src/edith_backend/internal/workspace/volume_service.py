@@ -124,14 +124,8 @@ class WorkspaceVolumeService:
         root = self._backend.local_root_of(workspace_id)
         return str(root) if root else None
 
-    async def on_delete(
-        self, user_id: str, workspace_id: str, volume_id: str | None = None
-    ) -> None:
-        """删除工作区时调用：清理本地目录（绑定的是用户目录时只解绑）。
-
-        `volume_id` 是历史签名（曾用于区分远端卷 id），保留参数只为不改调用方；
-        本地存储不看它。
-        """
+    async def on_delete(self, user_id: str, workspace_id: str) -> None:
+        """删除工作区时调用：清理本地目录（绑定的是用户目录时只解绑）。"""
         try:
             await self._backend.destroy(user_id, workspace_id)
         except Exception as exc:  # noqa: BLE001 - 销毁失败不影响删除

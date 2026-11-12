@@ -125,7 +125,7 @@ webadapter POST /internal/gateway/messages:stream
 
 ### ② 配置项
 
-**无**。本模块不读取任何环境变量或配置（`main.py` 中的 `EDITH_E2B_TEMPLATE`、`EDITH_COS_*` 分别属于 sandbox、images 模块）。
+**无**。本模块不读取任何环境变量或配置。
 
 ### ③ 异常处理
 

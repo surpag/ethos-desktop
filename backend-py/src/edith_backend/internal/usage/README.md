@@ -126,7 +126,7 @@
 
 ### ② 配置项
 
-**无**。本模块不读取任何环境变量或配置文件；模块唯一输入是组合根传入的 `aiosqlite.Connection`。`main.py` 中的 `EDITH_E2B_TEMPLATE`（sandbox）、`EDITH_COS_*`（images）等环境变量与本模块无关。
+**无**。本模块不读取任何环境变量或配置文件；模块唯一输入是组合根传入的 `aiosqlite.Connection`。
 
 ### ③ 异常处理
 

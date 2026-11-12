@@ -108,7 +108,7 @@ webadapter.Adapter.stream_message            (webadapter/adapter.py)
    ▼
 gateway.Service.run                          (gateway/service.py)
    │  身份翻译：WEB/CRON 为可信渠道直接用 userId；
-   │  其余渠道经 bindings.to_clerk_user_id 换绑（未绑定 → identity_not_bound）
+   │  其余渠道不在白名单内 → invalid_request（没有绑定表，不做 fallback）
    │  to_agentrun_request(...) → agentrun.Request
    ▼
 agentrun.Service.run                         (service.py)
@@ -159,7 +159,7 @@ webadapter 消费队列                          (webadapter/adapter.py)
 | `GET /internal/gateway/runs/{request_id}` | 查询任务状态（query 参数 `userId`） |
 | `POST /internal/gateway/runs/{request_id}/cancel` | 取消任务（query 参数 `userId`） |
 
-**调用方链**：`main.py` 组合根创建 `agent_runs = Service(Dependencies(...))` → 传给 `new_gateway_service(users.bindings, agent_runs)` → `Adapter(gateway)`（Web）与 `CronAdapter(gateway)`（定时任务，`cronjob` 模块）均通过 gateway 触发 agentrun。
+**调用方链**：`main.py` 组合根创建 `agent_runs = Service(Dependencies(...))` → 传给 `new_gateway_service(agent_runs)` → `Adapter(gateway)`（Web）与 `CronAdapter(gateway)`（定时任务，`cronjob` 模块）均通过 gateway 触发 agentrun。
 
 **涉及的 DB 表**：本模块不直接建表/写 SQL，经由依赖访问——`session.store` 写 `chat_messages` 表（`user_id / session_id / role / content / reasoning / image_ids`），`usage.recorder` 写 `usage_runs` 表（`request_id` 主键、token 用量、`status`：running/completed/failed）。
 
@@ -177,7 +177,7 @@ webadapter 消费队列                          (webadapter/adapter.py)
 
 ### ② 配置项
 
-**无**。本模块代码内未读取任何环境变量或配置项（没有 `os.getenv` / `environ` 调用）。与运行相关的环境变量（如 `EDITH_E2B_TEMPLATE`、`EDITH_COS_*`）由组合根 `main.py` 读取并注入到 Sandbox / Images 模块，再以依赖对象形式传入。本模块的"配置"全部来自：注入的依赖（`Dependencies`）、用户设置（`userconfig.Settings`：人格、默认模型）、供应商密钥（`userconfig.Providers`）、模型目录定义（`models.catalog.ModelDefinition`：`base_url` / `api_model` / `vision` / `extra_fields`）、`MAX_TOOL_ROUNDS`（代码常量）。
+**无**。本模块代码内未读取任何环境变量或配置项（没有 `os.getenv` / `environ` 调用）。与运行相关的路径（数据根目录等）由组合根 `main.py` 决定，再以依赖对象形式传入。本模块的"配置"全部来自：注入的依赖（`Dependencies`）、用户设置（`userconfig.Settings`：人格、默认模型）、供应商密钥（`userconfig.Providers`）、模型目录定义（`models.catalog.ModelDefinition`：`base_url` / `api_model` / `vision` / `extra_fields`）、`MAX_TOOL_ROUNDS`（代码常量）。
 
 ### ③ 异常处理
 

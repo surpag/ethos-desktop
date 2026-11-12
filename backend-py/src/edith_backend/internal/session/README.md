@@ -147,7 +147,7 @@ session 是纯内部模块，`main.py` 中 `app.include_router(...)` 列表里�
 
 **无。**
 
-本模块不读取任何环境变量/配置（`EDITH_E2B_TEMPLATE` 等由 sandbox、images 等其他模块读取；数据库连接由 `main.py` 经 `config.database_path()` 打开后注入，属 database/config 模块职责，session 只接收连接对象）。
+本模块不读取任何环境变量/配置（数据库连接由 `main.py` 经 `config.database_path()` 打开后注入，属 database/config 模块职责，session 只接收连接对象）。
 
 ### ③ 异常处理
 

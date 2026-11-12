@@ -43,7 +43,7 @@
 | --- | --- | --- |
 | `Adapter` | `adapter.py` | Cron 渠道执行器；不负责轮询和任务存储。`__init__(self, gateway: GatewayService) -> None` |
 | `Adapter.run_job` | `adapter.py` | `async def run_job(self, job: Job) -> None`：把一个已抢占任务交给 Gateway，并消费事件直到 AgentRun 收尾；失败时抛异常。 |
-| （复用）`Job` | `cronjob/types.py` | 一条定时任务定义（dataclass），含 `id`、`clerk_user_id`、`task_type`、`prompt` 等字段。 |
+| （复用）`Job` | `cronjob/types.py` | 一条定时任务定义（dataclass），含 `id`、`user_id`、`task_type`、`prompt` 等字段。 |
 | （复用）`IncomingMessage` / `CRON_CHANNEL` | `gateway/types.py` | 渠道消息 dataclass 与渠道常量 `CRON_CHANNEL = "cron"`。 |
 
 ## 三、与其他模块的联系
@@ -72,7 +72,7 @@ Scheduler._run_claimed(job) ──► JobRunner.run_job(job)      【调用点�
    ▼
 cronadapter.Adapter.run_job(job)
    │ 构造 IncomingMessage{
-   │   channel="cron", external_user_id=job.clerk_user_id,
+   │   channel="cron", external_user_id=job.user_id,
    │   session_key="cron:{job.id}", request_id=uuid4().hex, message=job.prompt }
    ▼
 gateway.Service.run(msg)          【cron 属于可信渠道，跳过用户绑定查找】
@@ -92,7 +92,7 @@ store.finish_run(job.id)：recurring 重算 next_run_at；once 置 enabled=0（c
 要点：
 
 - `Job` 数据来自 `cron_jobs` 表（`cronjob/store.py`），但本模块不直接访问该表；
-- cron 渠道在 gateway 中属于可信渠道（`gateway/service.py` 的 `_is_trusted_channel` 对 `"web"`、`"cron"` 返回 True），因此不做用户绑定查找，身份直接取 `job.clerk_user_id`；
+- cron 渠道在 gateway 中属于可信渠道（`gateway/service.py` 的 `_is_trusted_channel` 对 `"web"`、`"cron"` 返回 True），因此不做用户绑定查找，身份直接取 `job.user_id`；
 - 执行结果沉淀在 `cron:{job.id}` 对应的 Agent 会话历史中（`Job` docstring 注明）。
 
 ### 3. 接口调用
@@ -120,14 +120,14 @@ store.finish_run(job.id)：recurring 重算 next_run_at；once 置 enabled=0（c
 
 - **渠道翻译**：把 cron 任务（`Job`）翻译为 Gateway 的 cron 渠道 `IncomingMessage`，每次运行生成独立 `request_id`（`uuid4().hex`）。
 - **会话隔离**：`session_key = "cron:{job.id}"`，同一任务的每次运行进入同一 Agent 会话，结果写入该会话历史。
-- **可信渠道**：cron 是受信渠道，绕过 `userconfig.bindings` 的用户映射，直接用 `job.clerk_user_id` 作为用户身份。
+- **渠道身份**：cron 在 gateway 的渠道白名单内，直接取 `job.user_id` 作为用户身份，不做任何映射。
 - **事件消费**：`while True: event = await stream.events.get(); if event is None: break`——必须消费到 `None` 哨兵才算收尾（对齐 Go 版 channel 关闭语义）。
 - **错误提升**：只关注 `run.error` 事件；启动失败（`gateway.run` 返回的 `run_error`）与执行失败（`run.error` 事件）都转为 `RuntimeError` 向上抛出。
 - **与 Go 版的差异**：Go `RunJob(ctx, job)` 返回 error，Python `run_job(job)` 直接抛异常（且无 context 参数）；Go `New(agentGateway)` 工厂校验 gateway 非空并返回 error，Python 构造器不做非空校验。
 
 ### 2. 配置项
 
-无。本模块不读取任何环境变量或配置（`EDITH_E2B_TEMPLATE`、`EDITH_COS_*` 等由 `main.py` 读取并注入 sandbox、images 等其他模块）。
+无。本模块不读取任何环境变量或配置。
 
 ### 3. 异常处理
 

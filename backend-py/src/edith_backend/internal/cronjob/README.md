@@ -48,7 +48,7 @@
 | 仓储（Repository） | `store.py` 的 `Store` 类 | 所有 SQL 收敛于此，业务层不直接接触 SQL；对外暴露语义化方法（`create/list/update/delete/set_enabled/due_jobs/claim_due/finish_run/initialize_next_runs`） |
 | 适配器（Adapter） | 外部模块 `cronadapter.Adapter`（`main.py` 中 `CronAdapter(gateway)`） | 实现 `JobRunner` 协议，把 `Job` 转成 Gateway 消息（`CRON_CHANNEL`），是 cronjob 与 gateway/agentrun 之间的适配器 |
 | 协议/结构化子类型（Protocol） | `scheduler.py: class JobRunner(Protocol)` | 用 `typing.Protocol` 声明 `run_job(job: Job) -> None` 契约，运行时鸭子类型匹配，无需继承 |
-| DTO/视图模型 | `types.py: JobResponse` | 面向 Web 的安全表示，裁剪内部字段（如不暴露 `clerk_user_id`），时间字段序列化为字符串 |
+| DTO/视图模型 | `types.py: JobResponse` | 面向 Web 的安全表示，裁剪内部字段（如不暴露 `user_id`），时间字段序列化为字符串 |
 | 异常分层映射 | `http.py` + `http_utils.EDITHError` | 领域异常（`InvalidJob`/`JobNotFound`）在 HTTP 层转为统一的 `{"type","message"}` JSON 错误 |
 | 状态标记位（轻量状态机） | `cron_jobs` 表的 `enabled`/`running` 列 | 任务的启用/禁用（toggle）、运行中抢占、执行后释放由布尔列驱动，配合 `next_run_at` 表达调度状态 |
 
@@ -56,7 +56,7 @@
 
 | 名称 | 所在文件 | 职责 / 关键签名 |
 | --- | --- | --- |
-| `Job` | `types.py` | 任务领域数据类：`id, clerk_user_id, name, task_type, schedule, prompt, enabled=True, next_run_at=None, running=False, created_at=None` |
+| `Job` | `types.py` | 任务领域数据类：`id, user_id, name, task_type, schedule, prompt, enabled=True, next_run_at=None, running=False, created_at=None` |
 | `JobInput` | `types.py` | 创建/编辑时允许填写的字段：`name, task_type, schedule, prompt` |
 | `CreateRequest` | `types.py` | 创建/更新任务的 HTTP 输入（camelCase 别名、`extra="forbid"`）：`user_id, name, task_type, schedule, prompt, timezone`；`userId` 由 BFF 注入 |
 | `JobResponse` / `ListResponse` | `types.py` | 任务响应模型（`next_run_at`/`created_at` 为 ISO 字符串）与任务列表响应 |
@@ -123,7 +123,7 @@ Scheduler.run：
        └─ 逐个 Store.claim_due(job_id, now)          # 原子 UPDATE running=1；rowcount!=1 则跳过（防重复）
             └─ asyncio.create_task(_run_claimed(job))
                  ├─ runner.run_job(job)              # cronadapter.Adapter → Gateway
-                 │    ├─ gateway.run(IncomingMessage(channel="cron", external_user_id=job.clerk_user_id,
+                 │    ├─ gateway.run(IncomingMessage(channel="cron", external_user_id=job.user_id,
                  │    │     session_key=f"cron:{job.id}", message=job.prompt))
                  │    └─ 消费事件流直到结束/run.error（执行结果落在该 Agent 会话历史中）
                  └─ Store.finish_run(job.id, now)    # running=0；recurring 重算 next_run_at，once 置 enabled=0
@@ -167,7 +167,7 @@ Agent 会话 → ToolRegistry.execute("create_cron_job", arguments, user_id, ses
 
 ### ① 核心业务逻辑要点
 
-1. **任务模型**：任务归属用户（`clerk_user_id`），由 `name/task_type/schedule/prompt` 定义；`task_type` 仅支持 `once`（RFC3339 绝对时间）与 `recurring`（五段 cron 表达式）。
+1. **任务模型**：任务归属用户（`user_id`），由 `name/task_type/schedule/prompt` 定义；`task_type` 仅支持 `once`（RFC3339 绝对时间）与 `recurring`（五段 cron 表达式）。
 2. **调度时间计算**：`schedule_rules.next_run` 按用户时区计算——once 直接解析 `datetime.fromisoformat`，recurring 用 `croniter` 从 `from_time` 取下一触发时刻；用户未设置时区时回退默认 `Asia/Shanghai`。
 3. **原子抢占（防重复执行）**：`claim_due` 用条件 `UPDATE ... SET running=1 WHERE id=? AND enabled=1 AND running=0 AND next_run_at<=?`，以 `rowcount != 1` 判断抢占失败并跳过——即使部署多实例也不会重复派发同一任务。
 4. **执行生命周期**：抢占成功即 `asyncio.create_task` 异步执行（不阻塞轮询循环）；执行后无论成败都会 `finish_run` 释放 `running` 标记；recurring 任务重算下一次时间，once 任务执行完自动 `enabled=0`（一次性）。
@@ -177,7 +177,7 @@ Agent 会话 → ToolRegistry.execute("create_cron_job", arguments, user_id, ses
 
 ### ② 配置项
 
-**环境变量**：无。cronjob 模块内未读取任何环境变量（`EDITH_E2B_TEMPLATE` 等由 `main.py` 中其他模块如 sandbox 读取，与本模块无关）；数据库连接由 `main.py` 的 `config.database_path()` 统一提供。
+**环境变量**：无。cronjob 模块内未读取任何环境变量；数据库连接由 `main.py` 的 `config.database_path()` 统一提供。
 
 **代码内常量（非环境配置）**：
 
@@ -185,7 +185,7 @@ Agent 会话 → ToolRegistry.execute("create_cron_job", arguments, user_id, ses
 | --- | --- | --- | --- |
 | `_DEFAULT_TIMEZONE` | `schedule_rules.py` | `"Asia/Shanghai"` | 用户未配置时区时的默认时区 |
 | `DEFAULT_POLL_INTERVAL` | `scheduler.py` | `10` | 调度轮询间隔（秒） |
-| `cron_jobs` | `schema.py` | 表名 | 任务表：`id, clerk_user_id, name, task_type, schedule, prompt, enabled, next_run_at, running, created_at` |
+| `cron_jobs` | `schema.py` | 表名 | 任务表：`id, user_id, name, task_type, schedule, prompt, enabled, next_run_at, running, created_at` |
 
 ### ③ 异常处理
 

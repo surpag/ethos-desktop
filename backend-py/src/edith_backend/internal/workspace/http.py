@@ -149,7 +149,7 @@ def build_workspace_router(
         user_id: str = Query(..., alias="userId", min_length=1),
     ):
         deleted = await store.delete(
-            user_id, workspace_id, on_destroy_volume=volume_service.on_delete
+            user_id, workspace_id, on_destroy_storage=volume_service.on_delete
         )
         if not deleted:
             raise EDITHError(404, "not_found", "workspace not found")

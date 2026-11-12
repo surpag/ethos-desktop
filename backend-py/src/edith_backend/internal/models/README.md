@@ -150,7 +150,7 @@
 | `EDITH_ALLOW_LOCAL_MODEL_ENDPOINT` | `false` | 允许自定义端点使用 `http://` 与回环/私网地址（自建 Ollama、vLLM、内网网关）。**云元数据端点始终拒绝**，不受此开关影响。 |
 | `EDITH_MODEL_PROBE_TIMEOUT_S` | `15` | 「拉取模型列表」与「测试连接」的请求超时（秒）；两条路径都 `max_retries=0`，不叠加 SDK 重试。 |
 
-内置供应商的 base_url 仍是 `catalog.py` 里的硬编码常量。组合根 `main.py` 中读取的 `EDITH_E2B_TEMPLATE`（`main.py:66`）、`EDITH_COS_*` 等属于 sandbox/images 模块，与本模块无关。
+内置供应商的 base_url 仍是 `catalog.py` 里的硬编码常量，与本模块的配置项无关。
 
 ### ③ 异常处理
 

@@ -1,32 +1,29 @@
-# EDITH backend (Python)
+# ETHOS backend (Python)
 
-EDITH 服务端 Agent 平台的 **Python 重写版**，1:1 对齐 Go 版 [`backend-v2/`](../backend-v2/) 的功能与对外契约。
+ETHOS 桌面版的服务端：一个跑在本机的单用户 Agent 运行时，由 Electron 壳拉起，
+前端是 `web-v1/`（Next.js BFF）。
 
-> 动机：学习 Python 生态。Agent 内核采用「OpenAI SDK + 手写编排循环」的轻量方案（方案 B），
-> 继承 Go 版「少抽象、显式线性、模块自治」的架构哲学，不使用 LangChain/LangGraph 全家桶。
-> 前端（`web-v1/`）**完全不变**，只要对外 HTTP/SSE 契约保真即可无缝切换。
+它脱胎于一个云端多租户 Agent 平台，但**不再为多租户服务**：没有登录、没有远端
+沙箱、没有对象存储。身份固定为本机用户，工作区就是磁盘上的目录。
 
 ## 架构
 
-与 Go 版保持同一套纵向模块自治结构，主流程线性：
-
 ```
-Web浏览器 / 定时任务 / 未来IM渠道
-              │
-              ▼
-          Adapter          ← 协议翻译（HTTP SSE / Cron）
-              │
-              ▼
-          Gateway          ← 身份认证 + 请求边界
-              │
-              ▼
-          AgentRun         ← 聚合本次运行配置
-              │
-              ▼
-        OpenAI SDK 流式循环  ← 手写编排（方案 B）
-              │
-              ▼
-         中性 Event         ← 渠道无关的流式事件
+Web 前端 ──(BFF, 同源)──┐
+                        ▼
+                     Adapter        ← 协议翻译（HTTP SSE / Cron）
+                        │
+                        ▼
+                     Gateway        ← 渠道白名单 + 请求边界
+                        │
+                        ▼
+                     AgentRun       ← 聚合本次运行配置
+                        │
+                        ▼
+              OpenAI SDK 流式循环    ← 手写编排，不用 LangChain
+                        │
+                        ▼
+                    中性 Event      ← 渠道无关的流式事件
 ```
 
 ## 目录结构
@@ -34,22 +31,21 @@ Web浏览器 / 定时任务 / 未来IM渠道
 ```
 src/edith_backend/
 ├── main.py                 # 组合根 + FastAPI 应用
-├── config.py               # 环境变量加载
-├── database.py             # SQLite 连接 + WAL
+├── config.py               # 数据目录与环境变量
+├── database.py             # SQLite 连接（DELETE journal + busy_timeout）
 └── internal/
     ├── agentrun/           # 核心编排：准入 → 配置聚合 → 流式执行
     ├── agentstream/        # 中性事件模型与流式解码
-    ├── gateway/            # 渠道统一入口
+    ├── gateway/            # 渠道统一入口（web / cron）
     ├── webadapter/         # HTTP/SSE 适配器
     ├── conversation/       # Timeline 投影
     ├── session/            # 消息、任务状态、检查点
     ├── models/             # 内置 + 用户自定义模型目录
-    ├── userconfig/         # 设置、供应商密钥、MCP、渠道绑定
-    ├── sandbox/            # E2B 沙箱生命周期与工具集
-    ├── workspace/          # 工作区实体、存储后端与双向同步
-    ├── volume/             # 持久化卷
-    ├── skills/             # Skill 目录
-    ├── images/             # COS 图片
+    ├── userconfig/         # 设置、供应商密钥、MCP、Git 凭据
+    ├── sandbox/            # 本机沙箱：命令执行与文件原语
+    ├── workspace/          # 工作区实体与本地目录（含绑定用户目录）
+    ├── skills/             # Skill 目录（单层）
+    ├── images/             # 聊天图片（本机磁盘）
     ├── gitops/             # Git 推送与凭据注入
     ├── cronjob/            # 定时任务存储与调度
     ├── cronadapter/        # 定时执行适配
@@ -63,64 +59,58 @@ src/edith_backend/
 ## 技术栈
 
 - 后端：Python 3.13、FastAPI、uvicorn、Pydantic v2、openai SDK
-- 存储：SQLite（aiosqlite）
-- 调度：自实现轮询调度器（对齐 Go 版，10 秒轮询 + SQL 原子抢占）
-- 身份：Clerk（后端仅读 BFF 注入的 userId）
-- Agent 工作区：E2B Sandbox + Volume
-- 图片存储：腾讯云 COS
+- 存储：SQLite（aiosqlite）+ 本地文件系统
+- 调度：自实现轮询调度器（10 秒轮询 + SQL 原子抢占）
+- 身份：单用户，固定 `local-user`（BFF 与服务端各一处常量）
+- 沙箱：本机进程与目录，不经远端
+- 图片：本机磁盘；喂给模型时内联为 data URL
+
+## 数据落点
+
+`data_root()` 决定一切可变数据的根目录，优先级：
+
+1. `ETHOS_DATA_DIR`（壳注入 / 测试用临时目录）；
+2. 桌面模式（`ETHOS_DESKTOP=1`）→ `%APPDATA%\ETHOS`；
+3. 否则 → `backend-py/`（脱离壳单独调试时）。
+
+底下是 `edith-v2.db`、`workspace-volumes/{workspace}/`、`skills/`、`images/`。
 
 ## 本地启动
 
-依赖已安装到 `.venv/`（uv 在此环境有 cache 锁问题，用 venv 直启更稳）：
-
 ```powershell
 cd backend-py
-
-# 方式一：直接用 venv 启动（推荐）
-.venv\Scripts\python.exe -m uvicorn edith_backend.main:app --reload --host 127.0.0.1 --port 8080
-
-# 方式二：uv 启动（依赖 uv 正常时）
-uv sync
-uv run edith-backend
+.venv\Scripts\python.exe -m uvicorn edith_backend.main:app --host 127.0.0.1 --port 8080
 ```
 
-启动后访问：`http://127.0.0.1:8080/health`
+`curl http://127.0.0.1:8080/health` 应返回 ok。
 
-环境变量在项目根目录 `.env`（E2B、COS 配置），默认从 `../.env` 加载。
+> 同一份数据库只能有一个后端进程：`database.py` 用 `busy_timeout` 而非 WAL，
+> 另一个进程长期持锁会让新进程启动即 `database is locked`。
 
 ## 运行测试
 
 ```powershell
-.venv\Scripts\python.exe -m pytest -q
+.venv\Scripts\python.exe -m pytest tests -q --basetemp=.pytest-tmp-<随机>
 ```
 
-## 运维命令：Skill 显式迁移
+`--basetemp` 必须指向一个**尚不存在**的目录（或每次换名）：pytest 会先尝试清空
+它，而本机的删除护栏可能拒绝，从而让所有 `tmp_path` 用例在 setup 阶段失败。
 
-把存量**用户级** Skill 复制成**项目级**（`docs/skill-scope-design.md` 第九节）。默认 dry-run，源永不自动删：
+## 环境变量
 
-```powershell
-# 单条：只打印计划，一个文件都不写
-.venv\Scripts\python.exe -m edith_backend.internal.skills.migrate `
-  --user user_x --skill deploy-notes --to project:ws-abc
+桌面模式下 `.env` 全部留空即可（模型 Key 在应用内设置页写入数据库）。
 
-# 批量：migration.yaml 里 migrations 列表，字段严格（多/少一个都拒绝执行）
-.venv\Scripts\python.exe -m edith_backend.internal.skills.migrate --file migration.yaml --apply
-```
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `EDITH_ADDR` | `127.0.0.1:8080` | 监听地址（壳会覆盖为随机端口） |
+| `EDITH_DB_PATH` | `data_root()/edith-v2.db` | 填相对路径会相对**当前目录**解析 |
+| `ETHOS_DATA_DIR` | 见上 | 可变数据根目录 |
+| `EDITH_SECRET_KEY` | 内置 fallback | 混淆落盘的 API Key / MCP Header |
+| `EDITH_MAX_TOOL_ROUNDS` | `30` | 单轮工具调用上限 |
+| `EDITH_WORKSPACE_VOLUME_DIR` | `workspace-volumes` | 工作区目录名（相对 `data_root()`） |
+| `EDITH_WORKSPACE_LOCAL_ROOTS` | 空 | 可绑定为工作区的本地目录允许清单（`os.pathsep` 分隔）；**留空 = 放行任意目录**，只打一条 warning |
+| `EDITH_GIT_AUTHOR_NAME` / `_EMAIL` | 空 | 用户设置里没填时的提交身份兜底 |
+| `EDITH_TRACE_FULL` / `_SLOW_MS` / `_RETENTION_DAYS` | `false` / `10000` / `14` | 追踪详略、慢阈值、保留天数 |
 
-退出码：`0` 全部 migrated/skipped，`1` 有 failed（其余已迁），`2` schema 或预检查失败（**整批未执行**）。
-
-## 开发进度
-
-- [x] 阶段 0：脚手架（FastAPI + /health）
-- [x] 阶段 1：配置 + 数据库 + 模型目录
-- [x] 阶段 2：agentstream + agentrun 核心
-- [x] 阶段 3：gateway + webadapter + SSE
-- [x] 阶段 4：conversation + usage
-- [x] 阶段 5：sandbox + volume + skills
-- [x] 阶段 6：MCP + cronjob
-- [x] 阶段 7：images + systemtools
-- [x] 阶段 8：前端联调 + 回归（冒烟测试通过）
-- [x] 阶段 9：MCP streamable HTTP / SSE 双传输
-- [x] 阶段 10：工作区绑定、自定义模型、Git 推送、深层安全加固
-
-> 当前测试规模：`tests/` 下 220+ 用例，覆盖迁移、同步删除传播、用量核算、Git 推送与 MCP。
+> 不要把 `ETHOS_DESKTOP` / `ETHOS_DATA_DIR` 写进 `.env`：pytest 走同一条装配路径，
+> 写死会让测试把数据写进真实的 `%APPDATA%\ETHOS`。
