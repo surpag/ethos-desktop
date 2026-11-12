@@ -18,7 +18,7 @@ export type UserBlock = {
 };
 
 // ChatImage is an ETHOS-owned image reference. The browser always loads it
-// through /api/images/{id}; it never stores a short-lived COS URL.
+// through /api/images/{id}; it never stores a storage URL of its own.
 export type ChatImage = {
   id: string;
   mimeType: string;

@@ -17,7 +17,7 @@ export async function uploadChatImage(sessionId: string, file: File): Promise<Ch
     headers: { "Content-Type": file.type },
     body: file,
   });
-  if (!putResponse.ok) throw new Error("图片上传到存储服务失败");
+  if (!putResponse.ok) throw new Error("图片上传失败");
 
   const completeResponse = await fetch(`/api/images/${encodeURIComponent(upload.image.id)}/complete`, {
     method: "POST",

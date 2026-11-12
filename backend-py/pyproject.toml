@@ -17,7 +17,6 @@ dependencies = [
     "croniter>=6.0",
     "tzdata>=2024.1",
     "python-multipart>=0.0.9",
-    "cos-python-sdk-v5>=1.9",
     # 上游缺失声明：`internal/userconfig/mcp_runtime.py` 直接 import，
     # 但 pyproject 与 uv.lock 里都没有，只有开发机的 venv 里手工装过。
     # 干净环境安装后启动即 `ModuleNotFoundError: No module named 'mcp'`。

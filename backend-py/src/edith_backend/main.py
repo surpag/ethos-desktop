@@ -33,7 +33,6 @@ from .internal.gitops import resolve_git_identity
 from .internal.gitops.http import HTTP as GitopsHTTP
 from .internal.gitops.orchestrator import WorkspacePush
 from .internal.images import new_module as new_images_module
-from .internal.images.cos import COSConfig
 from .internal.models import DEFAULT_MODEL_ID, CustomModels
 from .internal.models import create_schema as create_models_schema
 from .internal.models import new_module as new_models_module
@@ -174,15 +173,7 @@ async def lifespan(app: FastAPI):
     )
     sandbox_input = SandboxAgentInput(sandboxes)
     cron_jobs = await new_cronjob_module(db, users.settings)
-    images = await new_images_module(
-        db,
-        COSConfig(
-            bucket=os.getenv("EDITH_COS_BUCKET", ""),
-            region=os.getenv("EDITH_COS_REGION", ""),
-            secret_id=os.getenv("EDITH_COS_SECRET_ID", ""),
-            secret_key=os.getenv("EDITH_COS_SECRET_KEY", ""),
-        ),
-    )
+    images = await new_images_module(db, config.data_root() / "images")
 
     tools = ToolRegistry(
         [SystemToolSet(), sandbox_tools, cron_jobs.tools, PlanToolSet(run_plans, plan_store)]

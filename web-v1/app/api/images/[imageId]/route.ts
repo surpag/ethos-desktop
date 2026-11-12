@@ -2,14 +2,15 @@ import { currentUserId } from "@/lib/auth/current-user";
 
 const runtimeURL = process.env.EDITH_RUNTIME_URL ?? "http://127.0.0.1:8080";
 
-// This stable ETHOS endpoint is what the browser stores in img.src. Go signs
-// a fresh private COS URL every time it is requested.
+// GET /api/images/{imageId} — 浏览器 `<img src>` 用的稳定地址。
+//
+// 上游这里会 302 跳到一个 COS 签名地址（每次请求都要重签，所以只能在服务端
+// 中转）；桌面端图片就在本机磁盘上，直接透传字节即可，不再需要跳转。
 export async function GET(
   _request: Request,
   context: RouteContext<"/api/images/[imageId]">,
 ) {
   const userId = await currentUserId();
-  if (!userId) return Response.json({ error: "Unauthorized" }, { status: 401 });
 
   const { imageId } = await context.params;
   const url = new URL(
@@ -18,23 +19,14 @@ export async function GET(
   );
   url.searchParams.set("userId", userId);
   try {
-    const response = await fetch(url, {
-      cache: "no-store",
-      redirect: "manual",
-    });
-    const location = response.headers.get("Location");
-    if (response.status === 302 && location) {
-      return new Response(null, {
-        status: 302,
-        headers: { Location: location, "Cache-Control": "no-store" },
-      });
-    }
+    const response = await fetch(url, { cache: "no-store" });
     return new Response(response.body, {
       status: response.status,
       headers: {
         "Content-Type":
           response.headers.get("Content-Type") ?? "application/json",
-        "Cache-Control": "no-store",
+        "Cache-Control":
+          response.headers.get("Cache-Control") ?? "no-store",
       },
     });
   } catch {
