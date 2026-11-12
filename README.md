@@ -65,6 +65,22 @@ cp -r public .next/standalone/public
 cd desktop && npm install && npm start
 ```
 
+### 环境变量
+
+桌面端**不需要 `.env`**。数据目录、沙箱后端、认证模式均由 `desktop/src/main.ts`
+在 spawn 时注入；模型 API Key 走应用内「设置 → 模型」，写进数据库。
+`backend-py/.env.example` 只对云端部署和脱离壳调试后端有意义。
+
+单独调试后端时注入同样的上下文，但要**换一个数据目录**——桌面端用的是
+非 WAL 的 SQLite（`busy_timeout=5000`），和壳同时指着同一个库必定
+`database is locked`：
+
+```bash
+cd backend-py
+ETHOS_DESKTOP=1 ETHOS_DATA_DIR="$APPDATA/ETHOS-dev" \
+  .venv/Scripts/python.exe -m uvicorn edith_backend.main:app --port 8080
+```
+
 ## 当前进度
 
 | 阶段 | 内容 | 状态 |
