@@ -10,21 +10,24 @@ import time
 
 from ..agentrun.service import Service as AgentRunService
 from ..agentrun.types import Error, Status, Stream
-from ..userconfig.bindings import Bindings
 from .types import CRON_CHANNEL, WEB_CHANNEL, IncomingMessage, to_agentrun_request
 
 logger = logging.getLogger(__name__)
 
-
-def _is_trusted_channel(channel: str) -> bool:
-    return channel in (WEB_CHANNEL, CRON_CHANNEL)
+# 桌面端只有进程内渠道：浏览器（web）与定时任务（cron）。
+# 上游还支持「外部渠道」——企微/微信之类的账号先经 `user_channel_bindings`
+# 映射到 EDITH 用户，再以那个用户身份跑任务。那张表与它对应的绑定流程已经
+# 删除，因此这里改为白名单：不认识的渠道一律拒绝。
+#
+# 不做 fallback 是刻意的：把 unknown channel 当成某个默认用户，等于让任何
+# 能调到这个入口的东西以那个用户身份跑任务——这正是绑定机制本来要防的事。
+_CHANNELS = (WEB_CHANNEL, CRON_CHANNEL)
 
 
 class Service:
     """所有 Agent 渠道的唯一入口。"""
 
-    def __init__(self, bindings: Bindings, agent_runs: AgentRunService) -> None:
-        self.bindings = bindings
+    def __init__(self, agent_runs: AgentRunService) -> None:
         self.agent_runs = agent_runs
 
     async def run(
@@ -54,23 +57,12 @@ class Service:
 
         user_id = input_msg.external_user_id
         session_id = input_msg.session_key
-        if not _is_trusted_channel(input_msg.channel):
-            try:
-                bound_user_id, found = await self.bindings.to_clerk_user_id(
-                    input_msg.channel, input_msg.external_user_id
-                )
-            except ValueError as exc:
-                return None, Error("internal_error", str(exc))
-            if not found:
-                return None, Error(
-                    "identity_not_bound", "channel user is not bound to an EDITH user"
-                )
-            user_id = bound_user_id or ""
-            session_id = f"{input_msg.channel}:{user_id}"
-        if not session_id:
+        if input_msg.channel not in _CHANNELS:
             return None, Error(
-                "invalid_request", "sessionKey is required for trusted channels"
+                "invalid_request", f'unsupported channel "{input_msg.channel}"'
             )
+        if not session_id:
+            return None, Error("invalid_request", "sessionKey is required")
         try:
             stream, run_error = await self.agent_runs.run(
                 to_agentrun_request(input_msg, user_id, session_id)
@@ -110,7 +102,7 @@ class Service:
     def status(
         self, user_id: str, request_id: str
     ) -> tuple[Status | None, Error | None]:
-        """查询一个属于可信 Clerk 用户的活跃任务。"""
+        """查询一个属于某个用户的活跃任务。"""
         return self.agent_runs.status(user_id, request_id)
 
     def resume(
@@ -125,12 +117,12 @@ class Service:
         return self.agent_runs.subscribe(user_id, request_id, after)
 
     def cancel(self, user_id: str, request_id: str) -> Error | None:
-        """停止一个属于可信 Clerk 用户的活跃任务。"""
+        """停止一个属于某个用户的活跃任务。"""
         return self.agent_runs.cancel(user_id, request_id)
 
 
-def new_service(bindings: Bindings, agent_runs: AgentRunService) -> Service:
+def new_service(agent_runs: AgentRunService) -> Service:
     """创建 Gateway；它不会创建 AgentRun 或渠道 Adapter。"""
-    if bindings is None or agent_runs is None:
-        raise ValueError("gateway requires bindings and agent runs")
-    return Service(bindings, agent_runs)
+    if agent_runs is None:
+        raise ValueError("gateway requires agent runs")
+    return Service(agent_runs)

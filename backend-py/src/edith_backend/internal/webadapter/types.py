@@ -10,7 +10,7 @@ from pydantic.alias_generators import to_camel
 
 
 class MessageRequest(BaseModel):
-    """Web BFF 发给后端的流式消息契约。userId 由 BFF 从 Clerk 注入。"""
+    """Web BFF 发给后端的流式消息契约。userId 由 BFF 在服务端注入。"""
 
     model_config = ConfigDict(
         alias_generator=to_camel,

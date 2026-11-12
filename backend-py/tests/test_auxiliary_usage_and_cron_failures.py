@@ -126,7 +126,7 @@ async def _cron_store() -> tuple[CronStore, aiosqlite.Connection]:
 
 async def _insert_job(db: aiosqlite.Connection, job_id: str) -> None:
     await db.execute(
-        "INSERT INTO cron_jobs (id, clerk_user_id, name, task_type, schedule, prompt, "
+        "INSERT INTO cron_jobs (id, user_id, name, task_type, schedule, prompt, "
         "enabled, running, created_at) VALUES (?, 'u1', '日报', 'once', '2026-11-05T00:00:00Z', "
         "'写日报', 1, 1, '2026-11-04T00:00:00Z')",
         (job_id,),
@@ -192,7 +192,7 @@ def test_cron_schema_migration_is_idempotent() -> None:
             # 模拟旧版表（没有结果列）
             await db.execute(
                 """CREATE TABLE cron_jobs (
-                    id TEXT PRIMARY KEY, clerk_user_id TEXT NOT NULL, name TEXT NOT NULL,
+                    id TEXT PRIMARY KEY, user_id TEXT NOT NULL, name TEXT NOT NULL,
                     task_type TEXT NOT NULL, schedule TEXT NOT NULL, prompt TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1, next_run_at TEXT,
                     running INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)"""
@@ -204,6 +204,50 @@ def test_cron_schema_migration_is_idempotent() -> None:
             columns = {row["name"] for row in await cursor.fetchall()}
             await cursor.close()
             assert {"last_error", "last_error_at", "last_run_at", "consecutive_failures"} <= columns
+        finally:
+            await db.close()
+
+    asyncio.run(go())
+
+
+def test_cron_schema_renames_legacy_clerk_column() -> None:
+    """老库的 `clerk_user_id` 要改名成 `user_id`，且不能丢数据。
+
+    这个改名之所以必须真的做（而不是像多余列那样留着不管），是因为 `user_id`
+    出现在每一条 CRUD 语句里：留着旧列名，老库启动后第一次查任务就会
+    `no such column: user_id`，表现成「升级后定时任务列表全空」。
+    """
+
+    async def go() -> None:
+        db = await aiosqlite.connect(":memory:")
+        db.row_factory = aiosqlite.Row
+        try:
+            await db.execute(
+                """CREATE TABLE cron_jobs (
+                    id TEXT PRIMARY KEY, clerk_user_id TEXT NOT NULL, name TEXT NOT NULL,
+                    task_type TEXT NOT NULL, schedule TEXT NOT NULL, prompt TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1, next_run_at TEXT,
+                    running INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)"""
+            )
+            await db.execute(
+                "INSERT INTO cron_jobs (id, clerk_user_id, name, task_type, schedule, prompt, created_at) "
+                "VALUES ('job-1', 'legacy-user', 'n', 'once', '2026-01-01T00:00:00Z', 'p', '2026-01-01T00:00:00Z')"
+            )
+            await db.commit()
+
+            await cron_schema.create_schema(db)
+            await cron_schema.create_schema(db)  # 幂等：第二次不该报错
+
+            cursor = await db.execute("PRAGMA table_info(cron_jobs)")
+            columns = {row["name"] for row in await cursor.fetchall()}
+            await cursor.close()
+            assert "user_id" in columns
+            assert "clerk_user_id" not in columns
+
+            cursor = await db.execute("SELECT user_id FROM cron_jobs WHERE id = 'job-1'")
+            row = await cursor.fetchone()
+            await cursor.close()
+            assert row["user_id"] == "legacy-user"
         finally:
             await db.close()
 

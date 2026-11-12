@@ -27,8 +27,6 @@ def _gateway_error_to_http(error: Error) -> EDITHError:
     # 不是服务端故障。落进 500 会让前端只会弹通用错误，也无法给出 holder 提示。
     elif error.type in ("session_busy", "workspace_busy", "request_conflict"):
         status = 409
-    elif error.type == "identity_not_bound":
-        status = 403
     elif error.type == "not_found":
         status = 404
     return EDITHError(status, error.type, error.message)

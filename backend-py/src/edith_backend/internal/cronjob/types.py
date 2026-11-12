@@ -28,7 +28,7 @@ class Job:
     """一条定时任务定义；执行结果保存在对应的 Agent 会话历史中。"""
 
     id: str
-    clerk_user_id: str
+    user_id: str
     name: str
     task_type: str
     schedule: str

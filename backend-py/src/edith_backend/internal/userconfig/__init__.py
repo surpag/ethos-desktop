@@ -3,7 +3,6 @@
 对应 Go 版 internal/userconfig。
 """
 
-from .bindings import Bindings
 from .http import HTTP
 from .mcp import MCP
 from .module import Module, new_module
@@ -20,7 +19,6 @@ __all__ = [
     "HTTP",
     "MCP",
     "AgentSettings",
-    "Bindings",
     "Module",
     "ProviderStatus",
     "Providers",

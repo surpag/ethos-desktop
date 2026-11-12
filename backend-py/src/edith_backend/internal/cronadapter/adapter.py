@@ -23,7 +23,7 @@ class Adapter:
         stream, run_error = await self._gateway.run(
             IncomingMessage(
                 channel=CRON_CHANNEL,
-                external_user_id=job.clerk_user_id,
+                external_user_id=job.user_id,
                 session_key=f"cron:{job.id}",
                 request_id=uuid4().hex,
                 message=job.prompt,

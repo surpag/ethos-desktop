@@ -26,7 +26,7 @@ async def create_schema(db: aiosqlite.Connection) -> None:
     await db.execute(
         """CREATE TABLE IF NOT EXISTS cron_jobs (
             id TEXT PRIMARY KEY,
-            clerk_user_id TEXT NOT NULL,
+            user_id TEXT NOT NULL,
             name TEXT NOT NULL,
             task_type TEXT NOT NULL,
             schedule TEXT NOT NULL,
@@ -55,6 +55,14 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     cursor = await db.execute("PRAGMA table_info(cron_jobs)")
     existing = {row["name"] for row in await cursor.fetchall()}
     await cursor.close()
+    if "user_id" not in existing and "clerk_user_id" in existing:
+        # 列改名：`user_id` 才是它实际的含义，旧名是上游多租户身份体系留下的。
+        # SQLite 3.25+ 的 RENAME COLUMN 保留数据与 NOT NULL 约束，比「建新表
+        # → 拷数据 → 删旧表」安全得多。新库不会有 `clerk_user_id`，因此这一步
+        # 只在老库上是真的动作。
+        await db.execute("ALTER TABLE cron_jobs RENAME COLUMN clerk_user_id TO user_id")
+        existing.discard("clerk_user_id")
+        existing.add("user_id")
     for column, ddl in _RESULT_COLUMNS.items():
         if column not in existing:
             await db.execute(f"ALTER TABLE cron_jobs ADD COLUMN {column} {ddl}")

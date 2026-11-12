@@ -22,7 +22,7 @@ from .types import (
 )
 
 _COLUMNS = (
-    "id, clerk_user_id, name, task_type, schedule, prompt, enabled, next_run_at, "
+    "id, user_id, name, task_type, schedule, prompt, enabled, next_run_at, "
     "running, created_at, last_run_at, last_error, last_error_at, consecutive_failures"
 )
 
@@ -38,7 +38,7 @@ def _parse_dt(value: str | None) -> datetime | None:
 def _row_to_job(row) -> Job:
     return Job(
         id=row["id"],
-        clerk_user_id=row["clerk_user_id"],
+        user_id=row["user_id"],
         name=row["name"],
         task_type=row["task_type"],
         schedule=row["schedule"],
@@ -68,7 +68,7 @@ class Store:
         next_at = await schedule_rules.next_run(self._settings, user_id, input_, now)
         job = Job(
             id=uuid4().hex,
-            clerk_user_id=user_id,
+            user_id=user_id,
             name=input_.name.strip(),
             task_type=input_.task_type,
             schedule=input_.schedule.strip(),
@@ -78,9 +78,9 @@ class Store:
             created_at=now,
         )
         await self._db.execute(
-            "INSERT INTO cron_jobs (id, clerk_user_id, name, task_type, schedule, prompt, enabled, next_run_at, running, created_at) "
+            "INSERT INTO cron_jobs (id, user_id, name, task_type, schedule, prompt, enabled, next_run_at, running, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, 1, ?, 0, ?)",
-            (job.id, job.clerk_user_id, job.name, job.task_type, job.schedule, job.prompt,
+            (job.id, job.user_id, job.name, job.task_type, job.schedule, job.prompt,
              _dt(job.next_run_at), _dt(job.created_at)),
         )
         await self._db.commit()
@@ -88,7 +88,7 @@ class Store:
 
     async def list(self, user_id: str) -> list[Job]:
         cursor = await self._db.execute(
-            f"SELECT {_COLUMNS} FROM cron_jobs WHERE clerk_user_id = ? ORDER BY created_at, id",
+            f"SELECT {_COLUMNS} FROM cron_jobs WHERE user_id = ? ORDER BY created_at, id",
             (user_id.strip(),),
         )
         rows = await cursor.fetchall()
@@ -100,7 +100,7 @@ class Store:
         next_at = await schedule_rules.next_run(self._settings, user_id.strip(), input_, datetime.now(UTC))
         cursor = await self._db.execute(
             "UPDATE cron_jobs SET name = ?, task_type = ?, schedule = ?, prompt = ?, next_run_at = ? "
-            "WHERE id = ? AND clerk_user_id = ?",
+            "WHERE id = ? AND user_id = ?",
             (input_.name.strip(), input_.task_type, input_.schedule.strip(), input_.prompt.strip(),
              _dt(next_at), job_id.strip(), user_id.strip()),
         )
@@ -111,7 +111,7 @@ class Store:
 
     async def delete(self, user_id: str, job_id: str) -> None:
         cursor = await self._db.execute(
-            "DELETE FROM cron_jobs WHERE id = ? AND clerk_user_id = ?",
+            "DELETE FROM cron_jobs WHERE id = ? AND user_id = ?",
             (job_id.strip(), user_id.strip()),
         )
         if cursor.rowcount != 1:
@@ -123,20 +123,20 @@ class Store:
         next_at = current.next_run_at
         if enabled and next_at is None:
             next_at = await schedule_rules.next_run(
-                self._settings, current.clerk_user_id,
+                self._settings, current.user_id,
                 JobInput(current.name, current.task_type, current.schedule, current.prompt),
                 datetime.now(UTC),
             )
         await self._db.execute(
-            "UPDATE cron_jobs SET enabled = ?, next_run_at = ? WHERE id = ? AND clerk_user_id = ?",
-            (1 if enabled else 0, _dt(next_at), current.id, current.clerk_user_id),
+            "UPDATE cron_jobs SET enabled = ?, next_run_at = ? WHERE id = ? AND user_id = ?",
+            (1 if enabled else 0, _dt(next_at), current.id, current.user_id),
         )
         await self._db.commit()
         return await self._job(current.id)
 
     async def _job_for_user(self, user_id: str, job_id: str) -> Job:
         cursor = await self._db.execute(
-            f"SELECT {_COLUMNS} FROM cron_jobs WHERE id = ? AND clerk_user_id = ?",
+            f"SELECT {_COLUMNS} FROM cron_jobs WHERE id = ? AND user_id = ?",
             (job_id, user_id),
         )
         row = await cursor.fetchone()
@@ -187,7 +187,7 @@ class Store:
         next_at = None
         if job.task_type == TASK_TYPE_RECURRING:
             next_at = await schedule_rules.next_run(
-                self._settings, job.clerk_user_id,
+                self._settings, job.user_id,
                 JobInput(job.name, job.task_type, job.schedule, job.prompt), now,
             )
         if error:
@@ -217,7 +217,7 @@ class Store:
         jobs = [_row_to_job(row) for row in rows]
         for job in jobs:
             next_at = await schedule_rules.next_run(
-                self._settings, job.clerk_user_id,
+                self._settings, job.user_id,
                 JobInput(job.name, job.task_type, job.schedule, job.prompt), now,
             )
             await self._db.execute(

@@ -43,12 +43,6 @@ _STATEMENTS = [
         header_value TEXT NOT NULL,
         PRIMARY KEY (server_id, header_name)
     )""",
-    """CREATE TABLE IF NOT EXISTS user_channel_bindings (
-        channel TEXT NOT NULL,
-        external_user_id TEXT NOT NULL,
-        clerk_user_id TEXT NOT NULL,
-        PRIMARY KEY (channel, external_user_id)
-    )""",
     """CREATE TABLE IF NOT EXISTS user_git_credentials (
         user_id TEXT NOT NULL,
         provider TEXT NOT NULL,
@@ -81,3 +75,8 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         await db.execute(
             "ALTER TABLE user_agents ADD COLUMN git_author_email TEXT NOT NULL DEFAULT ''"
         )
+
+    # `user_channel_bindings`（外部渠道账号 → 用户）随渠道绑定功能一起删除。
+    # 这里显式 DROP 而不是「留着不管」：表里的数据没有第二个消费者，留着只会让
+    # 后来的人以为「外部渠道是支持过的、只是没接线」，从而去修一个不存在的功能。
+    await db.execute("DROP TABLE IF EXISTS user_channel_bindings")

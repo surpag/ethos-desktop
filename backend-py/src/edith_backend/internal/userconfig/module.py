@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import aiosqlite
 
-from .bindings import Bindings
 from .gitcredentials import GitCredentials
 from .http import HTTP
 from .mcp import MCP
@@ -23,7 +22,6 @@ class Module:
         self,
         settings: Settings,
         providers: Providers,
-        bindings: Bindings,
         mcp: MCP,
         http: HTTP,
         git_credentials: GitCredentials,
@@ -31,7 +29,6 @@ class Module:
         self.settings = settings
         self.providers = providers
         self.mcp = mcp
-        self.bindings = bindings
         self.http = http
         self.git_credentials = git_credentials
 
@@ -47,9 +44,8 @@ async def new_module(db: aiosqlite.Connection, default_model_id: str) -> Module:
 
     settings = Settings(db)
     providers = Providers(db)
-    bindings = Bindings(db)
     mcp = MCP(db)
     git_credentials = GitCredentials(db)
     http = HTTP(settings, providers, git_credentials, default_model_id)
 
-    return Module(settings, providers, bindings, mcp, http, git_credentials)
+    return Module(settings, providers, mcp, http, git_credentials)

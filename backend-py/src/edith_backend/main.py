@@ -200,7 +200,7 @@ async def lifespan(app: FastAPI):
             traces=traces,
         )
     )
-    gateway = new_gateway_service(users.bindings, agent_runs)
+    gateway = new_gateway_service(agent_runs)
     web = Adapter(gateway)
     cron_adapter = CronAdapter(gateway)
     cron_scheduler = cron_jobs.new_scheduler(cron_adapter)
