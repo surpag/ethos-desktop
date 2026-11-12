@@ -8,6 +8,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .pytest-tmp*/
+.pytest-*/
 *.tsbuildinfo
 
 # 运行期数据（桌面端应落在 %APPDATA%\ETHOS，这里挡的是开发期误写）

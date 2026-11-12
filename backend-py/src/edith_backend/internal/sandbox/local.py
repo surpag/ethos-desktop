@@ -18,8 +18,11 @@
 from __future__ import annotations
 
 import asyncio
+import locale
+import logging
 import os
 import posixpath
+import re
 import shutil
 import subprocess
 import sys
@@ -31,6 +34,8 @@ from e2b import FileType
 
 from ...config import data_root
 from ..workspace.layout import WORKSPACE
+
+logger = logging.getLogger(__name__)
 
 # 单次读文件上限：本地磁盘没有网络成本，但没有上限时一次 `files.read` 就能把
 # 几百 MB 塞进上下文。与 E2B 后端的 `SYNC_MAX_FILE_BYTES` 保持同一量级。
@@ -91,6 +96,131 @@ def _safe_segment(raw: str) -> str:
     return cleaned
 
 
+# ---- 命令执行环境 ----
+#
+# 三条都来自同一个事实：**模型是按 Linux 习惯写命令的**。
+# 它看到的是 `/home/user`、`sed`、`wc -l`、管道；E2B 里这些都成立，本机不成立。
+# 所以本地后端的职责不是"尽量能跑"，而是把这三件事补齐，否则每条命令都是试错。
+
+# Git for Windows 自带的 bash 是最好的替代品：POSIX 语义 + 能在 Windows 上跑 exe。
+# 只在导入时探测一次；探测不到就退回系统 shell（语义降级，但至少能跑）。
+_SHELL_CANDIDATES = (
+    r"C:\Program Files\Git\bin\bash.exe",
+    r"C:\Program Files\Git\usr\bin\bash.exe",
+    r"C:\Program Files (x86)\Git\bin\bash.exe",
+)
+
+
+def _find_posix_shell() -> str | None:
+    if sys.platform != "win32":
+        return shutil.which("bash") or "/bin/sh"
+    for candidate in _SHELL_CANDIDATES:
+        if Path(candidate).is_file():
+            return candidate
+    # 非默认安装路径：从 PATH 找，且必须排除 WSL 的 System32\bash.exe
+    # （它会把命令送进另一个 Linux 发行版，看不到本机的沙箱目录）。
+    found = shutil.which("bash")
+    if found and "system32" not in found.lower():
+        return found
+    return None
+
+
+POSIX_SHELL = _find_posix_shell()
+
+
+def _shell_path() -> str:
+    """给子进程一套**确定的** PATH。
+
+    为什么要重写：应用若从开始菜单/双击启动，PATH 里没有 Git 的 `usr\\bin`，
+    `ls`、`sed`、`grep` 全部消失——而模型的命令里到处是它们。
+    开发时从 Git Bash 里 `npm start` 会"恰好"继承到，测出来的通过是假的。
+    """
+    parts: list[str] = []
+    if POSIX_SHELL:
+        shell_dir = Path(POSIX_SHELL).parent          # ...\Git\bin 或 ...\Git\usr\bin
+        usr_bin = shell_dir.parent / "usr" / "bin"    # 无论哪种来源，POSIX 工具都在这里
+        parts += [str(usr_bin), str(shell_dir)]
+    for key in ("SystemRoot", "windir"):
+        root = os.environ.get(key)
+        if root:
+            parts += [str(Path(root) / "System32"), root]
+    existing = os.environ.get("PATH", "")
+    if existing:
+        parts.append(existing)
+    # 去重但保序：靠前的先赢
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for item in parts:
+        key = item.lower()
+        if item and key not in seen:
+            seen.add(key)
+            ordered.append(item)
+    return os.pathsep.join(ordered)
+
+
+def _decode_output(raw: bytes) -> str:
+    """子进程输出 → str。
+
+    只按 UTF-8 解码是错的：Windows 上 `cmd`/系统程序按控制台代码页（中文为 GBK）
+    输出，按 UTF-8 解会得到 `ϵͳ�Ҳ���ָ����·����` 这种乱码，模型会把它当成
+    "命令本身出错了"而不是"路径不存在"，于是换着花样重试。
+    先严格 UTF-8，再按本地代码页，最后兜底 replace。
+    """
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    for encoding in {locale.getpreferredencoding(False), "gbk", "mbcs"}:
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+# 只替换"完整的一段路径开头"：`/home/user/x` 要换，`/home/username` 不能换。
+# 后面的分隔符涵盖引号、空白、管道与重定向——这些都是命令字符串里真实会出现的边界。
+_VIRTUAL_ROOT_RE = re.compile(r"/home/user(?=[/\s'\"`;|&)]|$)")
+
+
+def _is_link(path: Path) -> bool:
+    """判断是不是目录联接 / 符号链接。
+
+    `Path.is_symlink()` 对 Windows junction 返回 False（junction 是 reparse point，
+    不是 symlink），所以还要看 stat 的 FILE_ATTRIBUTE_REPARSE_POINT 位。
+    """
+    try:
+        if path.is_symlink():
+            return True
+        attrs = getattr(path.lstat(), "st_file_attributes", 0)
+        return bool(attrs & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+    except OSError:
+        return False
+
+
+def _make_link(link: Path, target: Path) -> bool:
+    """建目录联接（Windows）或符号链接（POSIX）。失败返回 False，由调用方决定告警。"""
+    if sys.platform != "win32":
+        try:
+            os.symlink(target, link, target_is_directory=True)
+            return True
+        except OSError:
+            return False
+    # mklink 是 cmd 内建命令，必须经 cmd /c；/J 的联接不需要管理员权限。
+    try:
+        proc = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and link.exists()
+
+
 class LocalSandbox:
     """一个会话一个实例；目录在磁盘上持久，重启后可重新打开。"""
 
@@ -119,8 +249,10 @@ class LocalSandbox:
         """
         root = sandbox_root_for(user_id, session_id)
         root.mkdir(parents=True, exist_ok=True)
-        # 三个约定目录先建好：模型第一次 `ls` 时不该看到"目录不存在"。
-        for name in (WORKSPACE.uploads, WORKSPACE.work, WORKSPACE.artifacts, WORKSPACE.workspace):
+        # 平铺目录先建好：模型第一次 `ls` 时不该看到"目录不存在"。
+        # `workspace/` 刻意不在这里建——它是挂载点（联接），由
+        # `_ensure_workspace_mount` 在首次解析工作区路径时创建。
+        for name in (WORKSPACE.uploads, WORKSPACE.work, WORKSPACE.artifacts):
             (root / name).mkdir(parents=True, exist_ok=True)
         return cls(root, f"local-{_safe_segment(user_id)}-{_safe_segment(session_id)}")
 
@@ -199,7 +331,7 @@ class LocalSandbox:
 
     def _resolve_workspace_volume(self, workspace_id: str, rest: list[str], virtual: str) -> Path:
         """`workspace/{id}/…` → `workspace-volumes/{id}/…`（权威副本，零拷贝）。"""
-        base = (data_root() / "workspace-volumes" / _safe_segment(workspace_id)).resolve()
+        base = self._ensure_workspace_mount(workspace_id)
         if not rest or rest == [""]:
             return base
         normalized = posixpath.normpath("/".join(rest))
@@ -209,6 +341,52 @@ class LocalSandbox:
         if target != base and not target.is_relative_to(base):
             raise SandboxPathError(f"路径解析后越出工作区根: {virtual} → {target}")
         return target
+
+    def _ensure_workspace_mount(self, workspace_id: str) -> Path:
+        """让 `{root}/workspace` 指向权威副本根 `workspace-volumes`。
+
+        **为什么必须有这一步**：文件原语可以自己把 `workspace/{id}` 翻译到
+        `workspace-volumes/{id}`，但 `run_command` 是真实进程，它只认文件系统。
+        少了这个联接，`pwd`/`ls` 看到的是沙箱里那个空目录，而文件工具写的是
+        权威副本——模型「刚写完就 ls 不到」，开始怀疑自己并疯狂重试
+        （2026-11-12 实测 21 次调用里 15 次在找同一个文件）。
+
+        **为什么挂 `workspace/` 而不是逐个 `workspace/{id}`**：接在 `{id}` 上时，
+        MSYS 把联接识别成符号链接，于是 `ls -la` 只显示链接本身、
+        `find` 默认不进去——这两条都是模型最常用的探查命令。挂在上一层，
+        `workspace/{id}` 就是普通目录，行为与 E2B 的挂载点一致。
+        代价是 shell 能看到同级工作区：命令本来就是 `unrestricted`（能读整台机器），
+        这不是新增暴露面；文件工具的边界仍由 `resolve()` 与授权层守。
+
+        用联接（junction）而不是复制：复制会重新引入"两份副本 + 同步"，
+        正是 M2 要删掉的东西。junction 在 Windows 上不需要管理员权限。
+        """
+        volumes = (data_root() / "workspace-volumes").resolve()
+        volume = volumes / _safe_segment(workspace_id)
+        volume.mkdir(parents=True, exist_ok=True)
+
+        mount = self._root / WORKSPACE.workspace
+        if _is_link(mount):
+            return volume
+        if mount.exists():
+            # 旧版本在这里建过实体目录（可能还带若干子联接）。只有空的才敢替换；
+            # 非空说明里面有真实文件，宁可让 shell 少看见，也不能删用户数据。
+            try:
+                mount.rmdir()
+            except OSError:
+                logger.warning(
+                    "workspace mount skipped: %s 是非空实体目录，shell 将看不到工作区文件", mount
+                )
+                return volume
+
+        self._root.mkdir(parents=True, exist_ok=True)
+        if not _make_link(mount, volumes):
+            logger.warning(
+                "workspace mount failed: %s → %s（文件工具仍正常，shell 看不到工作区）",
+                mount,
+                volumes,
+            )
+        return volume
 
     def virtual(self, real: Path) -> str:
         """真实路径 → 虚拟路径（回给模型的路径必须是 `/home/user/...`）。"""
@@ -294,7 +472,11 @@ class LocalFiles:
         real = self._sb.resolve(path)
         if not real.exists():
             raise FileNotFoundError(f"{path} 不存在")
-        if real.is_dir() and not real.is_symlink():
+        # 挂载点绝不能删：`shutil.rmtree` 会顺着联接把权威副本整个删掉
+        # （Python 的 is_symlink() 对 junction 返回 False，这道判断不能省）。
+        if _is_link(real):
+            raise SandboxPathError(f"不能删除工作区挂载点: {path}")
+        if real.is_dir():
             shutil.rmtree(real)
         else:
             real.unlink()
@@ -348,35 +530,28 @@ class LocalCommands:
         work_dir.mkdir(parents=True, exist_ok=True)
 
         env = {**os.environ}
+        # PATH 必须确定：继承到的 PATH 依赖"应用从哪启动"，双击启动就没有 Git 工具。
+        env["PATH"] = _shell_path()
         if envs:
             env.update({str(k): str(v) for k, v in envs.items()})
-        # 子进程一律 UTF-8：Windows 默认用 GBK 解码中文输出，`decode` 会在
-        # 工具结果里变成乱码（模型会把它当成命令失败）。
-        env.setdefault("PYTHONIOENCODING", "utf-8")
+        # 子进程一律 UTF-8：Windows 默认用 GBK 输出中文，会让工具结果变乱码。
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        env.setdefault("LANG", "C.UTF-8")
+        env.setdefault("LC_ALL", "C.UTF-8")
+
+        command = self._translate(cmd)
+        argv = [POSIX_SHELL, "-c", command] if POSIX_SHELL else command
 
         if background:
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
-                cwd=str(work_dir),
-                env=env,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                **self._spawn_kwargs(),
-            )
+            proc = await self._spawn(argv, work_dir, env, devnull=True)
             assert proc.pid is not None
             self._sb._background[proc.pid] = proc
             # 退出后由 commands.list() 摘除。调用方不一定会 list，所以表可能
             # 残留已退出项；它们不占资源（Process 对象很小），且 kill 前会先判 returncode。
             return LocalCommandInfo(pid=proc.pid, cmd=cmd, cwd=self._sb.virtual(work_dir))
 
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            cwd=str(work_dir),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            **self._spawn_kwargs(),
-        )
+        proc = await self._spawn(argv, work_dir, env, devnull=False)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except (asyncio.TimeoutError, TimeoutError):
@@ -392,10 +567,88 @@ class LocalCommands:
             raise
 
         return LocalCommandResult(
-            stdout=(out or b"").decode("utf-8", errors="replace"),
-            stderr=(err or b"").decode("utf-8", errors="replace"),
+            stdout=self._normalize(_decode_output(out or b"")),
+            stderr=self._normalize(_decode_output(err or b"")),
             exit_code=proc.returncode or 0,
         )
+
+    def _normalize(self, text: str) -> str:
+        """把输出里的宿主真实路径还原成虚拟路径。
+
+        与 `_translate` 是同一件事的两侧：进去时 `/home/user` → 真实路径，
+        出来时真实路径 → `/home/user`。少了这一半，`find`/`grep` 的输出里就全是
+        `C:\\Users\\<用户名>\\AppData\\...`：模型会照着这个路径再调一次文件工具，
+        而那个路径会被 `resolve()` 判为越界（它确实不在虚拟命名空间里）。
+        顺带不让宿主机用户名出现在给模型的上下文里。
+        """
+        pairs = self._path_pairs()
+        for real, virtual in pairs:
+            if real and real in text:
+                text = re.sub(
+                    re.escape(real) + r"(?=[\\/\s'\"`),:;|&]|$)",
+                    virtual,
+                    text,
+                )
+        return text
+
+    def _path_pairs(self) -> list[tuple[str, str]]:
+        """(宿主路径写法, 虚拟路径) —— 覆盖 bash 的 `/c/...` 与 Windows 的两种写法。"""
+        root = self._sb.root
+        volumes = data_root() / "workspace-volumes"
+        pairs: list[tuple[str, str]] = []
+        for real_path, virtual in ((volumes, f"{WORKSPACE.root}/{WORKSPACE.workspace}"), (root, WORKSPACE.root)):
+            for form in (self._shell_path_of(real_path), real_path.as_posix(), str(real_path)):
+                pairs.append((form, virtual))
+        # 长的先换：workspace-volumes 与 sandbox 根互不为前缀，但保险起见按长度倒序。
+        pairs.sort(key=lambda item: len(item[0]), reverse=True)
+        return pairs
+
+    def _translate(self, cmd: str) -> str:
+        """把命令里的 `/home/user` 换成真实的沙箱根。
+
+        这是**唯一**一处替模型做路径翻译的地方，和文件原语里的 `resolve()` 是同一件事：
+        模型永远只需要知道 `/home/user`（prompt、工具描述、历史记录都这么写），
+        真实路径只在这里出现一次。
+
+        为什么不能靠"让模型用 Windows 路径"绕过：`/home/user` 写在 prompt 里，
+        改成 `D:\\...` 会让同一条规则在云端（E2B）和本地两端都不一样，
+        而且模型对 `/home/user` 的先验远比对一个 UUID 目录强。
+        """
+        root = WORKSPACE.root
+        if root not in cmd:
+            return cmd
+        return _VIRTUAL_ROOT_RE.sub(lambda _m: self._shell_path_of(self._sb.root), cmd)
+
+    @staticmethod
+    def _shell_path_of(real: Path) -> str:
+        """真实路径 → shell 能识别、且与 POSIX 语义一致的写法。
+
+        Git Bash 接受 `C:/Users/...`，但 `/c/Users/...` 才是它的原生形式
+        （`cd /c/...`、`cd C:/...` 都能工作，后者在某些内建命令里会被当成相对路径）。
+        """
+        text = real.resolve().as_posix()
+        if POSIX_SHELL and sys.platform == "win32" and len(text) > 1 and text[1] == ":":
+            return "/" + text[0].lower() + text[2:]
+        return text
+
+    async def _spawn(
+        self,
+        argv: list[str] | str,
+        work_dir: Path,
+        env: dict[str, str],
+        *,
+        devnull: bool,
+    ) -> asyncio.subprocess.Process:
+        kwargs: dict[str, Any] = {
+            "cwd": str(work_dir),
+            "env": env,
+            "stdout": asyncio.subprocess.DEVNULL if devnull else asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.DEVNULL if devnull else asyncio.subprocess.PIPE,
+            **self._spawn_kwargs(),
+        }
+        if isinstance(argv, list):
+            return await asyncio.create_subprocess_exec(*argv, **kwargs)
+        return await asyncio.create_subprocess_shell(argv, **kwargs)
 
     async def list(self) -> list[LocalCommandInfo]:
         alive: list[LocalCommandInfo] = []

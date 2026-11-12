@@ -93,9 +93,36 @@ cd desktop && npm install && npm start
 `workspace/sync.py` 那 842 行的推送/回拉/护栏/熔断；本地模式下它们本来就是
 同一个目录，同步问题从根上不存在。
 
-安全边界（诚实说明）：文件原语拒绝 `..` 与符号链接逃逸，且不允许穿越
-`workspace/{id}` 挂载点。但 `commands.run` 执行的是**本机真实进程**，
-没有 OS 级隔离——本地后端的适用前提是「用户在自己的机器上跑自己的 Agent」。
+### 四件"看起来能用、实际不能用"的事
+
+文件原语的路径映射只解决了工具层；`run_command` 是**真实进程**，它只认文件系统。
+以下四条都必须补，少一条模型就开始反复试错（首轮实测：3 个任务用了 21 次工具调用）：
+
+| 缺口 | 症状 | 做法 |
+|---|---|---|
+| `workspace/{id}` 在 shell 里是空目录 | 刚写完 `ls` 不到，模型怀疑自己，开始用 `cmd.exe` / `python -c` 变着法子找文件 | 把 `{root}/workspace` 做成指向 `workspace-volumes/` 的**目录联接**，`workspace/{id}` 因此是普通目录（`find`/`grep -r` 也会进去） |
+| `/home/user` 在 Windows 上不存在 | `ls /home/user/...` → No such file | 命令文本里把 `/home/user` 换成真实根（`_translate`），**唯一**一处翻译点 |
+| 输出里是宿主真实路径 | 模型拿它再调文件工具，被 `resolve()` 判越界 | 输出侧反向归一化回 `/home/user`（`_normalize`），与 `_translate` 对称 |
+| 中文 Windows 输出 GBK | `ϵͳ�Ҳ���ָ����·����`，模型当成"语法错了"换语法重试 | 先严格 UTF-8、再按本地代码页解码（`_decode_output`） |
+
+另外两件事：命令统一走 **Git for Windows 的 bash**（模型的命令是按 POSIX 写的：
+`mkdir -p`、管道、`sed`、`find`），PATH 由 `_shell_path()` 显式拼装——不能依赖
+"应用从哪启动"，双击启动时 PATH 里没有 Git 的 `usr\bin`。
+
+安全边界（诚实说明）：文件原语拒绝 `..` 与符号链接逃逸，且不允许穿越或删除
+`workspace` 挂载点。但 `commands.run` 执行的是**本机真实进程**，没有 OS 级隔离——
+本地后端的适用前提是「用户在自己的机器上跑自己的 Agent」。
+
+### 验收
+
+`scripts/e2e_check.py` 跑两轮同一个会话（真实模型 + 真实工具）：
+
+```
+第一轮  写文件 → shell 确认 → 读回     3 次工具调用 / 0 失败 / 57s / 证据 mutated
+第二轮  不重建，只确认文件还在          1 次工具调用 / 0 失败 / 证据 read_only
+```
+
+第二轮是关键：它证明的是**跨 run 持久化**——新 run 新 request，文件仍在那份权威副本里。
 
 ## 与上游的关键差异
 

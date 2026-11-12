@@ -16,8 +16,10 @@ import sys
 import pytest
 
 from edith_backend.internal.sandbox.local import (
+    POSIX_SHELL,
     LocalSandbox,
     SandboxPathError,
+    _decode_output,
 )
 
 SANDBOX_PATH_ERROR = SandboxPathError
@@ -33,9 +35,19 @@ def sandbox(tmp_path, monkeypatch) -> LocalSandbox:
 
 
 def test_open_creates_layout_dirs(sandbox: LocalSandbox) -> None:
-    """首次打开就建好 uploads/work/artifacts/workspace：模型第一次 ls 不该看到目录缺失。"""
-    for name in ("uploads", "work", "artifacts", "workspace"):
+    """首次打开就建好 uploads/work/artifacts：模型第一次 ls 不该看到目录缺失。
+
+    `workspace` 是挂载点（指向 workspace-volumes 的联接），首次解析工作区路径时
+    才建立——它不是一个"空目录"，提前建一个空目录反而会让 shell 看不到工作区文件。
+    """
+    for name in ("uploads", "work", "artifacts"):
         assert (sandbox.root / name).is_dir()
+
+    async def body() -> None:
+        await sandbox.files.write("/home/user/workspace/ws-x/a.txt", "x")
+        assert (sandbox.root / "workspace").is_dir()
+
+    asyncio.run(body())
 
 
 def test_attach_does_not_create(tmp_path, monkeypatch) -> None:
@@ -230,9 +242,7 @@ def test_command_run_success(sandbox: LocalSandbox) -> None:
 def test_command_nonzero_exit_is_result_not_exception(sandbox: LocalSandbox) -> None:
     """非零退出是命令的业务结果，不是系统故障——不能让工具层误判成 failure。"""
     async def body() -> None:
-        result = await sandbox.commands.run(
-            "exit 3" if sys.platform != "win32" else "cmd /c exit 3"
-        )
+        result = await sandbox.commands.run("exit 3")
         assert result.exit_code == 3
 
     asyncio.run(body())
@@ -241,17 +251,17 @@ def test_command_nonzero_exit_is_result_not_exception(sandbox: LocalSandbox) -> 
 def test_command_cwd_is_work_dir(sandbox: LocalSandbox) -> None:
     async def body() -> None:
         await sandbox.files.write("/home/user/work/marker.txt", "x")
-        cmd = "dir /b" if sys.platform == "win32" else "ls"
-        result = await sandbox.commands.run(cmd)
+        result = await sandbox.commands.run("ls")
         assert "marker.txt" in result.stdout
+        pwd = await sandbox.commands.run("pwd")
+        assert pwd.stdout.strip().replace("\\", "/").endswith("/work")
 
     asyncio.run(body())
 
 
 def test_command_env_passthrough(sandbox: LocalSandbox) -> None:
     async def body() -> None:
-        cmd = "echo %ETHOS_T% > env.txt" if sys.platform == "win32" else "echo $ETHOS_T > env.txt"
-        await sandbox.commands.run(cmd, envs={"ETHOS_T": "sentinel"})
+        await sandbox.commands.run("echo $ETHOS_T > env.txt", envs={"ETHOS_T": "sentinel"})
         content = await sandbox.files.read("/home/user/work/env.txt")
         assert "sentinel" in content
 
@@ -369,3 +379,96 @@ def test_service_local_existing_without_open_raises(tmp_path, monkeypatch) -> No
         await db.close()
 
     asyncio.run(body())
+
+
+# ---- 命令执行环境：四条等价性要求 ----
+#
+# 模型是按 Linux 习惯写命令的（`/home/user`、`ls`、`mkdir -p`、管道）。
+# E2B 里这些都成立，本机不成立，所以本地后端要自己补齐。
+# 下面每个用例对应一种"看起来能用、实际不能用"的失败方式。
+
+
+def test_shell_sees_workspace_volume(sandbox: LocalSandbox) -> None:
+    """文件原语与 shell 必须看同一片字节。
+
+    少了 workspace/{id} 的联接，文件工具写的是权威副本、shell 看到的是沙箱里
+    那个空目录——模型"刚写完就 ls 不到"，于是开始疯狂重试
+    （2026-11-12 实测一轮 21 次工具调用里 15 次在找同一个文件）。
+    """
+    async def body() -> None:
+        ws = "ws-mount"
+        await sandbox.files.write(f"/home/user/workspace/{ws}/a.txt", "hello")
+
+        seen = await sandbox.commands.run(f"ls /home/user/workspace/{ws}")
+        assert "a.txt" in seen.stdout, f"shell 看不到工作区文件: {seen.stderr}"
+
+        # 反方向：shell 写的文件，文件原语也要读得到（同一个目录，不是副本）
+        await sandbox.commands.run(f"echo from-shell > /home/user/workspace/{ws}/b.txt")
+        assert await sandbox.files.read(f"/home/user/workspace/{ws}/b.txt") == "from-shell\n"
+
+        # 相对路径同样成立（cwd 是 work/，与 E2B 一致）
+        rel = await sandbox.commands.run(f"ls ../workspace/{ws}")
+        assert "a.txt" in rel.stdout
+
+    asyncio.run(body())
+
+
+@pytest.mark.skipif(POSIX_SHELL is None, reason="本机没有 POSIX shell")
+def test_virtual_root_is_resolvable_in_shell(sandbox: LocalSandbox) -> None:
+    """`/home/user` 既要能被命令解析，也要能在输出里原样回给模型。"""
+    async def body() -> None:
+        result = await sandbox.commands.run("pwd")
+        assert result.exit_code == 0
+        # 输出侧必须还原成虚拟路径：模型会拿它原样再传给文件工具，
+        # 宿主真实路径会被 resolve() 判为越界。
+        assert result.stdout.strip().replace("\\", "/").startswith("/home/user")
+        assert "AppData" not in result.stdout
+
+        listed = await sandbox.commands.run("ls /home/user")
+        assert listed.exit_code == 0, listed.stderr
+        assert "work" in listed.stdout
+
+    asyncio.run(body())
+
+
+@pytest.mark.skipif(POSIX_SHELL is None, reason="本机没有 POSIX shell")
+def test_command_output_paths_are_virtual(sandbox: LocalSandbox) -> None:
+    """`find` 的输出必须能直接喂回文件工具（虚拟路径，不是宿主路径）。"""
+    async def body() -> None:
+        await sandbox.files.write("/home/user/workspace/ws-out/deep/x.py", "print(1)")
+        found = await sandbox.commands.run(
+            'find /home/user/workspace/ws-out -name "*.py"'
+        )
+        path = found.stdout.strip().splitlines()[0]
+        assert path == "/home/user/workspace/ws-out/deep/x.py"
+        # 回读：输出里的路径是可直接使用的
+        assert await sandbox.files.read(path) == "print(1)"
+
+    asyncio.run(body())
+
+
+@pytest.mark.skipif(POSIX_SHELL is None, reason="本机没有 POSIX shell")
+def test_posix_habits_work(sandbox: LocalSandbox) -> None:
+    """`mkdir -p`、管道、`sed` 都不该报"找不到命令"。
+
+    这些在 E2B 里天然存在，本地若缺，模型每条命令都要试错一次。
+    """
+    async def body() -> None:
+        made = await sandbox.commands.run("mkdir -p deep/a/b && echo ok")
+        assert made.exit_code == 0, made.stderr
+
+        piped = await sandbox.commands.run("printf 'x\\ny\\n' | wc -l")
+        assert piped.stdout.strip() == "2"
+
+    asyncio.run(body())
+
+
+def test_gbk_output_is_decoded() -> None:
+    """中文 Windows 的控制台程序按 GBK 输出；只按 UTF-8 解会变成乱码。
+
+    乱码的后果不是"显示难看"：模型会把 `ϵͳ�Ҳ���ָ����·����` 当成"命令语法错了"，
+    换着语法重试，而不是"这个路径不存在"。
+    """
+    gbk = "系统找不到指定的路径".encode("gbk")
+    assert _decode_output(gbk) == "系统找不到指定的路径"
+    assert _decode_output("正常 UTF-8".encode()) == "正常 UTF-8"
