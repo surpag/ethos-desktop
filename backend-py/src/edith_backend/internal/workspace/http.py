@@ -1,8 +1,8 @@
 """工作区实体的 HTTP 路由（含 Volume 文件上传与级联删除）。
 
-对应 `docs/p1-workspace-volume-design.md`：
-- POST/GET /internal/workspaces + DELETE /internal/workspaces/{id}（级联删指令 + 销毁 Volume）
-- POST /internal/workspaces/{id}/files（上传文件到 Volume，懒创建）
+对应 `docs/archive/p1-workspace-volume-design.md`：
+- POST/GET /internal/workspaces + DELETE /internal/workspaces/{id}（级联删指令 + 清磁盘目录）
+- POST /internal/workspaces/{id}/files（上传文件，首次上传才建目录）
 - GET/PUT/DELETE /internal/workspaces/{id}/instructions（整段覆盖，等价 AGENTS.md）
 - GET/PUT/DELETE /internal/workspaces/{id}/memories（自动记忆）
 """

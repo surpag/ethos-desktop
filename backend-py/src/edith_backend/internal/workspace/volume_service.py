@@ -1,6 +1,6 @@
 """工作区文件服务：门面，负责写入、本地目录绑定与销毁。
 
-对应 `docs/p1-workspace-volume-design.md` 的懒创建语义：首次上传文件才在磁盘上
+对应 `docs/archive/p1-workspace-volume-design.md` 的懒创建语义：首次上传文件才在磁盘上
 建目录。存储只有一个实现（本地目录），所以这里不做后端选择——留一个 `VolumeBackend`
 抽象加一次 `isinstance` 判断，只会让人以为还有另一条路。
 """

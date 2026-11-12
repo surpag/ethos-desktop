@@ -22,32 +22,40 @@
 
 ## 已做的偏离
 
-改动都集中在这几处，便于将来对照上游 diff：
+偏离已经大到「逐文件对照」不再有意义（删掉的能力就有数千行），所以按**主题**
+列，而不是按文件：
 
-| 文件 | 改动 |
-|---|---|
-| `backend-py/src/edith_backend/config.py` | `project_root()` frozen 感知；新增 `is_desktop()` / `data_root()`；`database_path()` 缺省值改走 `data_root()` |
-| `backend-py/src/edith_backend/database.py` | `open_database()` 建父目录（桌面端首次启动 `%APPDATA%\ETHOS` 不存在 → `unable to open database file`） |
-| `backend-py/pyproject.toml` | 补 `mcp>=2.0`（上游漏声明，干净环境装完启动即 `ModuleNotFoundError`） |
-| `backend-py/src/edith_backend/internal/workspace/volume_backend.py` | `_LOCAL_ROOT` 由相对串改为 `data_root()/workspace-volumes` |
-| `backend-py/src/edith_backend/internal/skills/storage/local.py` | 用户级 skill 缺省根目录改为 `data_root()/user-skills` |
-| `backend-py/src/edith_backend/internal/skills/storage/project.py` | 项目级 skill 缺省根目录改为 `data_root()/project-skills` |
-| `backend-py/src/edith_backend/internal/sandbox/local.py` | **新增**：`LocalSandbox`（11 个原语的本机实现，形状兼容 E2B `AsyncSandbox`）；`workspace/` 目录联接、`/home/user` 双向路径翻译、POSIX shell（Git Bash）+ 显式 PATH、GBK 输出解码 |
-| `backend-py/src/edith_backend/internal/sandbox/service.py` | 加 `backend` 参数；`workspace()` / `existing_workspace()` 按后端分派（分歧只在这两处） |
-| `backend-py/src/edith_backend/internal/sandbox/tools.py` | `_read_file_slice` 尊重 `supports_large_read`（跳过依赖 `sed`/`wc` 的大文件分支，Windows 上没有这两个命令） |
-| `backend-py/src/edith_backend/main.py` | `EDITH_SANDBOX_BACKEND` / `EDITH_WORKSPACE_VOLUME_BACKEND` 在桌面模式下默认 `local` |
-| `backend-py/tests/test_local_sandbox.py` | **新增**：32 个用例覆盖 11 个原语、路径边界、shell/文件同视图、路径双向翻译、GBK 解码、Service 层登记 |
-| `scripts/e2e_check.py` | **新增**：两轮端到端验收（真实模型 + 真实工具 + 跨 run 持久化） |
-| `scripts/probe_local.py` | **新增**：本地沙箱探针（不花模型调用就能验证四条等价性） |
-| `web-v1/lib/auth/desktop.ts` | 新增：桌面模式判断（server + client 同构） |
-| `web-v1/lib/auth/current-user.ts` | 新增：`currentUserId()`，替代 51 处直接调用 Clerk `auth()` |
-| `web-v1/app/api/**`（38 个文件） | `auth()` → `currentUserId()`，机械替换 |
-| `web-v1/proxy.ts` | 桌面模式短路，不构造 `clerkMiddleware()` |
-| `web-v1/app/layout.tsx` | 桌面模式不包 `ClerkProvider` |
-| `web-v1/components/account-menu.tsx` | 桌面模式不渲染 `UserButton` |
+### 一、删掉的上游能力（不可回退）
 
-以上改动在非桌面模式下**行为不变**（`data_root() == project_root()`，
-`isDesktopMode()` 为 false 时全部走原路径）。
+| 能力 | 上游做法 | 现在 | 提交 |
+| --- | --- | --- | --- |
+| 远端沙箱 | E2B Sandbox + Volume 挂载 | 本机目录（`sandbox/local.py`），`workspace/{id}` 与 `skills/` 用目录联接指向权威副本 | `0846507` |
+| 工作区同步 | 双副本 push/pull + 三道护栏 + 熔断 + 删除传播 | 不存在：磁盘上只有一份文件 | `0846507` |
+| 认证 | Clerk + 双模开关 | 固定 `local-user` | `c575b17` |
+| 图片存储 | 腾讯云 COS 预签名直传 | 本机磁盘 + 模型侧 data URL | `20d9ece` |
+| 渠道绑定 | `user_channel_bindings` 映射外部账号 | 渠道白名单（web / cron），未知渠道拒绝 | `95a46c9` |
+| Skill 作用域 | platform/user/project 三层 + 裁决 + 冲突快照 + 迁移工具 | 单层目录（`<data_root>/skills`），只保留清单预算与加载预算 | `4335b48` |
+
+### 二、保留结构、换了实现
+
+| 位置 | 改动 |
+| --- | --- |
+| `config.py` | `project_root()` frozen 感知；新增 `is_desktop()` / `data_root()`；`database_path()` 缺省走 `data_root()` |
+| `database.py` | `open_database()` 建父目录（首次启动 `%APPDATA%\ETHOS` 不存在 → `unable to open database file`） |
+| `sandbox/local.py` | **新增**：本机实现（文件/命令原语）、目录联接、`/home/user` 双向路径翻译、Git Bash + 显式 PATH、GBK 解码 |
+| `sandbox/service.py` | 只收 `(db, workspaces, workspace_volumes)`，没有后端分派 |
+| `images/` | `cos.py` → `storage.py`；新增 `PUT /internal/images/{id}/blob`；`object_key` 只取末段（老记录无需迁移） |
+| `workspace/volume_backend.py` | 本地根目录改为 `data_root()/workspace-volumes` |
+| `skills/` | `catalog.py` / `instruction.py` / `budget.py` 重写为单层；删 `resolver.py`、`storage/`、`migrate.py` |
+| `gateway/service.py` | 去掉 `bindings` 依赖；`_is_trusted_channel` → 白名单常量 |
+| `cronjob/` | `clerk_user_id` → `user_id`（含 `ALTER TABLE RENAME COLUMN` 迁移） |
+| `main.py` | 装配收敛：无 E2B / COS / Volume 服务，`new_gateway_service(agent_runs)` |
+| `pyproject.toml` | 删 `e2b`、`cos-python-sdk-v5`；补 `mcp>=2.0`（上游漏声明） |
+| `web-v1/lib/auth/current-user.ts` | **新增**：`currentUserId()` 替代 51 处直接调用 Clerk `auth()`；现在返回常量 |
+| `web-v1/app/api/**` | `auth()` → `currentUserId()`，机械替换 |
+| `web-v1/app/(authenticated)`、`proxy.ts`、`sign-in`、`sign-up`、`account-menu` | 删除 |
+| `backend-py/tests/test_local_sandbox.py`、`tests/test_images.py`、`tests/test_skills.py` | **新增/重写**：覆盖本地沙箱原语、图片生命周期、Skill 单层与预算 |
+| `scripts/e2e_check.py`、`scripts/probe_local.py` | **新增**：端到端验收与本地沙箱探针 |
 
 ## 从上游取后续修复
 
@@ -58,5 +66,8 @@ git show <commit>:backend-py/src/edith_backend/internal/agentrun/execution.py \
   > /d/agent/ethos-desktop/backend-py/src/edith_backend/internal/agentrun/execution.py
 ```
 
-注意：直接覆盖会冲掉上表里的偏离，覆盖 `config.py` / `volume_backend.py` /
-`skills/storage/{local,project}.py` / web 的 auth 相关文件后需要重新应用。
+注意：直接覆盖会冲掉上面的偏离。**更容易踩的坑是拿上游文件替代「本仓库已经
+删掉的东西的调用方」**——例如覆盖 `main.py` 会把 E2B / COS 的装配重新带回来，
+而它们依赖的模块在这里已经不存在。移植单个修复时优先只取被修的**函数体**，
+不要整文件覆盖 `main.py` / `sandbox/service.py` / `gateway/service.py` /
+`images/*` / `skills/*`。

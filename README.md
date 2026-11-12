@@ -15,7 +15,7 @@ ethos-desktop/
 │   └── src/paths.ts      开发态与打包态的资源定位
 ├── backend-py/     Python 后端（快照，本地化改造进行中）
 ├── web-v1/         Next.js 界面（快照，认证已单点化）
-└── docs/           上游设计文档
+└── docs/           设计档案（archive/ 全为已废弃设计稿，勿据此理解代码）
 ```
 
 ## 启动链路
@@ -53,22 +53,19 @@ electron (desktop/dist/main.js)
 # 后端依赖（一次性）
 cd backend-py && python -m venv .venv && .venv/Scripts/python.exe -m pip install -e .
 
-# 前端依赖 + 桌面版构建（NEXT_PUBLIC_ETHOS_DESKTOP 必须在 build 时存在，
-# 它是编译期内联的，运行期再设无效）
+# 前端依赖 + 桌面版构建（standalone 产物 + 补齐 static/public，一条命令）
 cd web-v1 && npm install
-NEXT_PUBLIC_ETHOS_DESKTOP=1 npm run build
-cp -r .next/static .next/standalone/.next/static
-cp -r public .next/standalone/public
+cd ../desktop && npm install && npm run build:web
 
-# 壳
-cd desktop && npm install && npm start
+# 壳（build:web 已生成 web-v1/.next/standalone）
+npm start
 ```
 
 ### 环境变量
 
 桌面端**不需要 `.env`**。数据目录、沙箱、认证模式均由 `desktop/src/main.ts`
 在 spawn 时注入；模型 API Key 走应用内「设置 → 模型」，写进数据库。
-`backend-py/.env.example` 只对云端部署和脱离壳调试后端有意义。
+`backend-py/.env.example` 只对「脱离壳单独调试后端」有意义。
 
 单独调试后端时注入同样的上下文，但要**换一个数据目录**——桌面端用的是
 非 WAL 的 SQLite（`busy_timeout=5000`），和壳同时指着同一个库必定
@@ -168,8 +165,17 @@ LWW、事务、校验）、`migrate.py`（527 行迁移工具）、`overview.md`
 
 ## 与上游的关键差异
 
-**认证**：`web-v1/lib/auth/current-user.ts` 是唯一入口。桌面模式固定返回
-`local-user`，云端仍走 Clerk。38 个 BFF route 不再直接接触 Clerk。
+**认证**：`web-v1/lib/auth/current-user.ts` 是唯一入口，固定返回 `local-user`。
+Clerk（含 provider、middleware、登录页、账号菜单）与 `ETHOS_DESKTOP` /
+`NEXT_PUBLIC_ETHOS_DESKTOP` 两个构建期开关都已删除——桌面端没有第二条路径要兼容，
+留着只会让「服务端认为在桌面、客户端认为在云端」这种白屏故障有生存空间。
 
 **数据目录**：`config.data_root()` 按 `ETHOS_DESKTOP` 分流。非桌面模式下
-`data_root() == project_root()`，与上游行为完全一致。
+`data_root() == project_root()`，脱离壳单独调试时行为与上游一致。
+
+**图片**：从腾讯云 COS（预签名直传 + 签名 URL）改成本机磁盘
+（`data_root()/images`）+ 喂模型时内联 data URL。桌面端没有 bucket，
+远端模型也拉不到 `127.0.0.1` 的地址。
+
+**渠道**：`gateway` 只放行 `web` / `cron`，未知渠道直接 `invalid_request`。
+上游那套「外部渠道账号 → 用户」的绑定表已随多租户一起删除。

@@ -11,7 +11,7 @@
     await tracer.flush()
     await tracer.finish(status=OK, end_reason="completed")
 
-三条设计约束（`docs/trace-eval-design.md` §3）：
+三条设计约束（`docs/archive/trace-eval-design.md` §3）：
 1. 父步骤关联用 ContextVar —— 嵌套调用无需手传 parent；
    `asyncio.create_task` 会复制上下文，`asyncio.gather` 的并发子步各自独立且父链正确。
 2. `seq` 在**进入**时分配（不是在退出时），这样嵌套子步一定能拿到父的 seq。

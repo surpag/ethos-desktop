@@ -1,6 +1,6 @@
 """工作区实体的 SQLite 访问器：用户命名，系统生成 workspace_id。
 
-对应 `docs/p1-workspace-volume-design.md`：
+对应 `docs/archive/p1-workspace-volume-design.md`：
 - workspaces 含 metadata（文件清单）与 local_root（绑定的本地目录）
 - 删除工作区时级联删除指令 + 通过回调清理磁盘目录
 """

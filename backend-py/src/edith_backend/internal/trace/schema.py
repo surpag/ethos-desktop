@@ -3,7 +3,7 @@
 两张表：`traces`（一次 run 一行）+ `trace_steps`（一步一行）。
 与 `usage_runs`（run/行）、`run_checkpoints`（step/行）保持同一范式——
 不用 JSON 文件，因为后端可多副本、且崩溃时 JSON 必须结束时一次写会全丢
-（见 `docs/trace-eval-design.md` §3.1 决策 1）。
+（见 `docs/archive/trace-eval-design.md` §3.1 决策 1）。
 """
 
 from __future__ import annotations

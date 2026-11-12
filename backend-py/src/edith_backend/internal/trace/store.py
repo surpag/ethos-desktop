@@ -1,6 +1,6 @@
 """trace 模块的 SQLite 访问器。
 
-写入策略（`docs/trace-eval-design.md` §3.1 决策 2）：
+写入策略（`docs/archive/trace-eval-design.md` §3.1 决策 2）：
 - `insert_trace` 立即 commit——让「有一次 run 正在进行」立刻可见（排查卡住的前提）。
 - `insert_steps` 由 Tracer 按轮批量调用，一次 commit 写一批；
   逐条 commit 会在工具路径上产生双倍 fsync（本库是 DELETE journal 模式），

@@ -1,10 +1,10 @@
 """workspace 模块的表结构：workspaces + project_memories。
 
-对应 `docs/p1-workspace-volume-design.md`：
+对应 `docs/archive/p1-workspace-volume-design.md`：
 - workspaces 含 local_root（绑定的本地目录，方案 B）
 - project_memories 存项目指令（kind='user'）与自动记忆（kind='auto'）
 
-旧库可能还留有 volume_id / volume_name / volume_token 三列（远端卷时代的字段）。
+旧库可能还留有 volume_id / volume_name / volume_token 三列（远端持久卷时代的字段）。
 本模块不再读写它们；SQLite 允许多出未使用的列，因此不做破坏性的删列迁移。
 """
 

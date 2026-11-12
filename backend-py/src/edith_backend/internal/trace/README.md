@@ -1,6 +1,6 @@
 # trace 模块
 
-一次 run 的分步耗时 / 异常 / 降级记录。对应 `docs/trace-eval-design.md` 的 P0 + P1。
+一次 run 的分步耗时 / 异常 / 降级记录。对应 `docs/archive/trace-eval-design.md` 的 P0 + P1。
 
 
 ## 回答什么问题

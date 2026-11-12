@@ -1,6 +1,6 @@
 """项目指令（kind='user'）与自动记忆（kind='auto'）的 SQLite 访问器。
 
-对应 `docs/p0-phase-a-design.md`：
+对应 `docs/archive/p0-phase-a-design.md`：
 - kind='user'：用户写的工作区指令（整段覆盖式保存，等价 AGENTS.md）
 - kind='auto'：AI 自动总结的记忆（Phase B 预留，多条）
 记忆以 (user_id, workspace_id) 为粒度，多用户天然隔离。

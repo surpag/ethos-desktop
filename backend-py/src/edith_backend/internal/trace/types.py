@@ -2,7 +2,7 @@
 
 记录「一次 run 的分步耗时/异常」。
 
-设计依据：`docs/trace-eval-design.md` §3。
+设计依据：`docs/archive/trace-eval-design.md` §3。
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any
 
-# ── step 类型（对齐 docs/trace-eval-design.md §2.3 的枚举） ──────────────
+# ── step 类型（对齐 docs/archive/trace-eval-design.md §2.3 的枚举） ──────────────
 AGENTRUN = "agentrun"
 PREPARE = "prepare"
 MCP = "mcp"
