@@ -113,7 +113,7 @@ export async function uploadWorkspaceFiles(
       // 第二个参数是 filename，后端以此为 Volume 内相对路径（如 src/main.py）
       body.append("files", item.blob, item.relPath);
     }
-    // 不再传 userId：身份由 BFF 从 Clerk 会话解析
+    // 不再传 userId：身份由 BFF 在服务端解析
     const response = await fetch(uploadEndpoint(workspaceId), {
       method: "POST",
       body,

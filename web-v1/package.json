@@ -10,7 +10,6 @@
     "test": "node --test \"tests/**/*.test.ts\""
   },
   "dependencies": {
-    "@clerk/nextjs": "^7.6.2",
     "@fontsource-variable/jetbrains-mono": "^5.3.0",
     "@fontsource-variable/noto-sans-sc": "^5.3.0",
     "lucide-react": "^1.28.0",

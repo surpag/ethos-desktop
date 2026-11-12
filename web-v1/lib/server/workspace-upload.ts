@@ -16,7 +16,7 @@
  *   代价是单请求内存上限 = MAX_UPLOAD_BYTES，由调用方（前端分批）保证不越界。
  *
  * 安全边界：
- *   - userId 只由服务端会话（Clerk）解析，永不采信客户端传参。
+ *   - userId 只由服务端解析，永不采信客户端传参。
  *   - 转发前先用 `/internal/workspaces?userId=` 校验 workspace 归属，
  *     既避免为「别人的 workspace id」读入整包请求体，也让越权返回 404 而非 403
  *     （不泄露 workspace 是否存在）。
@@ -32,7 +32,7 @@ const OWNERSHIP_TIMEOUT_MS = 5_000;
 export type WorkspaceUploadDeps = {
   /**
    * 解析当前登录用户。返回 null 表示未登录。
-   * 用回调注入而非直接 import Clerk，使核心逻辑可在 Node 测试里跑。
+   * 用回调注入用户标识，使核心逻辑可在 Node 测试里跑。
    */
   resolveUserId: () => Promise<string | null>;
   /** 覆盖 runtime 地址（默认读 EDITH_RUNTIME_URL）。 */

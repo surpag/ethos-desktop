@@ -5,7 +5,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 // parseCronJobRequest is the browser-facing cron job boundary before
-// Clerk's userId is added by the BFF route.
+// The BFF route adds userId.
 export function parseCronJobRequest(value: unknown): CreateCronJobRequest | null {
   if (
     !isRecord(value) ||

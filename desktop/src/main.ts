@@ -75,7 +75,7 @@ async function startServices(): Promise<string> {
   if (!fs.existsSync(path.join(standaloneDir, "server.js"))) {
     throw new Error(
       `找不到 Next standalone 产物：${path.join(standaloneDir, "server.js")}\n` +
-        `请先在 web-v1 下执行 npm run build（桌面版需带 NEXT_PUBLIC_ETHOS_DESKTOP=1）。`,
+        `请先执行 desktop 下的构建脚本生成 standalone 产物。`,
     );
   }
 
@@ -90,7 +90,6 @@ async function startServices(): Promise<string> {
       PORT: String(webPort),
       HOSTNAME: "127.0.0.1",
       ETHOS_DESKTOP: "1",
-      NEXT_PUBLIC_ETHOS_DESKTOP: "1",
       EDITH_RUNTIME_URL: `http://127.0.0.1:${backendPort}`,
     },
   });

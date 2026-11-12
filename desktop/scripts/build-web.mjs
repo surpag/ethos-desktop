@@ -6,8 +6,6 @@
  * **不会**复制 `.next/static` 与 `public`——缺了它们的表现是页面能打开但
  * 没有任何样式与字体（CSS 404），很容易被误判成"样式写错了"。
  *
- * 关键：`NEXT_PUBLIC_ETHOS_DESKTOP` 必须在 build 时存在。它被编译期内联，
- * 运行期再设无效。
  */
 import { execSync } from "node:child_process";
 import { cpSync, existsSync, rmSync } from "node:fs";
@@ -23,11 +21,7 @@ console.log("[build-web] web 目录:", webDir);
 execSync("npm run build", {
   cwd: webDir,
   stdio: "inherit",
-  env: {
-    ...process.env,
-    ETHOS_DESKTOP: "1",
-    NEXT_PUBLIC_ETHOS_DESKTOP: "1",
-  },
+  env: { ...process.env },
 });
 
 if (!existsSync(path.join(standalone, "server.js"))) {

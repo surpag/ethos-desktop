@@ -202,7 +202,7 @@ export const emptySessionUsage: SessionUsage = {
   estimatedRuns: 0,
 };
 
-// Next BFF → Agent Gateway. userId comes from Clerk on the BFF.
+// Next BFF → Agent Gateway. userId is resolved on the BFF, never by the browser.
 export type GatewayMessageRequest = ChatRequest & {
   userId: string;
 };

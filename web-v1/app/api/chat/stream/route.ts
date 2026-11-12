@@ -5,7 +5,7 @@ import type { ChatRequest, GatewayMessageRequest } from "@/lib/chat/type";
 const runtimeURL = process.env.EDITH_RUNTIME_URL ?? "http://127.0.0.1:8080";
 
 // POST /api/chat/stream is ETHOS's browser-facing BFF endpoint.
-// It intentionally derives userId from Clerk instead of accepting it from JSON.
+// It intentionally derives userId from the server side instead of accepting it from JSON.
 export async function POST(request: Request) {
   const userId = await currentUserId();
   if (!userId) {

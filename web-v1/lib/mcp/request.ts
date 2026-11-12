@@ -5,7 +5,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 // parseMCPServerRequest is the browser-facing MCP configuration boundary
-// before Clerk's userId is added by the BFF route.
+// before the BFF route adds userId.
 export function parseMCPServerRequest(value: unknown): UpdateMCPServerRequest | null {
   if (
     !isRecord(value) ||

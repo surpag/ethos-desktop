@@ -1,9 +1,6 @@
 "use client";
 
-import { UserButton } from "@clerk/nextjs";
 import { Settings } from "lucide-react";
-
-import { isDesktopMode } from "@/lib/auth/desktop";
 
 import { ThemeToggle } from "./theme-toggle";
 
@@ -11,21 +8,14 @@ type AccountMenuProps = {
   onOpenSettings: () => void;
 };
 
-// Clerk owns account actions in cloud mode. ETHOS only adds its own settings entry.
-// 桌面端没有账号体系：显示本机标识，不渲染 UserButton（它依赖 ClerkProvider）。
+// 桌面端没有账号体系：只显示本机标识与本地设置入口。
 export function AccountMenu({ onOpenSettings }: AccountMenuProps) {
-  const desktop = isDesktopMode();
-
   return (
     <div className="flex items-center justify-between rounded-xl px-2 py-1 hover:bg-surface-subtle">
       <div className="min-w-0 flex-1 truncate">
-        {desktop ? (
-          <span className="text-sm text-muted" title="桌面端为单用户模式">
-            本机
-          </span>
-        ) : (
-          <UserButton showName userProfileMode="modal" />
-        )}
+        <span className="text-sm text-muted" title="桌面端为单用户模式">
+          本机
+        </span>
       </div>
       <div className="flex shrink-0 items-center gap-1">
         <ThemeToggle />

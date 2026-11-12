@@ -1,4 +1,4 @@
-// Sandbox 文件接口只描述浏览器可见的数据；用户身份由 Next BFF 从 Clerk 注入。
+// Sandbox 文件接口只描述浏览器可见的数据；用户身份由 Next BFF 注入。
 export type SandboxEntryType = "file" | "directory";
 
 export type SandboxFileEntry = {
