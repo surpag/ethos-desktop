@@ -339,7 +339,10 @@ async def _read_file_slice(
     except Exception:  # noqa: BLE001 - 取不到大小则回退直读（read 会再抛 FileNotFoundError）
         size = 0
 
-    if size <= _LARGE_FILE_BYTES:
+    # `supports_large_read` 是后端的能力声明（见 sandbox/local.py）：本地沙箱读磁盘
+    # 没有网络成本，不需要"大文件改用 sed 按行读"这条优化。而那个分支依赖
+    # `sed` / `wc`，Windows 上没有这两个可执行文件——一旦文件超过 512KB 就会整条失败。
+    if size <= _LARGE_FILE_BYTES or getattr(sandbox, "supports_large_read", False):
         data = await sandbox.files.read(file_path)
         all_lines = data.splitlines()
         total = len(all_lines)

@@ -161,8 +161,13 @@ async def lifespan(app: FastAPI):
 
     volumes = VolumeService(VolumeStore(db))
     workspaces = WorkspaceStore(db)
+    # 桌面端必须与 sandbox 后端一致（local）：本地沙箱把 `workspace/{id}`
+    # 直接映射到 `workspace-volumes/{id}`。若卷后端仍是 e2b，那个目录永远是空的，
+    # 表现为"Agent 看不到任何工作区文件"——而两边各自的日志都显示正常。
     workspace_backend = new_workspace_volume_backend(
-        os.getenv("EDITH_WORKSPACE_VOLUME_BACKEND", "e2b"), workspaces
+        os.getenv("EDITH_WORKSPACE_VOLUME_BACKEND")
+        or ("local" if config.is_desktop() else "e2b"),
+        workspaces,
     )
     workspace_volumes = WorkspaceVolumeService(workspaces, workspace_backend)
     workspace_memories = WorkspaceMemoryStore(db)
@@ -188,6 +193,10 @@ async def lifespan(app: FastAPI):
         workspaces,
         workspace_volumes,
         skill_scopes=skill_scopes,
+        # 桌面端默认本机沙箱；显式设置 EDITH_SANDBOX_BACKEND 可覆盖（调试用）。
+        # 云端不设这个变量 → e2b，行为与上游一致。
+        backend=os.getenv("EDITH_SANDBOX_BACKEND")
+        or ("local" if config.is_desktop() else "e2b"),
     )
     async def _git_identity(user_id: str) -> tuple[str, str]:
         """解析用户的 git 提交身份：用户设置优先，留空回退平台默认。"""

@@ -23,6 +23,7 @@ from ..workspace.layout import WORKSPACE
 from ..workspace.store import WorkspaceStore
 from ..workspace.volume_backend import LocalVolumeBackend
 from ..workspace.volume_service import WorkspaceVolumeService
+from .local import LocalSandbox
 
 if TYPE_CHECKING:  # 仅类型标注：运行期由 main.py 注入实例
     from ..skills.storage import SkillScopeStores, SkillStorageService
@@ -53,9 +54,17 @@ class Service:
         workspaces: WorkspaceStore | None = None,
         workspace_volumes: WorkspaceVolumeService | None = None,
         skill_scopes: SkillScopeStores | None = None,
+        backend: str = "e2b",
     ) -> None:
         self._db = db
         self._template = template
+        # 后端选择：`e2b`（远端微 VM）或 `local`（本机目录，桌面端）。
+        # 只影响「怎么拿到沙箱」——两边的返回形状一致，工具层不需要知道这件事。
+        self._backend = (backend or "e2b").strip().lower()
+        # 与 `skills.storage` / `workspace.volume_backend` 的做法一致：
+        # 启动就把实际生效的后端打出来。否则"为什么工具还在连远端"
+        # 只能靠读环境变量猜。
+        logger.info("sandbox backend: %s", self._backend)
         self._volumes = volumes
         self._workspaces = workspaces
         self._workspace_volumes = workspace_volumes
@@ -168,6 +177,11 @@ class Service:
         user_id, session_id = user_id.strip(), session_id.strip()
         if not user_id or not session_id:
             raise ValueError("sandbox requires a user ID and session ID")
+        if self._backend == "local":
+            # 本地沙箱就是磁盘目录：只要目录还在就能打开。
+            # 注意这里用 attach（不创建）——"仅连接已存在"的语义必须与 e2b 一致，
+            # 否则一个只读预览请求会凭空造出一个空沙箱目录。
+            return LocalSandbox.attach(user_id, session_id)  # type: ignore[return-value]
         sandbox_id = await self._load_sandbox_id(user_id, session_id)
         if sandbox_id is None:
             raise SandboxNotFound("sandbox mapping not found")
@@ -472,10 +486,45 @@ class Service:
         if force or self._workspace_volumes.is_dirty(workspace_id):
             await self._workspace_volumes.sync_to_sandbox(workspace, workspace_id)
 
+    async def _open_local(
+        self, user_id: str, session_id: str, workspace_id: str
+    ) -> LocalSandbox:
+        """本机沙箱：目录即沙箱，没有远端资源、没有 volume 挂载、没有同步。
+
+        与 e2b 分支的共同点只有两件事——登记 `user_sandboxes`（UI 的沙箱面板和
+        `existing_workspace` 都读它）、以及把 Skill 权威副本铺进去。其余
+        （出口白名单、volume 挂载、B2/B3 同步）在本地语义下都不存在。
+
+        `workspace/{id}` 由 `LocalSandbox.resolve` 直接映射到权威副本目录，
+        所以这里**刻意不调用** `_sync_workspace_files`。
+        """
+        sandbox = LocalSandbox.open(user_id, session_id)
+
+        existing = await self._load_sandbox_id(user_id, session_id)
+        if existing is None:
+            await self._db.execute(
+                "INSERT INTO user_sandboxes (user_id, session_id, sandbox_id) VALUES (?, ?, ?)",
+                (user_id, session_id, sandbox.sandbox_id),
+            )
+        else:
+            # 目录被外部删过 / sandbox_id 变化：就地更新，不必先删行。
+            await self._db.execute(
+                "UPDATE user_sandboxes SET sandbox_id = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE user_id = ? AND session_id = ?",
+                (sandbox.sandbox_id, user_id, session_id),
+            )
+        await self._db.commit()
+
+        # Skill：顺序与 e2b 分支一致——先兑现上一轮挂起的回拉，再把权威副本推上去。
+        # 本地模式下 push 仍是"写文件到沙箱目录"，走的是存储门面的指纹快路径。
+        await self._drain_skill_pending(user_id, session_id, sandbox)  # type: ignore[arg-type]
+        await self._push_skills(user_id, workspace_id, sandbox)  # type: ignore[arg-type]
+        return sandbox
+
     async def workspace(
         self, user_id: str, session_id: str, workspace_id: str = ""
     ) -> AsyncSandbox:
-        """返回可恢复的 E2B Sandbox；首次调用才创建远端资源。
+        """返回可恢复的 Sandbox；首次调用才创建资源。
 
         workspace_id 用于按需同步（Local 后端）：仅同步当前会话所属工作区，
         且只在「沙箱新建」或「该工作区有新写入（dirty）」时同步，避免每次工具调用全量同步。
@@ -483,6 +532,8 @@ class Service:
         user_id, session_id = user_id.strip(), session_id.strip()
         if not user_id or not session_id:
             raise ValueError("sandbox requires a user ID and session ID")
+        if self._backend == "local":
+            return await self._open_local(user_id, session_id, workspace_id)
         sandbox_id = await self._load_sandbox_id(user_id, session_id)
         if sandbox_id is not None:
             workspace = await AsyncSandbox.connect(

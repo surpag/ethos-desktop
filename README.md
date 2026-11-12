@@ -69,11 +69,33 @@ cd desktop && npm install && npm start
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| M0 | 壳能跑：standalone + sidecar + 数据目录 | 进行中 |
-| M1 | 本地沙箱：`sandbox/` 换成本机实现，13 个原语 | 未开始 |
+| M0 | 壳能跑：standalone + sidecar + 数据目录 | 完成 |
+| M1 | 本地沙箱：`sandbox/` 换成本机实现，11 个原语 | 完成 |
 | M2 | 删同步：`workspace/sync.py` 在本地后端下 no-op | 未开始 |
 | M3 | 桌面化：keychain、托盘、退出清理 | 未开始 |
 | M4 | 分发：隔离、签名、自动更新 | 未开始 |
+
+## 本地沙箱（M1）
+
+`backend-py/src/edith_backend/internal/sandbox/local.py` 提供与 E2B `AsyncSandbox`
+**形状兼容**的 `LocalSandbox`（`.files` / `.commands` / `.sandbox_id`）。所以
+`tools.py` 那一千行工具代码一行都没改——后端分歧只存在于 `Service.workspace()`
+的一个 `if` 上。
+
+虚拟路径映射（`LocalSandbox.resolve`）：
+
+| 模型看到的路径 | 实际落点 |
+|---|---|
+| `/home/user/work/a.txt` | `%APPDATA%\ETHOS\sandbox\{user}\{session}\work\a.txt` |
+| `/home/user/workspace/{id}/…` | `%APPDATA%\ETHOS\workspace-volumes\{id}\…`（**零拷贝，不同步**） |
+
+第二行是本地模式最重要的简化：E2B 后端里沙箱与权威副本是两份，才需要
+`workspace/sync.py` 那 842 行的推送/回拉/护栏/熔断；本地模式下它们本来就是
+同一个目录，同步问题从根上不存在。
+
+安全边界（诚实说明）：文件原语拒绝 `..` 与符号链接逃逸，且不允许穿越
+`workspace/{id}` 挂载点。但 `commands.run` 执行的是**本机真实进程**，
+没有 OS 级隔离——本地后端的适用前提是「用户在自己的机器上跑自己的 Agent」。
 
 ## 与上游的关键差异
 

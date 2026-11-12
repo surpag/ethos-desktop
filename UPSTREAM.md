@@ -32,6 +32,11 @@
 | `backend-py/src/edith_backend/internal/workspace/volume_backend.py` | `_LOCAL_ROOT` 由相对串改为 `data_root()/workspace-volumes` |
 | `backend-py/src/edith_backend/internal/skills/storage/local.py` | 用户级 skill 缺省根目录改为 `data_root()/user-skills` |
 | `backend-py/src/edith_backend/internal/skills/storage/project.py` | 项目级 skill 缺省根目录改为 `data_root()/project-skills` |
+| `backend-py/src/edith_backend/internal/sandbox/local.py` | **新增**：`LocalSandbox`（11 个原语的本机实现，形状兼容 E2B `AsyncSandbox`） |
+| `backend-py/src/edith_backend/internal/sandbox/service.py` | 加 `backend` 参数；`workspace()` / `existing_workspace()` 按后端分派（分歧只在这两处） |
+| `backend-py/src/edith_backend/internal/sandbox/tools.py` | `_read_file_slice` 尊重 `supports_large_read`（跳过依赖 `sed`/`wc` 的大文件分支，Windows 上没有这两个命令） |
+| `backend-py/src/edith_backend/main.py` | `EDITH_SANDBOX_BACKEND` / `EDITH_WORKSPACE_VOLUME_BACKEND` 在桌面模式下默认 `local` |
+| `backend-py/tests/test_local_sandbox.py` | **新增**：27 个用例覆盖 11 个原语、路径边界、Service 层登记 |
 | `web-v1/lib/auth/desktop.ts` | 新增：桌面模式判断（server + client 同构） |
 | `web-v1/lib/auth/current-user.ts` | 新增：`currentUserId()`，替代 51 处直接调用 Clerk `auth()` |
 | `web-v1/app/api/**`（38 个文件） | `auth()` → `currentUserId()`，机械替换 |
