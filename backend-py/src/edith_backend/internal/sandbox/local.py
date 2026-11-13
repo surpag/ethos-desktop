@@ -185,6 +185,17 @@ def _decode_output(raw: bytes) -> str:
 _VIRTUAL_ROOT_RE = re.compile(r"/home/user(?=[/\s'\"`;|&)]|$)")
 
 
+def _relative_or_none(path: Path, root: Path) -> Path | None:
+    """`path` 在 `root` 之下就返回相对路径，否则 None。
+
+    用 `is_relative_to` 而不是字符串前缀：`/a/bc` 不算在 `/a/b` 之内。
+    """
+    try:
+        return path.relative_to(root)
+    except ValueError:
+        return None
+
+
 def _is_link(path: Path) -> bool:
     """判断是不是目录联接 / 符号链接。
 
@@ -445,29 +456,50 @@ class LocalSandbox:
         return volume
 
     def virtual(self, real: Path) -> str:
-        """真实路径 → 虚拟路径（回给模型的路径必须是 `/home/user/...`）。"""
-        resolved = real.resolve()
+        """真实路径 → 虚拟路径（回给模型的路径必须是 `/home/user/...`）。
 
-        # 工作区权威副本要还原成 `workspace/{id}/…`，否则模型会看到
-        # `D:\...\workspace-volumes\...` 这种它根本无法再次传入的路径。
+        输入分为两类，两类都必须接住：
+
+        1. **沙箱树里的路径**（`files.list` / `get_info` / `rename` 交回来的）。
+           这一类要用**未解析**的路径去比沙箱根：`skills` 与 `workspace` 是联接，
+           `resolve()` 会跳出沙箱。之前的实现只走解析后的路径，于是**联接点本身**
+           落到了死局——`<root>/skills` 解析后正好等于 `data_root/skills`，被
+           `resolved != skills` 排除；`<root>/workspace` 解析后正好等于
+           `workspace-volumes`，同样被排除；最后兜底 `str(real)` 返回一个
+           `C:\\Users\\...` 绝对路径。文件面板把它当节点 path 回传，下一次请求
+           就被顶级目录白名单判成非法（线上表现：`workspace` 节点报
+           「top-level directory must be one of ...」，`skills` 节点同样打不开）。
+
+        2. **权威副本的真实路径**（workspace 存储 / agent_input 直接给的）。
+           要还原成 `workspace/{id}/…` 与 `skills/…`，否则模型拿到一个它无法
+           再次传入的路径，下一条命令必然失败。
+        """
+        raw = Path(real)
+        root = Path(self._root)
+        rel = _relative_or_none(raw, root) or _relative_or_none(raw.resolve(), root.resolve())
+        if rel is not None:
+            posix = rel.as_posix()
+            return WORKSPACE.root if posix in ("", ".") else posixpath.join(WORKSPACE.root, posix)
+
+        resolved = raw.resolve()
+
+        # 工作区权威副本（含 `workspace-volumes` 根本身）。
         volumes = (data_root() / "workspace-volumes").resolve()
-        if resolved != volumes and resolved.is_relative_to(volumes):
+        if resolved == volumes:
+            return posixpath.join(WORKSPACE.root, WORKSPACE.workspace)
+        if resolved.is_relative_to(volumes):
             rel = resolved.relative_to(volumes).as_posix()
             return posixpath.join(WORKSPACE.root, WORKSPACE.workspace, rel)
 
-        # Skill 同理：真实路径在数据目录下，必须还原成 `skills/…`，
-        # 否则模型拿到一个它无法再次传入的绝对路径（下一条命令必然失败）。
+        # Skill 同理（含 `skills` 根本身）。
         skills = (data_root() / SKILLS_PATH).resolve()
-        if resolved != skills and resolved.is_relative_to(skills):
+        if resolved == skills:
+            return posixpath.join(WORKSPACE.root, SKILLS_PATH)
+        if resolved.is_relative_to(skills):
             rel = resolved.relative_to(skills).as_posix()
             return posixpath.join(WORKSPACE.root, SKILLS_PATH, rel)
 
-        base = self._root.resolve()
-        try:
-            rel = resolved.relative_to(base).as_posix()
-        except ValueError:
-            return str(real)
-        return WORKSPACE.root if rel in ("", ".") else posixpath.join(WORKSPACE.root, rel)
+        return str(raw)
 
 
 class LocalFiles:

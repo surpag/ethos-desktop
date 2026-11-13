@@ -205,6 +205,53 @@ def test_symlink_escape_rejected(sandbox: LocalSandbox, tmp_path) -> None:
     asyncio.run(body())
 
 
+def test_list_root_returns_virtual_paths_for_mount_points(sandbox: LocalSandbox) -> None:
+    """根目录列表里 `skills` / `workspace` 必须回虚拟路径，不能是磁盘绝对路径。
+
+    这两个是联接（junction），它们的**联接点本身**是回归点：`resolve()` 会把
+    `<root>/skills` 解析成 `<data_root>/skills`、把 `<root>/workspace` 解析成
+    `workspace-volumes`，旧实现「等于根就跳过」的分支把两者都排除了，兜底返回
+    `C:\\...`。文件面板拿这个 path 当节点 key，再展开时原样回传：
+    `workspace_path()` 第一段不是白名单目录 → 400「top-level directory must be
+    one of ...」，树上的节点就一直显示错误、点不动。
+    """
+
+    async def body() -> None:
+        await sandbox.files.write("/home/user/workspace/ws-1/readme.md", "# hi")
+        root_entries = await sandbox.files.list("/home/user", depth=1)
+        paths = {e.name: e.path for e in root_entries}
+
+        assert paths["skills"] == "/home/user/skills"
+        assert paths["workspace"] == "/home/user/workspace"
+        for name, path in paths.items():
+            assert path.startswith("/home/user/"), f"{name} 泄漏了磁盘路径：{path}"
+
+    asyncio.run(body())
+
+
+def test_virtual_maps_mount_roots_and_authoritative_copies(sandbox: LocalSandbox, tmp_path) -> None:
+    """`virtual()` 两类输入都要正确：沙箱树里的路径、权威副本的真实路径。"""
+
+    async def body() -> None:
+        await sandbox.files.write("/home/user/workspace/ws-1/readme.md", "# hi")
+
+        # 1) 沙箱树（未解析路径）——联接点本身
+        assert sandbox.virtual(sandbox.root / "skills") == "/home/user/skills"
+        assert sandbox.virtual(sandbox.root / "workspace") == "/home/user/workspace"
+        assert sandbox.virtual(sandbox.root / "work" / "a.txt") == "/home/user/work/a.txt"
+
+        # 2) 权威副本的真实路径（workspace 存储 / agent_input 直接给的）
+        volume = tmp_path / "workspace-volumes"
+        assert sandbox.virtual(volume) == "/home/user/workspace"
+        assert sandbox.virtual(volume / "ws-1" / "readme.md") == "/home/user/workspace/ws-1/readme.md"
+        skills = tmp_path / "skills"
+        skills.mkdir(parents=True, exist_ok=True)
+        assert sandbox.virtual(skills) == "/home/user/skills"
+        assert sandbox.virtual(skills / "demo" / "SKILL.md") == "/home/user/skills/demo/SKILL.md"
+
+    asyncio.run(body())
+
+
 def test_workspace_path_maps_to_volume(sandbox: LocalSandbox, tmp_path) -> None:
     """`workspace/{id}` 直接落到权威副本目录：本地模式不需要任何同步。"""
     async def body() -> None:
