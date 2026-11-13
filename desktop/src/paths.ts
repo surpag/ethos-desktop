@@ -35,6 +35,17 @@ export function webStandaloneDir(): string {
 }
 
 /**
+ * 托盘图标。
+ *
+ * 直接复用前端的品牌图标（`web-v1/app/favicon.ico`，多尺寸 ico）：托盘需要
+ * 16×16，任务栏需要 32×32，分开维护两份图早晚会不一致。读不到时调用方
+ * 必须退回「关窗即退出」，否则窗口一关就再没有入口能把它叫回来。
+ */
+export function trayIconPath(): string {
+  return path.join(webDir(), "app", "favicon.ico");
+}
+
+/**
  * Python 解释器。
  *
  * 开发期用 backend-py 自己的 venv；打包后由 extraResources 带一份嵌入式

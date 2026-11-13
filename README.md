@@ -22,15 +22,43 @@ ethos-desktop/
 
 ```
 electron (desktop/dist/main.js)
-  ├─ 单实例锁 ─── 第二个实例直接退出（SQLite 非 WAL，双进程必锁）
+  ├─ 单实例锁 ─── 第二个实例不启动服务，只把已有窗口叫回前台
+  ├─ 回收        上次异常退出遗留的子进程（pid 存活 + 命令行匹配才 kill 进程树）
   ├─ sidecar    python -m uvicorn edith_backend.main:app --port <随机>
   │             ETHOS_DESKTOP=1, ETHOS_DATA_DIR=%APPDATA%\ETHOS
   ├─ web        electron.exe(ELECTRON_RUN_AS_NODE) .next/standalone/server.js
   │             PORT=<随机>, EDITH_RUNTIME_URL=http://127.0.0.1:<backendPort>
-  └─ BrowserWindow.loadURL(http://127.0.0.1:<webPort>)
+  └─ BrowserWindow.loadURL(http://127.0.0.1:<webPort>) + Tray
 ```
 
 端口全部随机分配：不和用户自己跑的 `:8080` 打架。
+
+## 关窗与退出
+
+关闭按钮**不是**退出：事件被拦成 `hide()`，应用留在托盘继续跑。Agent 的长任务
+不该因为误关窗口就被中断。
+
+恢复入口有三个：托盘菜单「打开 ETHOS」、单击托盘图标、再启动一次（第二个实例
+拿不到锁，但它会触发 first-instance 的 `second-instance`，把隐藏的窗口 `show()` 回来）。
+
+真正的退出只有托盘菜单的「退出」，走 `before-quit` → 先停 web 再停 backend。
+
+> 托盘图标读不到时，关窗**退回直接退出**。没有托盘就没有恢复入口，此时隐藏等于
+> 把应用藏丢——这种降级宁可少一个功能，也不能让窗口消失在无法唤回的地方。
+
+### 崩溃与残留
+
+子进程台账 `%APPDATA%\ETHOS\runtime\children.json` 只在运行期存在。**文件还在
+= 上次没走正常退出**（正常路径下两条记录都被 `stop()` 删掉，文件随之消失）。
+
+启动时逐条校验后才动手：pid 存活 **且** 命令行含签名（`edith_backend.main:app` /
+`server.js`）。只认 pid 会误杀——pid 会被系统复用，而用户自己也在跑 Python。
+校验不过就跳过，宁可留一个孤儿报出 `database is locked`（那个错误至少指向真实
+原因），也不盲杀。
+
+运行中后端或 web 挂掉会弹框说明是哪一个停了，然后退出，不原地重启：重启会让
+进行中的 SSE 断开、会话状态丢失，还可能再撞一次库锁。启动期的子进程退出会立刻
+中断就绪等待，不用等满 60 秒超时。
 
 ## 数据位置
 
@@ -41,6 +69,7 @@ electron (desktop/dist/main.js)
 ├── edith-v2.db          会话 / 消息 / 计划 / trace
 ├── skills/              Skill（用户可直接编辑的普通文件）
 ├── workspace-volumes/   工作区文件（未绑定本地目录时落这里）
+├── runtime/             子进程台账（只在运行期存在；文件还在 = 上次异常退出）
 └── sandbox/             每会话的沙箱目录（uploads / work / artifacts + 两个联接）
 ```
 
@@ -108,7 +137,8 @@ LWW、事务、校验）、`migrate.py`（527 行迁移工具）、`overview.md`
 | M1 | 本地沙箱：`sandbox/` 换成本机实现，11 个原语 | 完成 |
 | M2 | Skill 单层化 | 完成 |
 | M2.5 | 删 E2B 后端与工作区同步：`sync.py`、`volume/`、出口白名单 | 完成 |
-| M3 | 桌面化：keychain、托盘、退出清理 | 未开始 |
+| M3 | 桌面化：托盘常驻、关窗不退出、崩溃残留回收 | 完成 |
+| M3.5 | 凭据加密：`api_key` 目前只是混淆，未接 DPAPI | 未开始 |
 | M4 | 分发：隔离、签名、自动更新 | 未开始 |
 
 ## 本地沙箱（M1）
