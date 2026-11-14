@@ -1612,6 +1612,7 @@ async def chat(
                 user_id=user_id,
                 session_id=session_id,
                 request_id=request_id,
+                assistant_id=assistant_id,
                 emit=emit,
             )
             if outcome.meta:

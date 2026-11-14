@@ -133,8 +133,12 @@ run_approvals
 
 | type | 携带 | 消费方行为 |
 | --- | --- | --- |
-| `approval.requested` | `approval`（id / toolCallId / toolName / arguments / capabilities / expiresAt） | 弹确认框；刷新后靠重放恢复 |
+| `approval.requested` | `approval`（id / toolCallId / toolName / arguments / capabilities / expiresAt）+ `assistantId` | 弹确认框；刷新后靠重放恢复 |
 | `approval.resolved` | 同上 + `status` | 关闭确认框；被别的标签页处理时也能同步 |
+
+`assistantId` 不是装饰：卡片要落在**发起它的那条回复**里。只给 `toolCallId`
+也能反查，但那是让消费方替服务端做推理——一条事件说不清自己属于哪里，
+换一个消费方（IM、审计）就得把这个推理再实现一遍。
 
 事件里**不含**决策接口的 URL 或令牌——前端按 `approvalId` 调固定的
 `POST /internal/approvals/{id}`，接口自己按 `userId` 鉴权。
@@ -162,8 +166,6 @@ headless 下 `approval` 档的行为：拒绝（`approval_required` + `approval_
 
 ## 10. 不做 / 已知边界
 
-- **前端 UI**（P3）：本轮只交付事件与接口。没有 UI 时审批档的实际行为是「等到超时」，
-  这是已知的中间态，不是缺陷——`full` / `read_only` 两档不受影响。
 - **跨进程恢复**：多副本部署下 `ApprovalDesk` 在进程内，另一副本上看不到 ticket。
   与 `SessionLanes` / `RunPlanRegistry` 同一类边界，换共享存储时一起换。
 - **审批历史查询**：只落库不开放列表接口。要「谁在什么时候批了什么」时再加。
@@ -223,3 +225,76 @@ run 确实还在进行，只是暂停在一个 `await` 上。加一个状态要�
 
 判断口径还是那条：**`task_status` 回答「该不该续跑」，不回答「现在卡在哪」。**
 后者是诊断信息，`end_reason` / 审批表 / trace 各自负责，不要挤进状态机。
+
+## 14. 前端接入（P2-3）
+
+### 14.1 面板挂在哪
+
+挂在**工具卡片上**，不挂在时间线末尾，也不做全局弹窗：
+
+- 卡片本来就有工具名与完整参数，用户决定的就是「这一次调用」，两者在同一个视口里；
+- 挂在时间线末尾就得再复述一遍「是哪个工具、参数是什么」，还可能同时出现两条；
+- 全局弹窗会被用户当广告划掉，而它是一次真实的写操作。
+
+面板渲染在 `<details>` **外面**：卡片默认收起，放进去等于用户永远看不到有操作在等。
+
+### 14.2 不做乐观更新
+
+点「批准」之后卡片不变绿，只显示「已提交，等待服务端确认…」，等 `approval.resolved`
+回来才换终态。理由与整条流一致：能改变状态的只有服务端事实。
+
+| 响应 | 界面行为 |
+| --- | --- |
+| 200 | 保持禁用，等事件（同一进程内必发；断流会重放） |
+| 409 | 「已在别处处理，正在同步状态…」——不弹错，因为这不是错误 |
+| 404 | 「这条操作已失效（任务已经结束）」——run 已经不在了 |
+| 其它 / 网络失败 | 恢复按钮，提示重试 |
+
+提交过一次就不再允许点：二次提交最坏只是 409，但界面上先后出现两个相反的决定
+（先批后拒）是误导。
+
+### 14.3 重放与定位
+
+`applyStreamEvent` 对审批事件的处理顺序：`assistantId` → 按 `toolCallId` 反查 →
+最后一个助手块；卡片不存在时补建一张（参数取自事件本身）。
+
+补建不是兜底洁癖：重连时服务端从 `after=N` 补发，`tool.started` 可能早于日志窗口
+而被裁掉，此时只剩审批事件——不补建，用户会看到「有个操作在等确认」却没有按钮。
+
+**未知状态一律不可操作**：界面只对 `status === "pending"` 渲染按钮，认不出的状态
+原样保留。猜成 `approved` 会撒谎（看起来批准成功），猜成 `pending` 会让用户点一个
+注定 409 的按钮。
+
+已知边界：断流重连时若事件日志已把 `approval.requested` 裁掉，`alignWithHistory`
+用历史重建时间线后那张面板会缺失。**此时的安全方向是失败**：超时按拒绝处理，run
+继续，模型换策略——不是静默放行，也不是把会话锁死在一个没人能点的按钮上。
+补法是「对齐历史后按 `GET /internal/approvals?sessionId=` 再 reconcile 一次」，
+但触发条件（挂起期间日志被裁）在 10 分钟超时下几乎不存在，先不写这条没有真实
+触发器的链路。
+
+### 14.4 档位开关与 BFF
+
+`web-v1/app/api/settings/route.ts` 的 `parseSaveUserSettingsRequest` 此前只挑已知
+字段，`permissionLevel` 到不了后端（P1 §10 记的缺口）。现在：
+
+- BFF 严格校验三档，非法值整份拒绝（400），**不静默降级**——静默降到只读会让用户
+  以为切到了自己选的档位；
+- 前端在读到设置之前 `permissionLevel` 为 `null`，此时**提交不带这个字段**（后端
+  `COALESCE` 保留原值）。初始值写成 `"full"` 的话，一次读取失败 + 保存就是静默提权；
+- 保存后回填**生效值**（后端已把非法值归一到只读），而不是回填用户刚选的。
+
+### 14.5 前端改动清单
+
+| 文件 | 改动 |
+| --- | --- |
+| `lib/chat/type.ts` | `ToolApproval` / `ApprovalPayload`、两个事件、`ToolBlock.approval` |
+| `lib/chat/stream.ts` | `applyApproval`：定位 → upsert → 未知状态原样保留 |
+| `components/chat/tool-card.tsx` | `ApprovalPanel`：能力标签、参数预览、三个按钮、409/404 文案 |
+| `app/api/approvals/[approvalId]/route.ts` | 新增：`{decision, scope}` + 服务端注入 `userId` |
+| `lib/userconfig/{request,type}.ts` | `permissionLevel` 解析与类型（严格三档） |
+| `components/settings/settings-form.tsx` | 「执行权限」三选一 + 档位说明 |
+| `tests/approval-stream.test.ts` | 6 例：挂起/终态/幂等/补建/定位/未知状态 |
+| `tests/userconfig-request.test.ts` | 6 例：合法/归一/缺省/空串/非法/其余字段 |
+
+前端验收：`cd web-v1 && npm test` → 48 passed；`npx tsc --noEmit` 与
+`npx eslint` 均无输出。

@@ -1,6 +1,6 @@
 ﻿"use client";
 
-import { CheckCircle2, GitBranch, KeyRound, Plus, Save, SlidersHorizontal, Trash2 } from "lucide-react";
+import { CheckCircle2, GitBranch, KeyRound, Plus, Save, ShieldCheck, SlidersHorizontal, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 
 // browserTimezone 是用户浏览器的本地时区，首次设置时作为默认值。
@@ -29,11 +29,38 @@ const commonTimezones = [
 import type { ModelCatalogResponse, ModelInfo, ProviderInfo } from "@/lib/models/type";
 import { formatContextWindow } from "@/lib/models/type";
 import { notifyModelsChanged } from "@/lib/models/events";
-import type { UserSettingsResponse } from "@/lib/userconfig/type";
+import type { UserSettingsResponse, PermissionLevel } from "@/lib/userconfig/type";
 import { CustomModelDialog } from "./custom-model-dialog";
 import { WorkspaceSettings } from "./workspace-settings";
 
 const NEW_PROVIDER = "__new__";
+
+/**
+ * 三个档位的差别必须写清楚，尤其是「完全」那一档的代价：
+ *
+ * - 结构化工具（写文件 / 删除 / git）在任何档位都受敏感路径保护；
+ * - Shell 不受路径保护——`run_command` 拿到的是执行能力，它能 `cat .env`。
+ *
+ * 把这两件事混成一句「完全 = 不设限」会让人以为敏感路径也没了；反过来写成
+ * 「完全也有保护」则是虚假的安全感。两种都是错的，所以分两句说。
+ */
+const PERMISSION_OPTIONS: { value: PermissionLevel; label: string; description: string }[] = [
+  {
+    value: "read_only",
+    label: "只读",
+    description: "可以查看文件与仓库状态；写文件、执行命令、调用外部工具都会被直接拒绝，不会打扰你。",
+  },
+  {
+    value: "approval",
+    label: "每次确认",
+    description: "可用范围与只读相同，但遇到写入或执行时会停下来等你点确认；不理会则按拒绝处理。",
+  },
+  {
+    value: "full",
+    label: "完全",
+    description: "不设限。结构化工具仍受敏感路径保护（.env、密钥、凭据等），但 Shell 不受保护——它能在沙箱里执行任意命令。",
+  },
+];
 
 export function SettingsForm() {
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
@@ -45,6 +72,10 @@ export function SettingsForm() {
   const [timezone, setTimezone] = useState("");
   const [gitAuthorName, setGitAuthorName] = useState("");
   const [gitAuthorEmail, setGitAuthorEmail] = useState("");
+  // null = 还没从服务端读到。**不能初始化成 "full"**：读取失败时表单会带着一个
+  // 猜出来的档位提交，那等于把用户的只读设置静默提权。null 时提交不带这个字段，
+  // 后端 COALESCE 保留库里原值。
+  const [permissionLevel, setPermissionLevel] = useState<PermissionLevel | null>(null);
   const [message, setMessage] = useState("");
   const [gitToken, setGitToken] = useState("");
   const [gitConnected, setGitConnected] = useState(false);
@@ -94,6 +125,10 @@ export function SettingsForm() {
       setTimezone(settings.timezone || browserTimezone());
       setGitAuthorName(settings.gitAuthorName ?? "");
       setGitAuthorEmail(settings.gitAuthorEmail ?? "");
+      // 读成功了就以服务端为准；字段缺失只可能是旧后端，而旧后端的默认档位
+      // 就是 full（`DEFAULT_LEVEL`）。读取**失败**时上面已提前 return，
+      // permissionLevel 保持 null（提交时不带该字段，不会把用户设置冲成 full）。
+      setPermissionLevel(settings.permissionLevel ?? "full");
       setConfigured(Object.fromEntries(
         settings.providers.map((provider) => [provider.providerId, provider.hasApiKey]),
       ));
@@ -154,7 +189,15 @@ export function SettingsForm() {
     const response = await fetch("/api/settings", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ personality, defaultModelId, timezone, gitAuthorName, gitAuthorEmail, providers: providerKeys }),
+      body: JSON.stringify({
+        personality,
+        defaultModelId,
+        timezone,
+        gitAuthorName,
+        gitAuthorEmail,
+        ...(permissionLevel ? { permissionLevel } : {}),
+        providers: providerKeys,
+      }),
     });
     if (!response.ok) {
       setMessage((await response.text()) || "保存设置失败。");
@@ -166,6 +209,9 @@ export function SettingsForm() {
       saved.providers.map((provider) => [provider.providerId, provider.hasApiKey]),
     ));
     setDefaultModelId(saved.defaultModelId);
+    // 回填**生效值**：库里可能是脏数据，后端已归一（非法值 → 只读）。
+    // 用请求里那个值回填，界面会显示一个服务端并不承认的档位。
+    setPermissionLevel(saved.permissionLevel ?? "full");
     setKeys({});
     // Key 落库会改变「可用模型」集合（available-models 按供应商是否有 Key 过滤）
     notifyModelsChanged();
@@ -303,6 +349,42 @@ export function SettingsForm() {
               {gitMessage || "连接后可让 Agent 在工作区内拉取、提交与推送代码。"}
             </p>
           </div>
+        </section>
+
+        <section className="ui-surface overflow-hidden">
+          <header className="flex items-start gap-3 border-b border-border px-5 py-4">
+            <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-accent-soft text-accent"><ShieldCheck className="size-4" /></span>
+            <div><h2 className="text-sm font-semibold text-ink">执行权限</h2><p className="mt-1 text-xs leading-5 text-muted">决定 Agent 能对你的文件与工作区做什么；对聊天、定时任务同时生效。</p></div>
+          </header>
+          <div className="grid gap-2.5 p-4 sm:grid-cols-3">
+            {PERMISSION_OPTIONS.map((option) => {
+              const selected = permissionLevel === option.value;
+              return (
+                <label
+                  className={`cursor-pointer rounded-xl border p-3.5 transition-colors ${selected ? "border-accent bg-accent-soft" : "border-border bg-surface-subtle hover:border-border-strong"}`}
+                  key={option.value}
+                >
+                  <span className="flex items-center gap-2">
+                    <input
+                      checked={selected}
+                      className="size-3.5 accent-current text-accent"
+                      name="permissionLevel"
+                      onChange={() => setPermissionLevel(option.value)}
+                      type="radio"
+                      value={option.value}
+                    />
+                    <span className="text-sm font-medium text-ink">{option.label}</span>
+                  </span>
+                  <span className="mt-1.5 block text-[11px] leading-5 text-muted">{option.description}</span>
+                </label>
+              );
+            })}
+          </div>
+          <p className="border-t border-border px-5 py-3 text-[11px] leading-5 text-muted">
+            {permissionLevel === null
+              ? "正在读取当前档位…"
+              : "敏感路径（.git、.ssh、密钥、凭据等）在任何档位下都不可读写；这是平台的安全约束，与档位无关。"}
+          </p>
         </section>
 
         <section className="ui-surface overflow-hidden">

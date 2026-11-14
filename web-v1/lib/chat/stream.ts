@@ -1,10 +1,12 @@
 import type {
+  ApprovalPayload,
   AssistantBlock,
   ChatStreamEvent,
   CompletionEvidence,
   ErrorBlock,
   RunOutcome,
   Timeline,
+  ToolApproval,
 } from "./type";
 
 // Read ETHOS's SSE frames without exposing transport details to ChatPage.
@@ -162,6 +164,13 @@ export function applyStreamEvent(timeline: Timeline, event: ChatStreamEvent): Ti
     }));
   }
 
+  // 审批：挂起与终态都只是「给已有那张工具卡片补一个状态」。
+  // 卡片必须按 toolCallId 定位——不能按「最后一个块」猜：重放时 tool.started
+  // 与 approval.requested 可能分批到达，猜错就把审批面板挂到了别的调用上。
+  if (event.type === "approval.requested" || event.type === "approval.resolved") {
+    return applyApproval(timeline, event.assistantId, event.approval);
+  }
+
   // 计划不是 Timeline 的一部分：它是会话级状态（一个会话一份），由 ChatPage 单独
   // 持有并按 revision 覆盖。这里显式返回原时间线，避免被当成「漏处理」。
   if (event.type === "plan.updated") {
@@ -174,6 +183,81 @@ export function applyStreamEvent(timeline: Timeline, event: ChatStreamEvent): Ti
   }
 
   return timeline;
+}
+
+/**
+ * 把审批状态写到对应的工具卡片上。
+ *
+ * 定位顺序：事件自带的 assistantId（最可靠，服务端已盖章）→ 按 toolCallId 反查
+ * 已在时间线里的卡片 → 最后一个助手块。**绝不按「猜」新建一张无归属的卡片**：
+ * 卡片自带工具名与参数，落在哪一段对话下面都不影响它说清「在批准什么」，
+ * 但它必须挂在某个助手块里，否则刷新后就成了孤儿。
+ */
+function applyApproval(
+  timeline: Timeline,
+  assistantID: string | undefined,
+  payload: ApprovalPayload,
+): Timeline {
+  const approval = toApproval(payload);
+  const target = assistantID
+    || findAssistantByToolCall(timeline, payload.toolCallId)
+    || lastAssistantID(timeline);
+  if (!target) {
+    return timeline;
+  }
+  return updateAssistant(timeline, target, (assistant) => {
+    const index = assistant.blocks.findIndex((block) => block.id === payload.toolCallId);
+    if (index < 0) {
+      // 重放从审批事件开始（前面的 tool.started 已被裁剪）：补一张卡片，
+      // 否则面板无处可挂，用户看到「有个操作在等确认」却没有按钮。
+      return {
+        ...assistant,
+        blocks: [...assistant.blocks, {
+          type: "tool",
+          id: payload.toolCallId,
+          toolName: payload.toolName,
+          arguments: payload.arguments ?? "",
+          status: "running",
+          approval,
+        }],
+      };
+    }
+    const blocks = [...assistant.blocks];
+    const block = blocks[index];
+    if (block.type !== "tool") {
+      return assistant;
+    }
+    blocks[index] = {
+      ...block,
+      toolName: payload.toolName || block.toolName,
+      approval,
+    };
+    return { ...assistant, blocks };
+  });
+}
+
+function toApproval(payload: ApprovalPayload): ToolApproval {
+  return {
+    approvalId: payload.approvalId,
+    status: payload.status || "pending",
+    capabilities: payload.capabilities ?? [],
+    ...(payload.expiresAt ? { expiresAt: payload.expiresAt } : {}),
+  };
+}
+
+function findAssistantByToolCall(timeline: Timeline, toolCallID: string): string | undefined {
+  for (const block of timeline.blocks) {
+    if (block.type !== "assistant") continue;
+    if (block.blocks.some((content) => content.id === toolCallID)) {
+      return block.id;
+    }
+  }
+  return undefined;
+}
+
+function lastAssistantID(timeline: Timeline): string | undefined {
+  const last = [...timeline.blocks].reverse().find((block) => block.type === "assistant");
+  return last?.id;
 }
 
 export function errorTimelineEvent(message: string): ErrorBlock {

@@ -111,6 +111,9 @@ class ApprovalDesk:
         user_id: str,
         session_id: str,
         request_id: str,
+        # 该事件属于哪一个助手块。审批卡片要落在「发起它的那条回复」里，
+        # 而不是时间线末尾——和其他渲染事件一样由事件自己说明归属。
+        assistant_id: str,
         tool_call_id: str,
         tool_name: str,
         arguments: str,
@@ -148,7 +151,15 @@ class ApprovalDesk:
             ",".join(capabilities) or "-",
             self._timeout,
         )
-        emit(Event(type="approval.requested", request_id=request_id, approval=snapshot))
+        emit(
+            Event(
+                type="approval.requested",
+                request_id=request_id,
+                session_id=session_id,
+                assistant_id=assistant_id,
+                approval=snapshot,
+            )
+        )
         try:
             await asyncio.wait_for(ticket.wake.wait(), self._timeout)
             decision = ticket.decision or ApprovalDecision(
@@ -163,6 +174,8 @@ class ApprovalDesk:
             Event(
                 type="approval.resolved",
                 request_id=request_id,
+                session_id=session_id,
+                assistant_id=assistant_id,
                 approval=snapshot.model_copy(update={"status": decision.status}),
             )
         )
@@ -278,6 +291,7 @@ async def resolve_approval(
     user_id: str,
     session_id: str,
     request_id: str,
+    assistant_id: str,
     emit,
 ) -> ApprovalOutcome:
     """审批档的挂起入口。返回最终裁决与（可能的）拒绝结果。
@@ -305,6 +319,7 @@ async def resolve_approval(
         user_id=user_id,
         session_id=session_id,
         request_id=request_id,
+        assistant_id=assistant_id,
         tool_call_id=tool_call_id,
         tool_name=verdict.tool,
         arguments=arguments,

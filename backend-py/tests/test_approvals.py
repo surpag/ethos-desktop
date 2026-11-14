@@ -177,6 +177,7 @@ def test_desk_waits_then_wakes_on_approve() -> None:
                     user_id="u1",
                     session_id="s1",
                     request_id="r1",
+                    assistant_id="assistant_r1",
                     tool_call_id="call_1",
                     tool_name="sandbox_write_file",
                     arguments='{"path": "a.md"}',
@@ -188,6 +189,9 @@ def test_desk_waits_then_wakes_on_approve() -> None:
             assert events[0].type == "approval.requested"
             assert events[0].approval.tool_name == "sandbox_write_file"
             assert events[0].approval.capabilities == ["WRITE"]
+            # 卡片要落进「发起它的那条回复」：归属由事件自己带，不靠前端猜最后一个块
+            assert events[0].assistant_id == "assistant_r1"
+            assert events[0].session_id == "s1"
 
             assert await desk.decide("u1", rows[0]["approval_id"], approve=True) == "ok"
             decision = await task
@@ -195,6 +199,9 @@ def test_desk_waits_then_wakes_on_approve() -> None:
             assert decision.scope == "once"
             assert events[-1].type == "approval.resolved"
             assert events[-1].approval.status == approval_store.APPROVED
+            # 同一次挂起的两条事件必须共用 approvalId：前端靠它把卡片从「待确认」
+            # 改成终态，而不是新开一张（那会留下一个点了没反应的按钮）。
+            assert events[-1].approval.approval_id == events[0].approval.approval_id
             row = await store.get(rows[0]["approval_id"])
             assert row is not None and row["status"] == approval_store.APPROVED
         finally:
@@ -214,6 +221,7 @@ def test_desk_timeout_expires() -> None:
                 user_id="u1",
                 session_id="s1",
                 request_id="r1",
+                assistant_id="assistant_r1",
                 tool_call_id="call_1",
                 tool_name="sandbox_write_file",
                 arguments="{}",
@@ -242,6 +250,7 @@ def test_desk_second_decision_is_previous() -> None:
                     user_id="u1",
                     session_id="s1",
                     request_id="r1",
+                    assistant_id="assistant_r1",
                     tool_call_id="call_1",
                     tool_name="sandbox_write_file",
                     arguments="{}",
@@ -296,6 +305,7 @@ def test_cancel_run_only_wakes_its_own_tickets() -> None:
                     user_id="u1",
                     session_id="s1",
                     request_id="r1",
+                    assistant_id="assistant_r1",
                     tool_call_id="call_1",
                     tool_name="sandbox_write_file",
                     arguments="{}",
@@ -308,6 +318,7 @@ def test_cancel_run_only_wakes_its_own_tickets() -> None:
                     user_id="u1",
                     session_id="s2",
                     request_id="r2",
+                    assistant_id="assistant_r2",
                     tool_call_id="call_2",
                     tool_name="sandbox_write_file",
                     arguments="{}",
@@ -343,6 +354,7 @@ def _resolve(verdict, **overrides):
         "user_id": "u1",
         "session_id": "s1",
         "request_id": "r1",
+        "assistant_id": "assistant_r1",
         "emit": lambda _e: None,
     }
     params.update(overrides)

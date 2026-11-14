@@ -95,7 +95,32 @@ export type ToolBlock = {
   arguments: string;
   status: "running" | "completed" | "failed";
   result?: string;
+  /** 审批档下这次调用正等着人确认；有它就渲染决策面板。
+   *  undefined = 不需要审批（不是「已批准」） */
+  approval?: ToolApproval;
 };
+
+/**
+ * 一次待批准的调用。终态只有一个来源：`approval.resolved` 事件。
+ *
+ * 前端不做乐观更新——点了「批准」只表示请求发出去了，卡片仍显示「待确认」，
+ * 直到事件回来才变绿。理由和整个流的设计一致：能改变状态的是服务端事实。
+ */
+export type ToolApproval = {
+  approvalId: string;
+  /** 服务端状态原样保留。**只有 "pending" 可操作**；其余（含后端将来新增的值）
+   *  一律按「已结束」展示——认不出的状态绝不允许出现可点的按钮 */
+  status: string;
+  /** 这次调用需要哪些能力（write/exec/external），用来告诉用户「它在请求什么」 */
+  capabilities: string[];
+  /** 过期时间（ISO）。空 = 未知（历史记录不落库这个字段） */
+  expiresAt?: string;
+  /** 本 run 内已放行同类工具（scope=run 时服务端回填） */
+  scope?: string;
+};
+
+/** 已知终态。只用于挑文案，不用于判定「能不能点」——那个只看 pending。 */
+export type ApprovalStatus = "pending" | "approved" | "denied" | "expired" | "canceled";
 
 // Browser → Next BFF. userId must never be supplied by the browser.
 export type ChatRequest = {
@@ -214,6 +239,8 @@ export type ChatStreamEvent = (
   | ContentDeltaEvent
   | ToolStartedEvent
   | ToolFinishedEvent
+  | ApprovalRequestedEvent
+  | ApprovalResolvedEvent
   | PlanUpdatedEvent
   | UsageUpdatedEvent
   | RunLogTruncatedEvent
@@ -291,6 +318,36 @@ export type ToolFinishedEvent = {
   toolCallId: string;
   toolStatus: "completed" | "failed";
   toolResult?: string;
+};
+
+/**
+ * 审批挂起：一次调用停在原地等人。
+ *
+ * 这是**唯一**会让 run 停在半路的正常事件——收到它之后不该按「超时」处理，
+ * 界面要给出可点击的决策面板。`toolCallId` 已由 `tool.started` 建过卡片，
+ * 这里只补审批状态；卡片不在时（重放从中间开始）会先建一张。
+ */
+export type ApprovalRequestedEvent = {
+  type: "approval.requested";
+  assistantId?: string;
+  approval: ApprovalPayload;
+};
+
+/** 审批终态：批准 / 拒绝 / 超时 / 被取消，统一走这一条。 */
+export type ApprovalResolvedEvent = {
+  type: "approval.resolved";
+  assistantId?: string;
+  approval: ApprovalPayload;
+};
+
+export type ApprovalPayload = {
+  approvalId: string;
+  toolCallId: string;
+  toolName: string;
+  arguments?: string;
+  capabilities?: string[];
+  status?: string;
+  expiresAt?: string;
 };
 
 export type GatewayError = {
