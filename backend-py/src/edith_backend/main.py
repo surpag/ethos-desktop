@@ -197,6 +197,8 @@ async def lifespan(app: FastAPI):
             plans=run_plans,
             plan_store=plan_store,
             approval_store=ApprovalStore(db),
+            # 项目级档位的取数端：有工作区的 run 先看项目设置，没有就跟着用户级走
+            workspaces=workspaces,
             tool_definitions=tools.tool_definitions(),
             tool_executor=tools,
             traces=traces,

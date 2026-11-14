@@ -109,6 +109,35 @@ class WorkspaceResponse(BaseModel):
     local_root: str = ""
     # D-a：绑定的 Git 远端仓库地址（空 = 未绑定）；存于 metadata.gitRemoteUrl
     git_remote_url: str = ""
+    # 项目级档位。空 = 未设置（跟用户级走）；非空 = **覆盖**用户级，不是上限。
+    permission_level: str = ""
+
+
+class WorkspaceLevelRequest(BaseModel):
+    """PUT /internal/workspaces/{id}/permission-level 的请求体。
+
+    传三档之一 = 设为项目级；传 `""` = 清除（回到跟随用户级）。非法值 400，
+    不静默降级——用户选了「完全」却存成「只读」，界面显示与行为不一致，
+    他只会以为自己没点对，然后反复点。
+    """
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="forbid",
+    )
+
+    user_id: str = Field(..., min_length=1)
+    permission_level: str = ""
+
+
+class WorkspaceLevelResponse(BaseModel):
+    """写入后的项目级档位（只回这一层的值，生效值由 run 自己解析）。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    workspace_id: str
+    permission_level: str = ""
 
 
 class WorkspaceListResponse(BaseModel):

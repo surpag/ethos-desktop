@@ -13,13 +13,14 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from openai import AsyncOpenAI
 
 from ..agentstream.outcome import derive_outcome
 from ..agentstream.types import APIError, Event, SessionUsage
 from ..models.catalog import DEFAULT_MODEL_ID, Catalog, ModelDefinition
-from ..permissions.chain import resolve_user_level
+from ..permissions.chain import resolve_effective_level
 from ..session.approval_store import ApprovalStore
 from ..session.constraint_store import ConstraintStore, constraints_enabled
 from ..session.plan_store import RunPlanStore
@@ -65,6 +66,16 @@ from .workspace_lanes import WorkspaceLanes
 
 logger = logging.getLogger(__name__)
 
+class WorkspaceLevelSource(Protocol):
+    """项目级档位的取数端（由 `workspace.WorkspaceStore` 实现）。
+
+    只声明这一个方法而不是直接依赖 `WorkspaceStore`：agentrun 不该因为「要知道
+    项目的档位」而拖进整个工作区模块（删文件、绑定本地目录、级联清理都在那里）。
+    """
+
+    async def get_permission_level(self, user_id: str, workspace_id: str) -> str: ...
+
+
 
 @dataclass
 class Dependencies:
@@ -88,6 +99,8 @@ class Dependencies:
     plan_store: RunPlanStore | None = None
     # 审批记录的落库端；为 None 时审批档退化为「不等待、直接拒绝」
     approval_store: ApprovalStore | None = None
+    #: 项目级档位来源；为 None 时只按用户级解析（单测与老装配路径）
+    workspaces: WorkspaceLevelSource | None = None
     tool_definitions: list[dict] = field(default_factory=list)
     tool_executor: object | None = None
     traces: TraceStore | None = None
@@ -143,6 +156,7 @@ class Service:
         self.mcp = deps.mcp
         self.models = deps.models
         self.settings = deps.settings
+        self.workspaces = deps.workspaces
         self.providers = deps.providers
         self.memories = deps.memories
         # trace 落盘器；为 None 时打点全部空转（可作总开关）
@@ -492,21 +506,28 @@ class Service:
             # 断点续跑：只看 task_status + checkpoint（与终止原因解耦，无 end_reason 特例判断）
             await self._inject_resume_context(configured, tracer)
 
-            # 生效档位 = 用户级设置与本次执行上限取最严者
+            # 生效档位 = 项目设置覆盖用户设置，再被本次授权快照压住
             # （见 permissions/policy.py::resolve_chain）。
             #
-            # 只有这两个来源，因为档位只有一个回答者：用户在设置页里允许 Agent
-            # 对他的机器做什么。会话级 / 工作区级上限曾经做过，已回退——它不会让
-            # 系统更安全，只会让用户在每个对话里重新对账一次
-            # （见 docs/archive/permissions-p3-scopes.md）。
+            #   - workspace：项目级设置。有工作区且设了值就用它——同一个用户在
+            #     两处设置，粒度细的那处更接近他此刻的意图；
+            #   - user     ：项目没设（或这次对话没有工作区）时用它；
+            #   - ceiling  ：定时任务创建时的授权快照，**只能压低**。只看当前设置
+            #     会让「改一次全局」等于给所有历史定时任务重新授权；只看快照则让
+            #     用户把档位调低之后，定时任务成了例外——而例外恰恰在没人盯着的
+            #     时候跑。
             #
-            #   - user   ：用户当前设置，改一次就作用于所有会话与定时任务；
-            #   - ceiling：定时任务创建时的授权快照。只看 user 会让「改一次全局
-            #     设置」等于给所有历史定时任务重新授权；只看快照则让用户把档位
-            #     调低之后，定时任务成了例外——而例外恰恰在没人盯着的时候跑。
-            resolution = await resolve_user_level(
+            # workspace_id 为空（普通对话、定时任务）时不读项目级：空值就是空值，
+            # 不猜一个默认工作区出来。
+            resolution = await resolve_effective_level(
                 self.settings.load_permission_level,
                 request.user_id,
+                load_workspace=(
+                    self.workspaces.get_permission_level
+                    if self.workspaces is not None
+                    else None
+                ),
+                workspace_id=request.workspace_id,
                 ceiling=request.permission_level,
             )
             permission_level = resolution.level

@@ -17,6 +17,7 @@ from fastapi import APIRouter, File, Query, UploadFile, status
 
 from ..gitops.ssrf import CloneUrlRejected, assert_safe_clone_url
 from ..http_utils import EDITHError
+from ..permissions.policy import InvalidLevelValue, parse_level_input
 from .memory_store import WorkspaceMemoryStore
 from .store import DuplicateWorkspace, WorkspaceStore
 from .types import (
@@ -27,6 +28,8 @@ from .types import (
     InstructionRequest,
     InstructionResponse,
     WorkspaceCreateRequest,
+    WorkspaceLevelRequest,
+    WorkspaceLevelResponse,
     WorkspaceListResponse,
     WorkspaceMemoryCreateRequest,
     WorkspaceMemoryCreateResponse,
@@ -136,6 +139,7 @@ def build_workspace_router(
                     metadata=row["metadata"],
                     local_root=row["localRoot"],
                     git_remote_url=row["metadata"].get("gitRemoteUrl") or "",
+                    permission_level=row["permissionLevel"],
                 )
                 for row in rows
             ]
@@ -177,6 +181,36 @@ def build_workspace_router(
             metadata=record["metadata"],
             local_root=record.get("localRoot", "") or "",
             git_remote_url=record["metadata"].get("gitRemoteUrl") or "",
+            permission_level=record.get("permissionLevel", "") or "",
+        )
+
+    @router.put(
+        "/internal/workspaces/{workspace_id}/permission-level",
+        response_model=WorkspaceLevelResponse,
+    )
+    async def set_permission_level(workspace_id: str, req: WorkspaceLevelRequest):
+        """设置/清除本项目的档位。
+
+        语义是**覆盖**，不是「上限」：设了就用它，不设才跟用户级走
+        （`permissions/policy.py::resolve_chain`）。定时任务创建时的授权快照仍会
+        压在结果之上——那是「过去允许到这里」的记录，与项目设置无关。
+
+        Agent 没有任何工具能调到这个接口：只读档下 `run_command` 被拒，命令层
+        没有执行能力；能改档位的只有用户点这个按钮。
+        """
+        try:
+            level = parse_level_input(req.permission_level)
+        except InvalidLevelValue as exc:
+            raise EDITHError(
+                400,
+                "invalid_permission_level",
+                "permissionLevel 只能是 read_only / approval / full 或空",
+            ) from exc
+        updated = await store.set_permission_level(req.user_id, workspace_id, level)
+        if not updated:
+            raise EDITHError(404, "not_found", "workspace not found")
+        return WorkspaceLevelResponse(
+            workspace_id=workspace_id, permission_level=level
         )
 
     @router.post(

@@ -21,6 +21,7 @@ _STATEMENTS = [
         local_root   TEXT,
         local_root_prefix TEXT,
         session_id   TEXT,
+        permission_level TEXT NOT NULL DEFAULT '',
         created_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         UNIQUE (user_id, name)
     )""",
@@ -99,6 +100,9 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     # 一个 workspace 只允许一个 session（方案 B 决策 1）
     if "session_id" not in columns:
         await db.execute("ALTER TABLE workspaces ADD COLUMN session_id TEXT")
-    # 工作区级档位已回退：档位是用户级设置，工作区不再持有它。
-    # 老库可能还留着 permission_level 列（与 volume_* 三列同理），代码不读写；
-    # SQLite 允许多出未使用的列，因此不做破坏性的删列迁移。
+    # 项目级档位：空串 = 不设，跟用户级走；非空 = 覆盖用户级。
+    # 上一版删过它，老库里可能已有该列，所以按「缺才加」处理。
+    if "permission_level" not in columns:
+        await db.execute(
+            "ALTER TABLE workspaces ADD COLUMN permission_level TEXT NOT NULL DEFAULT ''"
+        )

@@ -209,16 +209,18 @@ def parse_level_input(raw: object) -> str:
 
 @dataclass(frozen=True)
 class Resolution:
-    """一次 run 的档位解析结果：**生效值 + 它是被谁压下来的**。
+    """一次 run 的档位解析结果：**生效值 + 这一档是谁定的**。
 
-    `binding` 不是装饰：界面上「本次会话选了完全，为什么实际是只读」必须有答案，
-    否则用户只会认为开关坏了，然后去关掉它。
+    `binding` 不是装饰：界面上「我在这个项目里选了完全，为什么实际是只读」必须有
+    答案，否则用户只会认为开关坏了，然后去关掉它。三个取值对应三种不同的解释：
+    `workspace` = 项目自己的设置；`user` = 项目没设、跟着用户级走；
+    `ceiling` = 被定时任务创建时的授权快照压着。
     """
 
     level: PermissionLevel
     #: 参与解析的来源（名称 → 原始值）。含空值，便于判断「未设置」与「设成了空」。
     sources: tuple[tuple[str, str], ...] = ()
-    #: 把档位压到 `level` 的来源名；空 = 没有任何来源在收紧（生效值就是默认值）。
+    #: 决定 `level` 的来源名：`workspace` / `user` / `ceiling`。
     binding: str = ""
     #: 值非法、已被按最严档处理的来源名。
     invalid: tuple[str, ...] = ()
@@ -227,55 +229,72 @@ class Resolution:
     errors: tuple[str, ...] = ()
 
 
-def resolve_chain(*, user: object = "", ceiling: object = "") -> Resolution:
-    """把用户级设置与本次执行上限折成生效档位：**取最严者**。
+def resolve_chain(
+    *, user: object = "", workspace: object = "", ceiling: object = ""
+) -> Resolution:
+    """算出一次 run 的生效档位：**项目覆盖用户，快照只能收紧**。
 
-    两个来源刻意用显式关键字参数而不是 `**sources`：拼错的来源名应当立刻
-    `TypeError`，而不是被静默忽略掉——这条链是每轮 run 都跑的，一个打错的
-    kwarg 静默等于「上限永远不生效」，而它在界面上看不出任何异常。
+    三个来源、**两种关系**，不是一条 min 链。把它们写成一条链是上一版的错误：
 
-    为什么取最严而不是「后者胜」（这条是本节唯一的策略判断）：
+    | 关系 | 谁对谁 | 为什么 |
+    | --- | --- | --- |
+    | 覆盖 | `workspace` 顶替 `user` | 同一个人在两处设置，粒度细的那处更接近他此刻的意图 |
+    | 收紧 | `ceiling` 压住结果 | 授权快照是「过去某一刻允许到这里」，未来不能超过它 |
 
-    - `user` 是用户**此刻**的意图，`ceiling` 是一次**授权记录**（定时任务创建时
-      用户允许它跑到几档）。授权记录不能比当前设置更宽：否则用户把档位调低之后，
-      历史定时任务成了例外——而例外恰恰在没人盯着的时候跑；
-    - 反方向是安全的：用户放宽之后，旧的严格快照仍会压住它，直到用户重新创建
-      任务。这是刻意的不便：自动执行宁可少做，不可多做。
+    为什么项目级能放宽（这里和 OAuth 的直觉相反，值得写清楚）：
 
-    没有第三、第四个来源：档位是「我允许 Agent 对我的机器做什么」，这个问题只有
-    一个回答者（用户设置）。工作区级 / 会话级上限曾经做过，已回退，见
-    `docs/archive/permissions-p3-scopes.md`。
+    - OAuth 的 scope 只能缩，因为子层是**别人的应用**，扩权就是越权；
+    - 这里的子层是**同一个用户**为某个项目做的选择。全局设只读、给某一个项目
+      设完全，表达的是「这个仓库我知道在干什么」，不是第三方在给自己发权限。
+      压成 min 的后果不是"更安全"，而是用户的设置变成摆设：他在项目里选了
+      完全，行为仍是只读，界面上没有任何地方能解释这件事。上一版做成"上限"
+      后就是这个效果，随后整体收回了。
 
-    空值 = 该来源未设置 = 不参与收紧（等价于默认档）。非法值 = 最严档
-    （`parse_level` 的既有约定：改坏一个字段不能提权）。
+    安全边界不靠这一层兜：敏感路径在任何档位下都不可读写
+    （`paths.py::check_path`），审批档每次放行都绑定到具体调用
+    （`agentrun/approval.py`），以及 Agent 没有任何工具能改这两处设置。
+
+    `ceiling` 保留取最严（上表第二行）：`user` / `workspace` 是**此刻**的意图，
+    `ceiling` 是一次**授权记录**（定时任务创建时允许它跑到几档）。授权记录不能
+    比当前设置更宽，否则用户调低档位后，历史定时任务成了例外——而例外恰恰在
+    没人盯着的时候跑。反方向是刻意的不便：用户放宽之后，旧的严格快照仍压着，
+    直到他重新创建任务。自动执行宁可少做，不可多做。
+
+    空值 = 该来源未设置（`workspace` 为空即回落到 `user`）。
+    非法值 = 最严档（`parse_level` 的既有约定：改坏一个字段不能提权）。
     """
+    # 显式关键字参数而不是 `**sources`：拼错的来源名应当立刻 `TypeError`，
+    # 而不是被静默忽略掉——这条链每轮 run 都跑，一个打错的 kwarg 静默等于
+    # 「那一级永远不生效」，而它在界面上看不出任何异常。
     pairs = (
         ("user", user),
+        ("workspace", workspace),
         ("ceiling", ceiling),
     )
-    parsed: list[tuple[str, str, PermissionLevel]] = []
+    texts: dict[str, str] = {}
+    levels: dict[str, PermissionLevel] = {}
     invalid: list[str] = []
     for name, raw in pairs:
         text = str(raw or "").strip()
         source_level, was_invalid = parse_level(text)
         if was_invalid:
             invalid.append(name)
-        parsed.append((name, text, source_level))
+        texts[name] = text
+        levels[name] = source_level
 
-    level = DEFAULT_LEVEL
-    for _, _, source_level in parsed:
-        level = min_level(level, source_level)
+    # 作用域层：项目设置了就用项目，没设置才轮到用户级。**覆盖，不是取最严。**
+    scope = "workspace" if texts["workspace"] else "user"
+    level = levels[scope]
+    binding = scope
 
-    # binding 只在**确实有来源把它压下来**时才有值：全员等于默认档时没有元凶。
-    binding = ""
-    if level != DEFAULT_LEVEL:
-        for name, _, source_level in parsed:
-            if source_level == level:
-                binding = name
-                break
+    # 授权层：只有 ceiling 能把它压得更严。
+    if LEVEL_ORDER.index(levels["ceiling"]) < LEVEL_ORDER.index(level):
+        level = levels["ceiling"]
+        binding = "ceiling"
+
     return Resolution(
         level=level,
-        sources=tuple((name, text) for name, text, _ in parsed),
+        sources=tuple((name, texts[name]) for name, _ in pairs),
         binding=binding,
         invalid=tuple(invalid),
     )

@@ -333,9 +333,10 @@ effective = min(current_user_level, job.permission_level_snapshot)   # 序：rea
 
 - 审批挂起 / 恢复（`approval_required` 只是拒绝理由）。**已在 P2-2 完成**，见
   `permissions-p2-approval.md`；
-- 会话级、工作区级档位。**做过又回退了**（2026-11-14）：档位的控制点只有用户级
-  设置（`user_agents.permission_level`），会话与工作区不再持有档位。当时的方案与
-  回退理由见 `archive/permissions-p3-scopes.md`；
+- 项目级档位。**已在 P4 完成**（2026-11-14）：工作区设置里有「跟随用户设置 / 只读 /
+  每次确认 / 完全」四选一，项目级**覆盖**用户级（不是上限），定时任务快照仍只能收紧；
+  见 `permissions-p4-project.md`。会话级不做——会话是临时容器，档位跟着项目走才是
+  稳定边界；
 - 前端档位 UI。**已在 P2-3 完成**：BFF 的 `parseSaveUserSettingsRequest` 已放行
   `permissionLevel`（严格三档，非法整份拒绝），设置页有「执行权限」三选一；
   聊天页顶部与会话内的工作区、会话级切换入口随 P3 一起删除，

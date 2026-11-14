@@ -118,7 +118,7 @@ class WorkspaceStore:
     async def list(self, user_id: str) -> list[dict]:
         """列出用户全部工作区（按创建时间），metadata 解析为 dict。"""
         async with self._db.execute(
-            "SELECT workspace_id, name, metadata, local_root "
+            "SELECT workspace_id, name, metadata, local_root, permission_level "
             "FROM workspaces "
             "WHERE user_id = ? ORDER BY created_at, workspace_id",
             (user_id,),
@@ -130,6 +130,7 @@ class WorkspaceStore:
                     "name": r[1],
                     "metadata": self._parse_metadata(r[2]),
                     "localRoot": r[3] or "",
+                    "permissionLevel": r[4] or "",
                 }
                 for r in rows
             ]
@@ -150,7 +151,7 @@ class WorkspaceStore:
     async def get(self, user_id: str, workspace_id: str) -> dict | None:
         """查询单个工作区（用于聊天页 workspaceId → 名称映射）。"""
         async with self._db.execute(
-            "SELECT workspace_id, name, metadata, local_root, session_id "
+            "SELECT workspace_id, name, metadata, local_root, session_id, permission_level "
             "FROM workspaces "
             "WHERE user_id = ? AND workspace_id = ?",
             (user_id, workspace_id),
@@ -164,7 +165,39 @@ class WorkspaceStore:
             "metadata": self._parse_metadata(row[2]),
             "localRoot": row[3] or "",
             "sessionId": row[4] or "",
+            "permissionLevel": row[5] or "",
         }
+
+    # ---- 项目级档位 ----
+
+    async def get_permission_level(self, user_id: str, workspace_id: str) -> str:
+        """返回该项目的档位；空串 = 未设置（跟用户级走）。
+
+        工作区不存在时也返回空串、不抛错：删掉一个项目不该把它变成一个永久的
+        只读陷阱。真正的读失败（DB 异常）照常抛出去，由 `permissions/chain.py`
+        降级成只读——「读不到」与「没设置」必须分开，前者不能当后者处理。
+        """
+        async with self._db.execute(
+            "SELECT permission_level FROM workspaces "
+            "WHERE user_id = ? AND workspace_id = ?",
+            (user_id, workspace_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return (row[0] or "") if row else ""
+
+    async def set_permission_level(
+        self, user_id: str, workspace_id: str, level: str
+    ) -> bool:
+        """写入项目级档位；`level` 为空串 = 清除（回到跟随用户级）。返回是否命中。"""
+        cursor = await self._db.execute(
+            "UPDATE workspaces SET permission_level = ? "
+            "WHERE user_id = ? AND workspace_id = ?",
+            (level, user_id, workspace_id),
+        )
+        affected = cursor.rowcount or 0
+        await cursor.close()
+        await self._db.commit()
+        return affected > 0
 
     # ---- 删除（级联 + 存储清理回调） ----
 
