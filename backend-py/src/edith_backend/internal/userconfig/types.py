@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -21,6 +22,9 @@ class AgentSettings:
     # git 提交身份；留空则回退平台默认（EDITH_GIT_AUTHOR_NAME/EMAIL）
     git_author_name: str = ""
     git_author_email: str = ""
+    #: 执行档位：read_only / approval / full。空 = 未配置（按默认档位处理）。
+    #: 这里只做存储，解析与降级在 `permissions.policy.parse_level`（非法值降为只读）。
+    permission_level: str = ""
 
 
 @dataclass
@@ -59,6 +63,9 @@ class SettingsRequest(BaseModel):
     timezone: str = ""
     git_author_name: str = ""
     git_author_email: str = ""
+    #: 执行档位。留空 = 不改（不是「重置为默认」）——前端还没做这个开关，
+    #: 它保存其它设置时不该顺手把用户调过的档位冲掉。
+    permission_level: Literal["", "read_only", "approval", "full"] = ""
     providers: list[ProviderCredentialInput] = Field(default_factory=list)
 
 
@@ -81,6 +88,8 @@ class SettingsResponse(BaseModel):
     timezone: str
     git_author_name: str = ""
     git_author_email: str = ""
+    #: 当前生效档位（读接口总是给出实际值，不会是空串）
+    permission_level: str = "full"
     providers: list[ProviderCredentialState]
 
 

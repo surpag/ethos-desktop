@@ -44,6 +44,8 @@ class Job:
     # 连续失败次数：一次失败可能只是网络抖动，连续 N 次才是「这个任务已经坏了」。
     # 成功一次即清零，所以它是一个「当前是否健康」的指标，不是累计统计。
     consecutive_failures: int = 0
+    #: 创建时的权限档位快照。执行时与「用户当前档位」取更严者，不继承创建上下文。
+    permission_level: str = ""
 
 
 @dataclass
@@ -88,6 +90,8 @@ class JobResponse(BaseModel):
     last_error: str | None = None
     last_error_at: str | None = None
     consecutive_failures: int = 0
+    #: 这条任务被授权到哪一档（快照）。空 = 历史行，执行时按当前档位处理。
+    permission_level: str = ""
 
 
 class ListResponse(BaseModel):

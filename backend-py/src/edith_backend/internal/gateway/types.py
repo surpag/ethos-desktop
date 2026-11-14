@@ -28,6 +28,8 @@ class IncomingMessage:
     model_id: str = ""
     reasoning_option_id: str = ""
     workspace_id: str = ""
+    #: 本次执行的档位上限（定时任务的权限快照）。空 = 只看用户当前设置。
+    permission_level: str = ""
 
 
 def to_agentrun_request(msg: IncomingMessage, user_id: str, session_id: str) -> Request:
@@ -42,4 +44,5 @@ def to_agentrun_request(msg: IncomingMessage, user_id: str, session_id: str) -> 
         model_id=msg.model_id,
         reasoning_option_id=msg.reasoning_option_id,
         workspace_id=msg.workspace_id,
+        permission_level=msg.permission_level,
     )

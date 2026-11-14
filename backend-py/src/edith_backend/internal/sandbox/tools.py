@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import posixpath
 import shlex
 from collections.abc import Awaitable, Callable
@@ -18,10 +19,12 @@ from ..gitops import (
     resolve_git_identity,
     run_git,
 )
+from ..permissions.paths import check_path
+from ..permissions.types import PERMISSION_DENIED
 from ..skills.budget import charge_skill_load
 from ..skills.types import SKILL_FILE, SKILLS_PATH
 from ..tools import COMMAND_ERROR, TOOL_FAILURE, command_stderr_hint, tool_error_result
-from .local import LocalSandbox
+from .local import LocalSandbox, SandboxPathError
 from .service import Service
 from .types import FileType
 from .workspace import ALLOWED_BASE_DIRS, WORKSPACE, relative_path, workspace_path
@@ -154,29 +157,77 @@ def _scope_violation(name: str, args: dict, workspace_id: str) -> str:
 
 # 敏感路径段：Agent 不应读写/删除。.git 是 git 能力根基（删了 git 工具就废），
 # .env / SSH 私钥 / 凭据文件是真实密钥——任何文件类工具都不该碰。
-_SENSITIVE_SEGMENTS = {
-    ".git", ".hg", ".svn",                                    # 版本库元数据
-    "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",             # SSH 私钥（.pub 公钥放行）
-    "credentials", "credentials.json", "auth.json",           # 凭据文件
-    ".netrc", "netrc",
-}
-
-
+#
+# 规则本体在 `permissions/paths.py`（那里是唯一权威源，包含 Windows/Unix 分隔符、
+# 大小写、`..` 穿越与符号链接的处理）。这里只负责「哪些参数是路径」这一层认知。
 def _sensitive_path_violation(name: str, args: dict) -> str:
-    """检查文件工具的目标路径是否命中敏感段（.git / .env / 私钥 / 凭据）。
+    """检查文件类工具的**逻辑**路径是否命中敏感段。
 
-    返回命中的敏感段说明（供模型自救），未命中返回空串。
+    返回命中的敏感描述（供模型自救），未命中返回空串。这是第一遍：
+    第二遍（宿主真实路径）见 `_sensitive_real_violation`。
     """
     for key in _PATH_FIELDS.get(name, ()):
         value = args.get(key)
         if not value:
             continue
-        for part in str(value).replace("\\", "/").split("/"):
-            if not part:
-                continue
-            low = part.lower()
-            if low in _SENSITIVE_SEGMENTS or low == ".env" or low.startswith(".env."):
-                return part
+        hit = check_path(value)
+        if hit:
+            return hit
+    return ""
+
+
+def _sensitive_real_violation(
+    sandbox: LocalSandbox, name: str, args: dict, workspace_id: str
+) -> str:
+    """第二遍：把逻辑路径解析成宿主真实路径再判一次（堵符号链接绕过）。
+
+    逻辑路径可以完全干净，落点却是 `C:\\Users\\me\\.ssh\\id_rsa`：
+    `sandbox_run_command ln -s ~/.ssh work/k` 在 `full` 档是允许的，之后
+    `sandbox_read_file work/k/config` 看上去毫无问题。只有看真实路径才拦得住。
+
+    解析失败一律拒绝：「说不清它指向哪」不能当成「没问题」。
+    """
+    for key in _PATH_FIELDS.get(name, ()):
+        value = args.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            virtual = workspace_path(
+                value, allow_root=True, current_workspace_id=workspace_id
+            )
+            real = os.path.realpath(sandbox.resolve(virtual))
+        except SandboxPathError:
+            # 解析到沙箱根之外 = 落点不可控。可能与符号链接无关（路径本身越界），
+            # 但两种情况下我们都不能说「它没问题」——按不可判定拒绝。
+            return "路径解析后越出沙箱根（疑似符号链接指向外部）"
+        except (PermissionError, ValueError):
+            # 越权 / 格式问题由授权层与各 _op_* 报，不在这里抢错误语义
+            continue
+        except Exception:  # noqa: BLE001 - 无法解析真实落点 = 无法判定
+            return "路径无法解析为真实位置"
+        hit = check_path(real)
+        if hit:
+            return hit
+    return ""
+
+
+def _sensitive_git_violation(arguments: dict) -> str:
+    """`git add` 的显式路径也要过敏感检查。
+
+    为什么单独处理：`git add .env && git commit && git_push` 是一条完整的
+    密钥外送链路——文件内容会被写进提交并推到远端，而这条链路上每一步都是
+    「合法工具 + 合法参数」。`add` 是 git 白名单里唯一接收路径参数的子命令
+    （`clone` 收的是 URL），所以只需覆盖它。
+    """
+    if str(arguments.get("subcommand") or "").strip() != "add":
+        return ""
+    raw_args = arguments.get("args")
+    if not isinstance(raw_args, list):
+        return ""
+    for arg in raw_args:
+        hit = check_path(str(arg))
+        if hit:
+            return hit
     return ""
 
 
@@ -417,37 +468,46 @@ class SandboxToolSet:
                 ensure_ascii=False,
             )
         try:
-            if name in _FILE_TOOLS and workspace_id:
-                arguments = self._complete_arguments(name, arguments, workspace_id)
-                # D1 授权校验：一个 session 只能访问自己的工作区
-                violation = _scope_violation(name, arguments, workspace_id)
-                if violation:
-                    logger.warning(
-                        "cross-workspace access blocked tool=%s user=%s session=%s workspace=%s: %s",
-                        name,
-                        user_id,
-                        session_id,
-                        workspace_id,
-                        violation,
-                    )
-                    return json.dumps(
-                        {
-                            "error": f"路径越权：{violation}",
-                            "kind": COMMAND_ERROR,
-                            "retryable": True,
-                            "suggestion": (
-                                "只能访问当前工作区内的文件。工作区内相对路径"
-                                "（如 docs/report.md）会自动补全到当前工作区；"
-                                "平台 Skill 用 skills/<目录>/SKILL.md。"
-                                "若本条报的是「without a workspace context」，"
-                                "说明本次会话没有绑定工作区，"
-                                "或让用户先在顶部选择一个工作区。"
-                            ),
-                        },
-                        ensure_ascii=False,
-                    )
-                # P2-6 敏感路径：.git/.env/私钥/凭据文件一律拒绝（与授权校验正交）
+            if name in _FILE_TOOLS:
+                if workspace_id:
+                    arguments = self._complete_arguments(name, arguments, workspace_id)
+                    # D1 授权校验：一个 session 只能访问自己的工作区
+                    violation = _scope_violation(name, arguments, workspace_id)
+                    if violation:
+                        logger.warning(
+                            "cross-workspace access blocked tool=%s user=%s session=%s workspace=%s: %s",
+                            name,
+                            user_id,
+                            session_id,
+                            workspace_id,
+                            violation,
+                        )
+                        return json.dumps(
+                            {
+                                "error": f"路径越权：{violation}",
+                                "kind": COMMAND_ERROR,
+                                "retryable": True,
+                                "suggestion": (
+                                    "只能访问当前工作区内的文件。工作区内相对路径"
+                                    "（如 docs/report.md）会自动补全到当前工作区；"
+                                    "平台 Skill 用 skills/<目录>/SKILL.md。"
+                                    "若本条报的是「without a workspace context」，"
+                                    "说明本次会话没有绑定工作区，"
+                                    "或让用户先在顶部选择一个工作区。"
+                                ),
+                            },
+                            ensure_ascii=False,
+                        )
+                # P2-6 敏感路径：.git/.env/私钥/凭据文件一律拒绝（与授权校验正交）。
+                # **不再挂在 `and workspace_id` 上**：那个条件让「没有绑定工作区的
+                # 会话」完全跳过这层检查，于是 `work/.env` 可写（实测）。安全约束的
+                # 覆盖面不能取决于会话有没有选工作区。
                 sensitive = _sensitive_path_violation(name, arguments)
+                if not sensitive:
+                    # 第二遍看真实落点（符号链接 / junction）
+                    sensitive = _sensitive_real_violation(
+                        sandbox, name, arguments, workspace_id
+                    )
                 if sensitive:
                     logger.warning(
                         "sensitive path blocked tool=%s user=%s session=%s workspace=%s: %r",
@@ -459,12 +519,40 @@ class SandboxToolSet:
                     )
                     return json.dumps(
                         {
-                            "error": f"敏感路径不可访问：{sensitive!r}",
-                            "kind": COMMAND_ERROR,
-                            "retryable": True,
+                            "error": f"敏感路径不可访问：{sensitive}",
+                            # 硬约束：换个工具名也成功不了，所以是确定性拒绝。
+                            # 用 command_error 的话，模型会按「换个路径再试」处理，
+                            # 而这条路径永远试不过——三次无效重试还会污染证据分级。
+                            "kind": PERMISSION_DENIED,
+                            "retryable": False,
+                            "reason": "sensitive_path",
                             "suggestion": (
-                                f"路径含敏感段 {sensitive!r}（版本库元数据 / 密钥文件），"
-                                "Agent 不允许读写或删除。请改操作其他文件。"
+                                f"路径命中敏感段 {sensitive!r}"
+                                "（版本库元数据 / 密钥 / 凭据），任何档位下都不允许"
+                                "读写或删除。这是平台的安全约束，重试同一个路径无效；"
+                                "请改操作其他文件。"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+            elif name == "git":
+                sensitive = _sensitive_git_violation(arguments)
+                if sensitive:
+                    logger.warning(
+                        "sensitive git path blocked user=%s session=%s: %r",
+                        user_id,
+                        session_id,
+                        sensitive,
+                    )
+                    return json.dumps(
+                        {
+                            "error": f"敏感路径不可加入版本库：{sensitive}",
+                            "kind": PERMISSION_DENIED,
+                            "retryable": False,
+                            "reason": "sensitive_path",
+                            "suggestion": (
+                                "该路径属于版本库元数据、密钥或凭据，不允许提交。"
+                                "若要提交代码，请只 add 源码与文档路径。"
                             ),
                         },
                         ensure_ascii=False,

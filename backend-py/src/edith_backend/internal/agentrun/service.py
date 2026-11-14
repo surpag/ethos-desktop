@@ -19,6 +19,7 @@ from openai import AsyncOpenAI
 from ..agentstream.outcome import derive_outcome
 from ..agentstream.types import APIError, Event, SessionUsage
 from ..models.catalog import DEFAULT_MODEL_ID, Catalog, ModelDefinition
+from ..permissions.policy import resolve_level
 from ..session.constraint_store import ConstraintStore, constraints_enabled
 from ..session.plan_store import RunPlanStore
 from ..session.store import SessionStore, WorkspaceSessionConflict
@@ -458,6 +459,21 @@ class Service:
             # 断点续跑：只看 task_status + checkpoint（与终止原因解耦，无 end_reason 特例判断）
             await self._inject_resume_context(configured, tracer)
 
+            # 生效档位：用户当前设置 ∩ 本次执行的额外上限（定时任务快照）。
+            # 两个来源都不够：
+            #   - 只看当前设置 → 改一次全局设置等于给所有历史定时任务重新授权；
+            #   - 只看快照     → 用户把档位调低之后，定时任务成了例外。
+            current_level = await self.settings.load_permission_level(request.user_id)
+            permission_level = resolve_level(current_level, request.permission_level)
+            if str(request.permission_level or "").strip():
+                logger.info(
+                    "permission_ceiling request_id=%s current=%s ceiling=%s effective=%s",
+                    request.request_id,
+                    current_level,
+                    request.permission_level,
+                    permission_level,
+                )
+
             # 运行中的进度落库：让「刷新页面」看到的是已发生的执行过程，
             # 而不是只有用户那一句。终态写入会覆盖它（同一条行、同一个 request_id）。
             progress = ProgressRecorder(
@@ -487,6 +503,7 @@ class Service:
                 tracer=tracer,
                 plans=self.plans,
                 progress=progress,
+                permission_level=permission_level,
             )
             # 任务状态：仅"模型主动完成"写 completed 并清进度；
             # rounds_exhausted 等未完成终止保持 in_progress（供下次续跑）

@@ -20,9 +20,20 @@ from openai.types.completion_usage import CompletionUsage
 from ..agentstream.decoder import StreamDecoder
 from ..agentstream.types import Event
 from ..models.catalog import ModelDefinition
+from ..permissions import catalog as permissions_catalog
+from ..permissions.context import bind_level
+from ..permissions.policy import Verdict, evaluate_call
+from ..permissions.types import (
+    TOOL_FAILURE,
+    Capability,
+    PermissionLevel,
+    kind_counts_toward_breaker,
+    kind_status,
+    result_kind,
+)
 from ..session.store import SessionStore
 from ..skills.budget import bind_skill_load_budget, new_skill_load_budget
-from ..tools import TOOL_FAILURE, tool_error_result
+from ..tools import tool_error_result
 from ..trace import (
     DEGRADE_SUMMARY,
     LLM_CALL,
@@ -91,15 +102,48 @@ class ToolCircuitBreakerError(Exception):
         )
 
 
-def _parse_result_retryable(result: str) -> bool | None:
-    """从工具结果解析 retryable：False=系统故障（参与熔断），True=业务错误（可自救），None=无该字段（视为成功）。"""
+def _parse_result_kind(result: str) -> str | None:
+    """从工具结果解析 `kind`（工具结果分类的唯一来源，见 permissions.types）。
+
+    没有 `kind` 的（MCP 原文、纯文本）返回 None：既不算系统故障也不算业务错误，
+    与历史行为一致——第三方工具没义务按我们的错误契约返回。
+    """
+    return result_kind(result)
+
+
+def _parse_arguments(raw: str) -> tuple[dict, bool]:
+    """解析模型给出的 arguments；返回 (参数, 是否非法)。
+
+    解析失败**不再退化成 `{}` 继续执行**：空参数会让工具在没有目标的情况下照常
+    跑（`read_file` 无 path → KeyError；`write_file` 无 path → 落到工作区根），
+    既掩盖了「模型把 JSON 写坏了」这个事实，也可能把一次格式错误放大成一次破坏。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return {}, False
     try:
-        data = json.loads(result)
-    except (json.JSONDecodeError, TypeError):
-        return None
-    if isinstance(data, dict) and "retryable" in data:
-        return bool(data["retryable"])
-    return None
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return {}, True
+    if not isinstance(parsed, dict):
+        return {}, True
+    return parsed, False
+
+
+def _permission_metadata(verdict: Verdict) -> dict:
+    """裁决结果进 trace：出事时能回答「当时是什么档位、拦在哪一步」。"""
+    return {
+        "level": str(verdict.level),
+        "allowed": verdict.allowed,
+        "reason": verdict.reason,
+        "needed": ",".join(sorted(str(cap) for cap in verdict.needed)) or "-",
+    }
+
+
+def _tc_readonly(tc: dict) -> bool:
+    """一次工具调用是否纯只读（并发调度用；参数会影响结论，例如 `git status`）。"""
+    arguments, _ = _parse_arguments(tc.get("arguments", ""))
+    return _is_readonly_tool(tc["name"], arguments)
 
 
 def _digest(value: str, limit: int = 200) -> str:
@@ -132,13 +176,55 @@ def _read_progress(tool_name: str, result: str) -> str:
     )
 
 
-# 只读工具：一轮中若全部是只读工具，可并发执行；含任一写工具则整批串行（对齐 Pi 的调度策略）。
-_READ_ONLY_TOOLS = frozenset({"sandbox_read_file", "sandbox_list_files"})
+# 只读判定来自**能力声明**（permissions/catalog.py），不再维护第四份手工清单。
+# 上一版 `_READ_ONLY_TOOLS` 已经漏了两个工具（git_remote_branches、
+# sandbox_list_processes），漏登记的直接后果是：两个纯查询被当成「产生过变更」，
+# 完成证据虚高一级；同时它们不再享受并发与结果缓存。
+def _is_readonly_tool(
+    name: str, arguments: dict | None = None, *, is_mcp: bool = False
+) -> bool:
+    """判断工具是否纯只读（未声明能力的工具一律按「可能写」处理）。"""
+    return permissions_catalog.is_readonly(name, arguments, is_mcp=is_mcp)
 
 
-def _is_readonly_tool(name: str) -> bool:
-    """判断工具是否只读（MCP 工具未知，保守视为非只读）。"""
-    return name in _READ_ONLY_TOOLS
+# 工具调用记录的分类（证据分级用）
+_CLASS_MCP_UNKNOWN = "external"
+_CLASS_MUTATING = "mutating"
+_CLASS_METADATA = "metadata"
+_CLASS_READ = "read"
+
+
+def _record_arguments(record: dict[str, str]) -> dict | None:
+    """从调用记录里取参数（记录里存的是模型给出的 JSON 字符串）。"""
+    raw = record.get("arguments")
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _record_class(record: dict[str, str]) -> str:
+    """按能力声明给一次调用分类。
+
+    为什么按声明而不是按名字：名字（"__" 前缀、工具名清单）是两套手工约定，
+    而能力声明本来就是「这个工具能做什么」的答案，换个问法不该换个答案。
+    """
+    capabilities = permissions_catalog.capabilities_of(
+        record.get("name", ""), _record_arguments(record)
+    )
+    if capabilities is None:
+        # 未声明的名字（含 MCP：运行时才有）：能力未知，按外部处理。
+        return _CLASS_MCP_UNKNOWN
+    if capabilities <= {Capability.METADATA}:
+        return _CLASS_METADATA
+    if capabilities & {Capability.WRITE, Capability.EXEC}:
+        return _CLASS_MUTATING
+    if Capability.EXTERNAL in capabilities:
+        return _CLASS_MCP_UNKNOWN
+    return _CLASS_READ
 
 
 # ── 完成证据 ───────────────────────────────────────────────────────────
@@ -151,14 +237,15 @@ EVIDENCE_METADATA = "metadata_only"
 EVIDENCE_EXTERNAL = "external"
 EVIDENCE_MUTATED = "mutated"
 
-# 元工具：只写**我们自己的元数据**（计划、后续可能有的记忆/会话设置），
-# 不碰用户的工作区、仓库或任何外部系统。
+# 元工具（只写**我们自己的元数据**：计划、后续可能有的记忆/会话设置）不碰用户的
+# 工作区、仓库或任何外部系统。
 #
 # 为什么必须单列：它们以前和其它内置写工具一样被算成 `mutated`，于是模型只要
 # 更新一次计划，哪怕这一轮只是在回答问题，UI 也会打上「已产生变更」最高等级。
 # 最高证据等级一旦人人都能拿到，它就不再是证据——这是「证据贬值」而不是
 # 「小误差」。
-_META_TOOLS = frozenset({"plan_update"})
+#
+# 现在这个区分由能力声明给出（`{METADATA}`），不再单独维护集合：见 `_record_class`。
 
 
 def completion_evidence(
@@ -166,7 +253,7 @@ def completion_evidence(
 ) -> tuple[str, int, int, int]:
     """从工具调用记录推出 (证据等级, 成功数, 内置写类数, 外部数)。
 
-    MCP 工具（名字形如 `<toolset>__<tool>`）能力未知：既不能声称它改了东西，
+    未声明能力的工具（MCP：名字形如 `<toolset>__<tool>`）既不能声称它改了东西，
     也不能排除。单列一类 `external` 比硬塞进「有写入」或「无证据」都更诚实。
 
     等级强弱：mutated > external > metadata_only > read_only > none。
@@ -174,17 +261,12 @@ def completion_evidence(
     但对用户可见的世界没有任何影响，所以既不能算「有产出」也不能算「没动过」。
     """
     completed = [r for r in tool_call_records if r.get("status") == "completed"]
-    builtin_mutating = [
-        r
-        for r in completed
-        if "__" not in r.get("name", "")
-        and not _is_readonly_tool(r.get("name", ""))
-        and r.get("name", "") not in _META_TOOLS
-    ]
-    external = [r for r in completed if "__" in r.get("name", "")]
-    metadata = [r for r in completed if r.get("name", "") in _META_TOOLS]
+    classes = [(r, _record_class(r)) for r in completed]
+    mutating = [r for r, cls in classes if cls == _CLASS_MUTATING]
+    external = [r for r, cls in classes if cls == _CLASS_MCP_UNKNOWN]
+    metadata = [r for r, cls in classes if cls == _CLASS_METADATA]
 
-    if builtin_mutating:
+    if mutating:
         level = EVIDENCE_MUTATED
     elif external:
         level = EVIDENCE_EXTERNAL
@@ -194,7 +276,7 @@ def completion_evidence(
         level = EVIDENCE_READ_ONLY
     else:
         level = EVIDENCE_NONE
-    return level, len(completed), len(builtin_mutating), len(external)
+    return level, len(completed), len(mutating), len(external)
 
 
 async def _record_completion_evidence(
@@ -1063,10 +1145,15 @@ async def chat(
     tracer: Tracer | None = None,
     plans: RunPlanRegistry | None = None,
     progress: ProgressRecorder | None = None,
+    *,
+    permission_level: PermissionLevel,
 ) -> tuple[Tokens, str, int, str, int, str]:
     """执行一次流式对话（含工具调用循环）。
 
     返回 (累计用量, 实际使用的模型 ID, 工具调用次数, 终止原因, 本轮耗时 ms, 完成证据等级)。
+
+    `permission_level`：本次 run 的**生效档位**，由 service 层解析后显式传入。
+    刻意不给默认值——漏传时必须立刻报错，而不是安静地按某个默认档位跑完整个任务。
 
     第一轮模型调用沿「当前模型 → 回退候选」尝试：openai SDK 的 max_retries=2
     已对网络/5xx/超时等可重试错误做指数退避重试，重试后仍失败才回退到下一个
@@ -1088,6 +1175,9 @@ async def chat(
     # task 消失，不需要 TTL 或清理钩子。**每次 run 都新建**，所以覆盖写入即幂等。
     skill_budget = new_skill_load_budget()
     bind_skill_load_budget(skill_budget)
+    # 档位上下文与 Skill 预算同生命周期：作用域 = 本 run 的 task，随 task 消失。
+    # 它的唯一消费者是「创建定时任务时记录权限快照」——裁决本身走显式参数。
+    bind_level(permission_level)
     end_reason = "completed"  # 终止原因（仅诊断；恢复依据是 task_status，与它解耦）
     if tracer is None:
         tracer = new_tracer(
@@ -1494,12 +1584,16 @@ async def chat(
         ]
         messages.append(assistant_msg)
 
-        async def _run_one(tc: dict) -> tuple[str, Materialized, float]:
-            """执行单个工具，返回 (原始结果, 定型结果, 耗时 ms)。
+        async def _run_one(tc: dict) -> tuple[str, Materialized, float, bool]:
+            """执行单个工具，返回 (原始结果, 定型结果, 耗时 ms, 是否只读)。
 
             定型在这里做而不是在后处理循环里：它是「结果诞生」的同一步，
             也只有在 tool step 作用域内才能把定型指标挂到对应调用上。
             原始结果与定型结果是两个消费者：前端/审计拿原始，模型历史拿定型。
+
+            权限裁决也在这里，而且**早于**缓存命中与分发：缓存命中不是「没执行」，
+            它是「用上一次的结果当成这一次的结果」，对只读工具无害，但它绝不能
+            成为绕过裁决的旁路（改成可缓存一个写工具，就绕过了）。
             """
             t0 = time.monotonic()
             name = tc["name"]
@@ -1511,9 +1605,46 @@ async def chat(
                 input=tc.get("arguments", ""),
                 metadata={"source": source},
             ) as tool_step:
+                arguments, arguments_invalid = _parse_arguments(tc.get("arguments", ""))
+                verdict = evaluate_call(
+                    permission_level,
+                    name,
+                    arguments,
+                    is_mcp=is_mcp,
+                    # 注册表里有没有这个名字：区分「模型幻觉」与「平台漏登记」，
+                    # 两者都拒绝，但排查方向相反。没有注册表时不臆断（None）。
+                    registered=(
+                        True
+                        if is_mcp
+                        else (
+                            tool_executor.has(name)
+                            if tool_executor is not None
+                            else None
+                        )
+                    ),
+                )
+                tool_step.metadata["permission"] = _permission_metadata(verdict)
+                if not verdict.allowed:
+                    # 拒绝也走完整的结果链路（trace / toast / 模型历史 / 工具卡），
+                    # 否则「被拒绝」在系统里等于「没发生过」。
+                    result = verdict.error_payload()
+                    logger.info(
+                        "tool_denied request_id=%s tool_name=%s level=%s reason=%s needed=%s",
+                        request_id,
+                        name,
+                        verdict.level,
+                        verdict.reason,
+                        ",".join(sorted(str(c) for c in verdict.needed)) or "-",
+                    )
+                    tool_step.output = result
+                    materialized = materialize_tool_result(name, result, is_error=True)
+                    _record_materialize(tool_step, materialized)
+                    return result, materialized, (time.monotonic() - t0) * 1000, False
+
+                readonly = _is_readonly_tool(name, arguments)
                 # run 级去重：只读工具命中相同调用时复用缓存结果，跳过实际执行
                 cache_key = ""
-                if _is_readonly_tool(name):
+                if readonly:
                     cache_key = name + "\x00" + (tc["arguments"] or "")
                     cached = read_cache.get(cache_key)
                     if cached is not None:
@@ -1525,19 +1656,13 @@ async def chat(
                         )
                         materialized = materialize_tool_result(name, cached)
                         _record_materialize(tool_step, materialized)
-                        return cached, materialized, 0.0
+                        return cached, materialized, 0.0, True
                 logger.info(
                     "tool_call_start request_id=%s tool_name=%s source=%s",
                     request_id,
                     name,
                     source,
                 )
-                try:
-                    arguments = (
-                        json.loads(tc["arguments"]) if tc["arguments"].strip() else {}
-                    )
-                except json.JSONDecodeError:
-                    arguments = {}
                 try:
                     if is_mcp:
                         result = await mcp_tools.execute(name, arguments)
@@ -1566,25 +1691,30 @@ async def chat(
                 # trace 保留原始结果（审计/排障要看真东西），模型历史用定型版本
                 tool_step.output = result
                 materialized = materialize_tool_result(
-                    name, result, is_error=_parse_result_retryable(result) is False
+                    name, result, is_error=kind_status(_parse_result_kind(result)) == "failed"
                 )
                 _record_materialize(tool_step, materialized)
-                return result, materialized, (time.monotonic() - t0) * 1000
+                return (
+                    result,
+                    materialized,
+                    (time.monotonic() - t0) * 1000,
+                    readonly,
+                )
 
         # 只读工具可并发；含写工具则整批串行（一票否决，对齐 Pi 调度策略）
-        if len(ordered) > 1 and all(_is_readonly_tool(tc["name"]) for tc in ordered):
+        if len(ordered) > 1 and all(_tc_readonly(tc) for tc in ordered):
             executed = await asyncio.gather(*[_run_one(tc) for tc in ordered])
         else:
             executed = [await _run_one(tc) for tc in ordered]
 
         # 后处理严格按调用顺序（保证 checkpoint / 熔断 / 事件 / 消息顺序确定）
-        for tc, (result, materialized, duration_ms) in zip(ordered, executed):
+        for tc, (result, materialized, duration_ms, readonly) in zip(ordered, executed):
             tool_name = tc["name"]
             is_mcp = mcp_tools is not None and mcp_tools.has(tool_name)
             source = "mcp" if is_mcp else "builtin"
             tool_calls_count += 1
             # 写操作可能改变文件内容：清空只读缓存，避免后续返回过期结果
-            if not _is_readonly_tool(tool_name):
+            if not readonly:
                 read_cache.clear()
             # WAL：本次工具调用完成后立即写进度日志（先记录，再做熔断判断，
             # 确保即使随后熔断/中断，本次进度也已落盘；独立于 run 终止）
@@ -1600,9 +1730,12 @@ async def chat(
                 )
             except Exception as exc:  # noqa: BLE001 - 进度写入失败不阻塞主流程
                 logger.warning("append checkpoint failed: %s", exc)
-            # 熔断统计：同一工具连续系统故障（retryable=False）达到阈值即终止；成功 / 业务错误 / 无字段都重置
-            retryable = _parse_result_retryable(result)
-            if retryable is False:
+            # 熔断统计：只数**系统故障**（kind=tool_failure）。权限拒绝、审批待定、
+            # 参数写坏、业务错误、成功、无 kind —— 全部重置计数。
+            # 上一版按 `retryable is False` 统计，于是「只读档下连试三次写文件」
+            # 会被当成「这个工具坏了」而熔断整轮任务。
+            kind = _parse_result_kind(result)
+            if kind_counts_toward_breaker(kind):
                 consecutive_failures[tool_name] = (
                     consecutive_failures.get(tool_name, 0) + 1
                 )
@@ -1612,18 +1745,18 @@ async def chat(
                     )
             else:
                 consecutive_failures[tool_name] = 0
-            is_error = retryable is False
+            status = kind_status(kind)
 
             logger.info(
-                "tool_call_end request_id=%s tool_name=%s source=%s duration_ms=%.2f result_len=%d is_error=%s",
+                "tool_call_end request_id=%s tool_name=%s source=%s duration_ms=%.2f result_len=%d kind=%s status=%s",
                 request_id,
                 tool_name,
                 source,
                 duration_ms,
                 len(result),
-                is_error,
+                kind or "-",
+                status,
             )
-            status = "failed" if retryable is False else "completed"
             emit(decoder.tool_finished(tc["id"], status, result))
             # 进入模型历史的是**定型版本**：这是「历史不可变」的起点。
             # 从这里往后，无论跑多少轮、要不要压缩，这条消息的内容都不再变化，

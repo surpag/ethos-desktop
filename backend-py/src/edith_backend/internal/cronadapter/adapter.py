@@ -19,7 +19,12 @@ class Adapter:
         self._gateway = gateway
 
     async def run_job(self, job: Job) -> None:
-        """把一个已抢占任务交给 Gateway，并消费事件直到 AgentRun 收尾。"""
+        """把一个已抢占任务交给 Gateway，并消费事件直到 AgentRun 收尾。
+
+        执行身份是**任务所有者**（`job.user_id`），不是「创建时那个 run 的身份」；
+        `permission_level` 传的是创建时写下的快照，service 层会与用户当前档位取
+        更严者。这两条合起来回答同一个问题：这条任务凭什么在这里做这件事。
+        """
         stream, run_error = await self._gateway.run(
             IncomingMessage(
                 channel=CRON_CHANNEL,
@@ -27,6 +32,7 @@ class Adapter:
                 session_key=f"cron:{job.id}",
                 request_id=uuid4().hex,
                 message=job.prompt,
+                permission_level=job.permission_level,
             )
         )
         if run_error is not None:

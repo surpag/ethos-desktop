@@ -36,6 +36,7 @@ def _job_response(job: Job) -> JobResponse:
         last_error=job.last_error,
         last_error_at=job.last_error_at.isoformat() if job.last_error_at else None,
         consecutive_failures=job.consecutive_failures,
+        permission_level=job.permission_level,
     )
 
 
@@ -60,7 +61,15 @@ class HTTP:
             if body.timezone.strip():
                 await self._settings.save_timezone(body.user_id, body.timezone)
             try:
-                job = await self._store.create(body.user_id, JobInput(body.name, body.task_type, body.schedule, body.prompt))
+                job = await self._store.create(
+                    body.user_id,
+                    JobInput(body.name, body.task_type, body.schedule, body.prompt),
+                    # 网页端创建的任务同样要留授权记录：两条创建入口（Agent 工具 /
+                    # HTTP）如果只有一条记快照，另一条就成了「不留痕的绕道」。
+                    permission_level=await self._store.current_permission_level(
+                        body.user_id
+                    ),
+                )
             except InvalidJob as exc:
                 raise EDITHError(400, "invalid_cron_job", str(exc))
             return _job_response(job)

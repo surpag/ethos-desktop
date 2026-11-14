@@ -16,9 +16,10 @@
 | `__init__.py` | 包文档注释 |
 | `internal/http_utils.py` | 统一错误契约：`EDITHError` + 全局处理器（`{"type","message"}` JSON） |
 | `internal/tools.py` | 工具注册表 `ToolRegistry`：按名汇总与分发 |
+| `internal/permissions/` | 权限系统：能力声明、档位裁决、敏感路径（三档皆拦） |
 | `internal/netguard.py` | 出口地址校验（SSRF / 本地回环地址判定） |
 
-**模块地图**（`internal/` 下 18 个模块，各自带 README）：
+**模块地图**（`internal/` 下 19 个模块，各自带 README）：
 
 | 模块 | 一句话职责 |
 | --- | --- |
@@ -31,6 +32,7 @@
 | `gitops` | Git 推送编排：bundle + 临时仓 + 凭据注入 |
 | `images` | 聊天图片：本机磁盘存储与 Agent 图片输入 |
 | `models` | 模型目录与供应商定义（内置 + 用户自定义） |
+| `permissions` | 工具能力声明、档位裁决、敏感路径约束 |
 | `sandbox` | 本机沙箱：命令执行、文件原语、目录联接 |
 | `session` | 会话消息持久化（`chat_messages` 表） |
 | `skills` | Skill 目录（单层）、清单注入与加载预算 |

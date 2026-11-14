@@ -7,13 +7,19 @@ from __future__ import annotations
 
 import json
 
-# 工具错误分类：业务错误（模型可自救）与系统故障（重试无用、参与熔断）彻底分开。
-TOOL_FAILURE = (
-    "tool_failure"  # 系统故障：SDK 异常 / 连接断开 / 超时（重试无用，参与熔断）
-)
-COMMAND_ERROR = (
-    "command_error"  # 业务错误：命令失败 / 路径错误 / 权限不足（模型可自救，不熔断）
-)
+from .permissions.types import COMMAND_ERROR, TOOL_FAILURE
+
+# 工具错误分类：取值定义在 `permissions.types`（唯一权威源）——因为「谁该重试、
+# 谁该计熔断、谁该显示成失败」这三件事必须由同一张表回答。这里只做再导出，
+# 兼容既有 import（历史代码与本模块的语义一致）。
+__all__ = [
+    "COMMAND_ERROR",
+    "TOOL_FAILURE",
+    "ToolRegistry",
+    "command_stderr_hint",
+    "describe_tool_failure",
+    "tool_error_result",
+]
 
 
 def describe_tool_failure(tool_name: str, exc: Exception) -> str:
@@ -107,6 +113,14 @@ class ToolRegistry:
     def tool_definitions(self) -> list[dict]:
         return [d for tool_set in self._tool_sets for d in tool_set.tool_definitions()]
 
+    def has(self, name: str) -> bool:
+        """该名字是否是本注册表里已注册的工具。
+
+        权限裁决要用它区分「未注册」（模型幻觉的名字）与「已注册但未声明能力」
+        （平台漏登记）——两者都必须拒绝，但排查方向完全相反。
+        """
+        return name in self._by_name
+
     async def execute(
         self,
         name: str,
@@ -118,8 +132,15 @@ class ToolRegistry:
         """统一执行入口（本次修改：透传 workspace_id 给各工具集，供 Sandbox 工具路径自动补全）。"""
         tool_set = self._by_name.get(name)
         if tool_set is None:
+            # 模型幻觉出的工具名是**模型错误**，不是系统故障：写成 tool_failure 会被
+            # 熔断统计当成「工具坏了」，三次幻觉就能把整轮任务杀掉。
             return json.dumps(
-                {"error": f"unknown tool: {name}", "kind": TOOL_FAILURE},
+                {
+                    "error": f"工具 {name} 不存在",
+                    "kind": COMMAND_ERROR,
+                    "retryable": True,
+                    "suggestion": "这个工具名不存在，请只调用工具列表中出现的工具。",
+                },
                 ensure_ascii=False,
             )
         try:

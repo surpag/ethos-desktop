@@ -15,8 +15,8 @@
        部分生效会让计划与现实错位，比直接拒绝更难排查。
 
 关于「业务错误也算 completed」的既有坑：
-    execution.py 里 `status = "failed" if retryable is False else "completed"`，
-    所以 `FileNotFoundError` 这类业务错误（retryable=True）会被记成 completed。
+    execution.py 里状态由 `kind` 决定，`command_error`（`FileNotFoundError` 这类
+    业务错误）仍然记成 completed，只有系统故障与权限拒绝才记 failed。
     因此判断一次调用是否真的成功，**必须同时看 result 里的 error 字段**，
     只看 status 会把失败当成功——这正是「假完成」的原产地。
 """
@@ -28,6 +28,8 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+
+from ..permissions import catalog as permissions_catalog
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -104,10 +106,19 @@ def _is_successful(fact: dict) -> bool:
     return True
 
 
-# 只读工具不能当「改动了什么」的证据（与 execution._READ_ONLY_TOOLS 同义，
-# 但这里不能 import execution：会形成 agentrun 内部环）。
-_READ_ONLY_TOOLS = frozenset({"sandbox_read_file", "sandbox_list_files"})
+# 只读工具不能当「改动了什么」的证据（读过 ≠ 改过）。
+#
+# 这里不维护工具名清单：它曾经是第三份手写只读清单，与 `execution._READ_ONLY_TOOLS`
+# 各自演化（那份漏了 `git_remote_branches` 与 `sandbox_list_processes`，也就是
+# 「查一下」会被当成「改过」）。现在统一问能力声明——`permissions/catalog.py`。
 _RUN_COMMAND = "sandbox_run_command"
+
+
+def _is_readonly_fact(fact: dict) -> bool:
+    """这次调用是否纯只读（按能力声明判定，参数会影响结论，例如 `git status`）。"""
+    name = str(fact.get("name", ""))
+    arguments = _result_dict(fact.get("arguments", ""))
+    return permissions_catalog.is_readonly(name, arguments)
 
 
 def _summarize_calls(calls: list[dict], limit: int = 5) -> str:
@@ -181,7 +192,7 @@ def resolve_evidence(evidence: dict, facts: list[dict]) -> tuple[dict | None, li
         matched = [
             f
             for f in pool
-            if str(f.get("name", "")) not in _READ_ONLY_TOOLS
+            if not _is_readonly_fact(f)
             and target
             and target in _normalize_path(str(f.get("arguments", "")))
         ]

@@ -19,6 +19,10 @@ _RESULT_COLUMNS = {
     "last_error": "TEXT",
     "last_error_at": "TEXT",
     "consecutive_failures": "INTEGER NOT NULL DEFAULT 0",
+    # 权限快照：创建时写入。空串 = 该列引入之前创建的历史任务（启动时回填）。
+    # 不用 DEFAULT 'full' 而不是 DEFAULT ''：空串能表达「不知道」，
+    # 有默认值就等于给历史任务发了一张事后补签的授权书。
+    "permission_level": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -38,7 +42,8 @@ async def create_schema(db: aiosqlite.Connection) -> None:
             last_run_at TEXT,
             last_error TEXT,
             last_error_at TEXT,
-            consecutive_failures INTEGER NOT NULL DEFAULT 0
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            permission_level TEXT NOT NULL DEFAULT ''
         )"""
     )
     await _migrate(db)

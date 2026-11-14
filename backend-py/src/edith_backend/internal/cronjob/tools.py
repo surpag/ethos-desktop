@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from datetime import UTC
 
+from ..permissions.context import current_level
 from .store import Store
 from .types import JobInput
 
@@ -49,6 +50,14 @@ class CronToolSet:
     ) -> str:
         if name != "create_cron_job":
             return json.dumps({"error": f"unknown cron tool: {name}"}, ensure_ascii=False)
+        # 权限快照：优先用**本 run 的生效档位**（它可能已经被更严的上限压过），
+        # 拿不到上下文时回落到用户设置——绝不回落到「默认档位」，那等于凭空授权。
+        level = current_level()
+        snapshot = (
+            str(level)
+            if level is not None
+            else await self._store.current_permission_level(user_id)
+        )
         try:
             job = await self._store.create(
                 user_id,
@@ -58,12 +67,16 @@ class CronToolSet:
                     schedule=arguments.get("schedule", ""),
                     prompt=arguments.get("prompt", ""),
                 ),
+                permission_level=snapshot,
             )
         except Exception as exc:  # noqa: BLE001
             return json.dumps({"error": str(exc)}, ensure_ascii=False)
         next_at = job.next_run_at.astimezone(UTC).isoformat() if job.next_run_at else ""
         return json.dumps(
             {"id": job.id, "name": job.name, "taskType": job.task_type,
-             "schedule": job.schedule, "nextRunAt": next_at, "message": "定时任务已创建"},
+             "schedule": job.schedule, "nextRunAt": next_at,
+             # 把授权档位回显给模型和用户：这条任务将来能做什么，创建时就该说清楚。
+             "permissionLevel": job.permission_level,
+             "message": "定时任务已创建"},
             ensure_ascii=False,
         )

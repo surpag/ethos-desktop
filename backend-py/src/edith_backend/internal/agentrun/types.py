@@ -28,6 +28,9 @@ class Request:
     model_id: str = ""
     reasoning_option_id: str = ""
     workspace_id: str = ""
+    #: 本次执行的档位**上限**（定时任务的权限快照）。空 = 用用户当前设置。
+    #: 生效档位由 service 层取「当前设置」与它的更严者，不在这里解析。
+    permission_level: str = ""
 
 
 @dataclass

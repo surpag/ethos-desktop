@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from uuid import uuid4
 
 import aiosqlite
 
+from ..permissions.policy import parse_level
 from ..userconfig.settings import Settings
 from . import schedule_rules
 from .types import (
@@ -21,9 +23,12 @@ from .types import (
     JobNotFound,
 )
 
+logger = logging.getLogger(__name__)
+
 _COLUMNS = (
     "id, user_id, name, task_type, schedule, prompt, enabled, next_run_at, "
-    "running, created_at, last_run_at, last_error, last_error_at, consecutive_failures"
+    "running, created_at, last_run_at, last_error, last_error_at, consecutive_failures, "
+    "permission_level"
 )
 
 
@@ -51,6 +56,7 @@ def _row_to_job(row) -> Job:
         last_error=row["last_error"],
         last_error_at=_parse_dt(row["last_error_at"]),
         consecutive_failures=int(row["consecutive_failures"] or 0),
+        permission_level=row["permission_level"] or "",
     )
 
 
@@ -59,7 +65,14 @@ class Store:
         self._db = db
         self._settings = settings
 
-    async def create(self, user_id: str, input_: JobInput) -> Job:
+    async def create(
+        self, user_id: str, input_: JobInput, permission_level: str = ""
+    ) -> Job:
+        """创建任务，并把**创建时**的权限档位记进快照。
+
+        快照不是「缓存用户设置」，而是一条授权记录：没有它，用户日后调高档位就等于
+        给所有历史任务批量重新授权，而这件事不经过任何准入检查。
+        """
         user_id = user_id.strip()
         if not user_id:
             raise InvalidJob("user ID is required")
@@ -76,15 +89,22 @@ class Store:
             enabled=True,
             next_run_at=next_at,
             created_at=now,
+            permission_level=str(permission_level or ""),
         )
         await self._db.execute(
-            "INSERT INTO cron_jobs (id, user_id, name, task_type, schedule, prompt, enabled, next_run_at, running, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, 1, ?, 0, ?)",
+            "INSERT INTO cron_jobs (id, user_id, name, task_type, schedule, prompt, enabled, next_run_at, running, created_at, permission_level) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?, 0, ?, ?)",
             (job.id, job.user_id, job.name, job.task_type, job.schedule, job.prompt,
-             _dt(job.next_run_at), _dt(job.created_at)),
+             _dt(job.next_run_at), _dt(job.created_at), job.permission_level),
         )
         await self._db.commit()
         return job
+
+    async def current_permission_level(self, user_id: str) -> str:
+        """用户此刻的生效档位（规范化后的字符串，可直接入库当快照）。"""
+        raw = await self._settings.load_permission_level(user_id)
+        level, _ = parse_level(raw)
+        return str(level)
 
     async def list(self, user_id: str) -> list[Job]:
         cursor = await self._db.execute(
@@ -209,6 +229,7 @@ class Store:
         await self._db.commit()
 
     async def initialize_next_runs(self, now: datetime) -> None:
+        await self._backfill_permission_levels()
         cursor = await self._db.execute(
             f"SELECT {_COLUMNS} FROM cron_jobs WHERE enabled = 1 AND next_run_at IS NULL"
         )
@@ -225,3 +246,27 @@ class Store:
             )
         if jobs:
             await self._db.commit()
+
+    async def _backfill_permission_levels(self) -> None:
+        """给「没有授权记录」的历史任务补一次快照。
+
+        为什么补而不是留空：留空意味着每次执行都临时读当前设置——那正是要避免的
+        「权限漂移」。补一次之后，这条任务就有了一条确定的授权记录。
+        取值用**此刻的用户档位**（而非 `full`）：宁可让历史任务按用户今天的意图
+        收敛，也不要凭空给它发一张全额授权书。
+        """
+        cursor = await self._db.execute(
+            "SELECT id, user_id FROM cron_jobs WHERE permission_level = ''"
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        if not rows:
+            return
+        for row in rows:
+            level = await self.current_permission_level(row["user_id"])
+            await self._db.execute(
+                "UPDATE cron_jobs SET permission_level = ? WHERE id = ?",
+                (level, row["id"]),
+            )
+        await self._db.commit()
+        logger.info("cron_permission_backfill rows=%d", len(rows))

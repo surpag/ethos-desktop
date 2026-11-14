@@ -18,7 +18,7 @@ from edith_backend.internal.agentrun.execution import (
     ToolCircuitBreakerError,
     _digest,
     _estimate_tokens,
-    _parse_result_retryable,
+    _parse_result_kind,
     _read_progress,
 )
 from edith_backend.internal.agentrun.tool_result import (
@@ -26,6 +26,12 @@ from edith_backend.internal.agentrun.tool_result import (
     materialize_tool_result,
 )
 from edith_backend.internal.agentstream.types import Event
+from edith_backend.internal.permissions.types import (
+    APPROVAL_REQUIRED,
+    PERMISSION_DENIED,
+    kind_counts_toward_breaker,
+    kind_status,
+)
 from edith_backend.internal.session.schema import create_schema
 from edith_backend.internal.session.store import SessionStore
 from edith_backend.internal.tools import (
@@ -38,11 +44,26 @@ from edith_backend.internal.tools import (
 # ---- 一、错误语义分层 ----
 
 
-def test_parse_result_retryable() -> None:
-    assert _parse_result_retryable(json.dumps({"retryable": False})) is False
-    assert _parse_result_retryable(json.dumps({"retryable": True})) is True
-    assert _parse_result_retryable(json.dumps({"exitCode": 0})) is None
-    assert _parse_result_retryable("not json") is None
+def test_parse_result_kind() -> None:
+    assert _parse_result_kind(json.dumps({"kind": TOOL_FAILURE})) == TOOL_FAILURE
+    assert _parse_result_kind(json.dumps({"kind": COMMAND_ERROR})) == COMMAND_ERROR
+    assert _parse_result_kind(json.dumps({"exitCode": 0})) is None
+    assert _parse_result_kind("not json") is None
+
+
+def test_failure_kinds_are_not_interchangeable() -> None:
+    """三个问题必须由枚举分别回答：谁计熔断、谁能自救、谁显示成失败。"""
+    # 只有系统故障计熔断
+    assert kind_counts_toward_breaker(TOOL_FAILURE) is True
+    assert kind_counts_toward_breaker(PERMISSION_DENIED) is False
+    assert kind_counts_toward_breaker(APPROVAL_REQUIRED) is False
+    assert kind_counts_toward_breaker(COMMAND_ERROR) is False
+    # 权限拒绝显示成失败（用户要看得见），但绝不计熔断
+    assert kind_status(PERMISSION_DENIED) == "failed"
+    assert kind_status(APPROVAL_REQUIRED) == "failed"
+    # 业务错误仍算「执行过」（UI 不报错，错误在结果里给模型看）
+    assert kind_status(COMMAND_ERROR) == "completed"
+    assert kind_status(None) == "completed"
 
 
 def test_tool_error_result_business_vs_system() -> None:

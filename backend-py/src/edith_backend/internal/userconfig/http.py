@@ -8,6 +8,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from ..http_utils import EDITHError
+from ..permissions.policy import parse_level
 from .gitcredentials import GitCredentials
 from .providers import Providers
 from .settings import Settings
@@ -48,12 +49,16 @@ class HTTP:
             for status in statuses
         ]
         model_id = agent_settings.default_model_id or self.default_model_id
+        # 读接口给**生效值**而不是原始值：库里可能是空串或脏数据，前端不该
+        # 自己实现一遍「空 = 默认、非法 = 只读」这套降级规则。
+        level, _ = parse_level(agent_settings.permission_level)
         return SettingsResponse(
             personality=agent_settings.personality,
             default_model_id=model_id,
             timezone=agent_settings.timezone,
             git_author_name=agent_settings.git_author_name,
             git_author_email=agent_settings.git_author_email,
+            permission_level=str(level),
             providers=provider_states,
         )
 
@@ -92,6 +97,7 @@ class HTTP:
                     timezone=body.timezone.strip(),
                     git_author_name=body.git_author_name.strip(),
                     git_author_email=body.git_author_email.strip(),
+                    permission_level=body.permission_level.strip(),
                 ),
             )
             await self.providers.save(user_id, credentials)

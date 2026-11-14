@@ -19,7 +19,8 @@ _STATEMENTS = [
         default_model_id TEXT NOT NULL DEFAULT '',
         timezone TEXT NOT NULL DEFAULT '',
         git_author_name TEXT NOT NULL DEFAULT '',
-        git_author_email TEXT NOT NULL DEFAULT ''
+        git_author_email TEXT NOT NULL DEFAULT '',
+        permission_level TEXT NOT NULL DEFAULT 'full'
     )""",
     """CREATE TABLE IF NOT EXISTS user_providers (
         user_id TEXT NOT NULL,
@@ -74,6 +75,12 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     if "git_author_email" not in columns:
         await db.execute(
             "ALTER TABLE user_agents ADD COLUMN git_author_email TEXT NOT NULL DEFAULT ''"
+        )
+    if "permission_level" not in columns:
+        # 老库补列：默认 'full' = 补列之前的行为。默认值必须是「不变」，
+        # 否则一次升级会把所有人的写入静默关掉（也把他们的定时任务一起降权）。
+        await db.execute(
+            "ALTER TABLE user_agents ADD COLUMN permission_level TEXT NOT NULL DEFAULT 'full'"
         )
 
     # `user_channel_bindings`（外部渠道账号 → 用户）随渠道绑定功能一起删除。
