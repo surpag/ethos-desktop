@@ -1,3 +1,14 @@
+> **已回退（2026-11-14 归档）**：会话级 / 工作区级档位已全部删除。
+> 档位的控制点只有一个——用户设置（`user_agents.permission_level`），
+> 定时任务快照只能压低。`session_meta.permission_level` 与 `workspaces.permission_level`
+> 两列停止使用，对应 HTTP 路由、响应字段、前端切换器一并删除。
+> 原因：档位回答的是「我允许 Agent 对我的机器做什么」，这个问题只有一个回答者；
+> 多一层作用域不会更安全，只会让用户在每个对话里重新对账一次。
+> 当前实现见 `backend-py/src/edith_backend/internal/permissions/README.md`。
+>
+> 本文仅作设计档案保留，**不要按它理解当前代码**；其中「为什么只能收紧」的论证
+> 仍然适用于 `ceiling`（定时任务快照）与用户级的关系。
+
 # P3：会话级 / 工作区级档位上限
 
 > 状态：已实施。上游：`permissions-p1.md`（能力与档位裁决）、`permissions-p2-approval.md`（审批挂起）。

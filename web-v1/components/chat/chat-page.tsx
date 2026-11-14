@@ -23,7 +23,6 @@ import { subscribeModelsChanged } from "@/lib/models/events";
 
 import { ChatComposer } from "./chat-composer";
 import { ConversationList } from "./conversation-list";
-import { PermissionSwitcher } from "./permission-switcher";
 import { TimelineView, type TimelineRunNotice } from "./timeline";
 import { SandboxPanel } from "./sandbox-panel";
 import { SessionUsageView } from "./session-usage";
@@ -40,12 +39,6 @@ type ChatSession = {
   plan?: PlanSnapshot | null;
   /** 任务状态（in_progress/completed/canceled）；来自后端 session_meta，刷新后仍在 */
   taskStatus?: string | null;
-  /** 本会话的档位上限（空 = 未设置，不额外收紧） */
-  permissionLevel?: string;
-  /** 实际生效档位（已与用户级/工作区级取最严）；显示以它为准 */
-  effectivePermissionLevel?: string;
-  /** 把档位压下来的那一级：user / workspace / session */
-  permissionBinding?: string;
 };
 
 type Workspace = {
@@ -806,9 +799,6 @@ export function ChatPage() {
             usage: responseBody.usage,
             plan: responseBody.plan ?? null,
             taskStatus: responseBody.taskStatus ?? null,
-            permissionLevel: responseBody.permissionLevel ?? "",
-            effectivePermissionLevel: responseBody.effectivePermissionLevel ?? "",
-            permissionBinding: responseBody.permissionBinding ?? "",
           }
         : session,
     ));
@@ -1114,19 +1104,6 @@ export function ChatPage() {
               </button>
             )}
             <SessionUsageView menuPosition="down" usage={activeSession.usage} />
-            <PermissionSwitcher
-              sessionID={activeSession.id}
-              setting={activeSession.permissionLevel ?? ""}
-              effective={activeSession.effectivePermissionLevel ?? ""}
-              binding={activeSession.permissionBinding ?? ""}
-              onChange={(next) => {
-                setSessions((current) =>
-                  current.map((session) =>
-                    session.id === activeSession.id ? { ...session, ...next } : session,
-                  ),
-                );
-              }}
-            />
             <button
               className="ui-icon-button"
               onClick={() => setSandboxOpen((current) => !current)}

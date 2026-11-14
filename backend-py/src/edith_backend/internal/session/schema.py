@@ -38,9 +38,6 @@ _STATEMENTS = [
     archived INTEGER NOT NULL DEFAULT 0,
     archived_at TEXT,
     task_status TEXT,   -- 任务状态：in_progress/completed/canceled（NULL = 从未有 run）
-    -- 本会话的档位**上限**（不是覆盖）：空 = 未设置 = 不收紧。
-    -- 解析时与用户级 / 工作区级取最严者，见 permissions/policy.py::resolve_chain。
-    permission_level TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (user_id, session_id)
 )""",
     # 本次新增：断点续跑进度日志（WAL 思路）——每次工具调用成功后立即追加一条，
@@ -273,12 +270,9 @@ async def _migrate(db: aiosqlite.Connection) -> None:
         # 会话的工作区归属从 chat_messages 提升到会话元数据：单一权威源在这里，
         # 否则「一个工作区一个会话」不变式无法用索引表达。
         await db.execute("ALTER TABLE session_meta ADD COLUMN workspace_id TEXT")
-    if "permission_level" not in columns:
-        # 会话级档位上限。DEFAULT '' 是「未设置」而不是「完全档」：
-        # 未设置必须中性（不参与收紧），否则给历史会话补列就等于给它们盖章。
-        await db.execute(
-            "ALTER TABLE session_meta ADD COLUMN permission_level TEXT NOT NULL DEFAULT ''"
-        )
+    # 会话级档位已回退：档位是用户级设置，会话不持有也不展示它。
+    # 老库可能还留着 permission_level 列，代码不读写；与 workspaces 的
+    # volume_* 同理，SQLite 允许多出未使用的列，不做破坏性的删列迁移。
 
     cursor = await db.execute("PRAGMA table_info(run_checkpoints)")
     rows = await cursor.fetchall()

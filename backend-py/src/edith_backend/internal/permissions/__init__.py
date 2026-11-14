@@ -4,7 +4,9 @@
 
 分两层，不可互相替代：
 
-- **档位裁决**（`policy`）：用户可配置。只读 / 审批 / 完全三档，按「能力集合」判定。
+- **档位裁决**（`policy`）：用户可配置，且**只在用户设置里配置**（会话/工作区
+  不各存一份档位：档位是「我允许 Agent 对我的机器做什么」，只有一个回答者）。
+  只读 / 审批 / 完全三档，按「能力集合」判定。
 - **安全约束**（`paths`）：不可配置。敏感路径三档皆拦，`full` 也拦。
 
 为什么分开：档位是「用户想让我做多少事」，安全约束是「无论用户想做什么都不做」。
@@ -12,7 +14,7 @@
 """
 
 from .catalog import MCP_CAPABILITIES, capabilities_of, is_readonly
-from .chain import LevelChain
+from .chain import resolve_user_level
 from .context import bind_level, current_level
 from .paths import check_path
 from .policy import (
@@ -47,7 +49,6 @@ __all__ = [
     "Capability",
     "INVALID_ARGUMENTS",
     "InvalidLevelValue",
-    "LevelChain",
     "MCP_CAPABILITIES",
     "PERMISSION_DENIED",
     "PermissionLevel",
@@ -69,5 +70,6 @@ __all__ = [
     "parse_level",
     "parse_level_input",
     "resolve_chain",
+    "resolve_user_level",
     "result_kind",
 ]

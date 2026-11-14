@@ -77,38 +77,6 @@ class WorkspaceStore:
             row = await cursor.fetchone()
         return (row[0] or "") if row else ""
 
-    async def get_permission_level(self, user_id: str, workspace_id: str) -> str:
-        """本工作区的档位上限；空串 = 未设置（不参与收紧）。
-
-        工作区不存在时也返回空串：调用方（档位解析链）不该为一个已被删除的
-        工作区中断整轮任务，也不该把它变成一个永久的只读陷阱。
-        """
-        async with self._db.execute(
-            "SELECT permission_level FROM workspaces "
-            "WHERE user_id = ? AND workspace_id = ?",
-            (user_id, workspace_id),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return str(row[0] or "") if row else ""
-
-    async def set_permission_level(
-        self, user_id: str, workspace_id: str, level: str
-    ) -> bool:
-        """写入本工作区的档位上限；返回是否命中记录。
-
-        不存在的 workspace 返回 False 而不是插入一行：工作区必须由 create 建，
-        否则会留下一个没有名字、没有存储根的空壳。
-        """
-        cursor = await self._db.execute(
-            "UPDATE workspaces SET permission_level = ? "
-            "WHERE user_id = ? AND workspace_id = ?",
-            (level, user_id, workspace_id),
-        )
-        affected = cursor.rowcount or 0
-        await cursor.close()
-        await self._db.commit()
-        return affected > 0
-
     async def bind_local_root(
         self,
         user_id: str,
@@ -150,7 +118,7 @@ class WorkspaceStore:
     async def list(self, user_id: str) -> list[dict]:
         """列出用户全部工作区（按创建时间），metadata 解析为 dict。"""
         async with self._db.execute(
-            "SELECT workspace_id, name, metadata, local_root, permission_level "
+            "SELECT workspace_id, name, metadata, local_root "
             "FROM workspaces "
             "WHERE user_id = ? ORDER BY created_at, workspace_id",
             (user_id,),
@@ -162,7 +130,6 @@ class WorkspaceStore:
                     "name": r[1],
                     "metadata": self._parse_metadata(r[2]),
                     "localRoot": r[3] or "",
-                    "permissionLevel": str(r[4] or ""),
                 }
                 for r in rows
             ]
@@ -183,7 +150,7 @@ class WorkspaceStore:
     async def get(self, user_id: str, workspace_id: str) -> dict | None:
         """查询单个工作区（用于聊天页 workspaceId → 名称映射）。"""
         async with self._db.execute(
-            "SELECT workspace_id, name, metadata, local_root, session_id, permission_level "
+            "SELECT workspace_id, name, metadata, local_root, session_id "
             "FROM workspaces "
             "WHERE user_id = ? AND workspace_id = ?",
             (user_id, workspace_id),
@@ -197,7 +164,6 @@ class WorkspaceStore:
             "metadata": self._parse_metadata(row[2]),
             "localRoot": row[3] or "",
             "sessionId": row[4] or "",
-            "permissionLevel": str(row[5] or ""),
         }
 
     # ---- 删除（级联 + 存储清理回调） ----

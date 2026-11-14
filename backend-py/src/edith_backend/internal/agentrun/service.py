@@ -19,8 +19,7 @@ from openai import AsyncOpenAI
 from ..agentstream.outcome import derive_outcome
 from ..agentstream.types import APIError, Event, SessionUsage
 from ..models.catalog import DEFAULT_MODEL_ID, Catalog, ModelDefinition
-from ..permissions.chain import LevelChain
-from ..permissions.policy import resolve_chain
+from ..permissions.chain import resolve_user_level
 from ..session.approval_store import ApprovalStore
 from ..session.constraint_store import ConstraintStore, constraints_enabled
 from ..session.plan_store import RunPlanStore
@@ -76,9 +75,7 @@ class Dependencies:
     providers: Providers
     store: SessionStore
     usage: Recorder
-    #: 档位解析链（用户级 / 工作区级 / 会话级 / 本次上限）。
-    #: None = 只按用户级与本次上限解析（老装配路径与单测）。
-    levels: LevelChain | None = None
+    #: 技能目录（可选）：没有它时 Agent 看不到用户安装的 skill。
     skills: SkillsCatalog | None = None
     images: object | None = None
     files: object | None = None
@@ -146,7 +143,6 @@ class Service:
         self.mcp = deps.mcp
         self.models = deps.models
         self.settings = deps.settings
-        self.levels = deps.levels
         self.providers = deps.providers
         self.memories = deps.memories
         # trace 落盘器；为 None 时打点全部空转（可作总开关）
@@ -496,36 +492,23 @@ class Service:
             # 断点续跑：只看 task_status + checkpoint（与终止原因解耦，无 end_reason 特例判断）
             await self._inject_resume_context(configured, tracer)
 
-            # 生效档位 = 四个来源取最严者（见 permissions/policy.py::resolve_chain）。
+            # 生效档位 = 用户级设置与本次执行上限取最严者
+            # （见 permissions/policy.py::resolve_chain）。
             #
-            # 底层理由：档位是安全边界，子作用域只能收紧。所以这里不存在「谁覆盖谁」
-            # ——会话级不能把用户级的只读放宽回完全，工作区级也不能。想放宽只能改
-            # 用户级设置，那是一个用户看得见、也只会作用于他本人的动作。
+            # 只有这两个来源，因为档位只有一个回答者：用户在设置页里允许 Agent
+            # 对他的机器做什么。会话级 / 工作区级上限曾经做过，已回退——它不会让
+            # 系统更安全，只会让用户在每个对话里重新对账一次
+            # （见 docs/archive/permissions-p3-scopes.md）。
             #
-            # 四个来源各自不可省：
-            #   - user     ：用户当前设置，改一次就作用于所有会话；
-            #   - workspace：跟着工作区走（换会话仍在），管的是「这个项目的边界」；
-            #   - session  ：跟着这个对话走（换工作区不带），管的是「这次任务多谨慎」；
-            #   - ceiling  ：本次执行的额外上限（定时任务创建时的快照）。
-            #     只看 user 会让「改一次全局设置」等于给所有历史定时任务重新授权；
-            #     只看快照则让用户把档位调低之后，定时任务成了例外。
-            #
-            # workspace 读不到（工作区已被删）时按未设置处理：删掉工作区不该把
-            # 那个位置变成一个永久的只读陷阱，用户此刻的意图由 user 级表达。
-            if self.levels is not None:
-                resolution = await self.levels.resolve(
-                    request.user_id,
-                    workspace_id=request.workspace_id,
-                    session_id=request.session_id,
-                    ceiling=request.permission_level,
-                )
-            else:
-                # 老装配路径（测试、或没有工作区/会话级来源的宿主）：
-                # 至少保住「用户级 ∩ 本次上限」，不能悄悄变成只看快照。
-                resolution = resolve_chain(
-                    user=await self.settings.load_permission_level(request.user_id),
-                    ceiling=request.permission_level,
-                )
+            #   - user   ：用户当前设置，改一次就作用于所有会话与定时任务；
+            #   - ceiling：定时任务创建时的授权快照。只看 user 会让「改一次全局
+            #     设置」等于给所有历史定时任务重新授权；只看快照则让用户把档位
+            #     调低之后，定时任务成了例外——而例外恰恰在没人盯着的时候跑。
+            resolution = await resolve_user_level(
+                self.settings.load_permission_level,
+                request.user_id,
+                ceiling=request.permission_level,
+            )
             permission_level = resolution.level
             if resolution.binding or resolution.invalid:
                 logger.info(

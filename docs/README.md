@@ -20,7 +20,6 @@
 | --- | --- |
 | `permissions-p1.md` | 权限系统 P1：能力声明、档位裁决、敏感路径、副作用入口覆盖矩阵；§15 含 P2 的按条目判定 |
 | `permissions-p2-approval.md` | 权限系统 P2-2/P2-3：审批挂起/恢复的终止路径枚举、为什么是原地等待、授权范围与风险；§14 含前端审批面板与档位开关 |
-| `permissions-p3-scopes.md` | 权限系统 P3：会话级/工作区级档位**上限**（只能收紧）、四来源解析链、问题空间枚举与存储/HTTP/前端接线 |
 
 `archive/` 存的是 2026-11-12 之前的设计稿。它们大多描述的是「云端多租户 Agent
 平台」这条路线，而桌面版走的是相反方向：单用户、本机执行、无远端沙箱、无对象
@@ -36,6 +35,7 @@
 | --- | --- | --- |
 | `cloud-multitenant-migration.md` | 多租户改造方案 | 方向已放弃（改为单用户桌面） |
 | `e2b-volume-beta-request.md` | E2B Volumes 申请 | 集成已删除，E2B 依赖已移除 |
+| `permissions-p3-scopes.md` | 会话级/工作区级档位上限 | 已回退：档位控制点收回到用户级设置，两级作用域的列/路由/前端入口全部删除 |
 | `local-sandbox-sync-design.md` | 本地 ↔ 沙箱双向同步 | 同步已删除（改目录联接） |
 | `sandbox-sync-optimization.md` | 同步按需化 / 降频 | 同上，无同步可优化 |
 | `sandbox-runtime-abstraction.md` | 多沙箱后端抽象 | 只剩本机实现，不留抽象 |

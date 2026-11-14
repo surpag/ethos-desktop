@@ -84,15 +84,23 @@ plan_update = {METADATA}
 - `None` → 调用方必须显式决定（cron 工具回落到用户设置并写进结果）；
 - 默认成 `FULL` 等于给任何漏传的长路径发一张全额授权书。
 
-## 档位来源：四个，取最严（`policy.resolve_chain` + `chain.LevelChain`）
+## 档位来源：两个，取最严（`policy.resolve_chain` + `chain.resolve_user_level`）
 
 ```
-effective = min(user, workspace, session, ceiling)
+effective = min(user, ceiling)
 ```
 
-子作用域是**上限**不是覆盖：会话级不能把用户级的只读放宽回完全。理由是安全边界
-不能由子层扩增（OAuth scope 只能缩、AWS 权限边界只能减）。所以这里没有「谁覆盖谁」，
-也就不需要在换绑工作区时重算或快照。
+- `user`：设置页里的三档。**这是唯一的控制点**，改一次作用于全部会话与定时任务；
+- `ceiling`：定时任务创建时记下的快照，是「这次自动执行最多到几档」的授权记录，
+  不是第二套设置。
+
+取最严而不是「后者胜」：授权记录不能比当前设置更宽（否则用户调低档位后，历史任务
+成了例外，而例外恰在没人盯着的时候跑）；反方向是刻意的不便——用户放宽之后，旧快照
+仍然压着，直到他重新创建任务。
+
+会话级 / 工作区级上限曾经实现过，已回退：档位回答的是「我允许 Agent 对我的机器做
+什么」，这个问题只有一个回答者。多一层作用域不会更安全，只会让用户在每个对话里
+重新对账一次（`docs/archive/permissions-p3-scopes.md`）。
 
 两个函数的边界：
 
@@ -103,10 +111,10 @@ effective = min(user, workspace, session, ceiling)
 
 写侧静默降级会骗人：用户选「完全」，存进去「只读」，界面与行为不一致。
 
-`chain.LevelChain` 是**取数**端，被 run 执行与会话详情共用——两处各写一遍 `min`，
-迟早漂移成「界面显示完全、实际按只读跑」，且没有任何报错。
+`chain.resolve_user_level` 是**取数 + 折叠**的唯一入口，run 执行只调它一次。会话详情
+不返回档位：会话不持有档位，也就不该有一份可能与之不一致的投影。
 
-读失败（DB 异常）→ 该来源按只读，并记在 `Resolution.errors`。当「没设置」处理等于
+读失败（DB 异常）→ 按只读，并记在 `Resolution.errors`。当「没设置」处理等于
 「数据库抖一下就能提权」，但让异常穿出去会让整轮 run 挂掉，所以降级 + 记日志。
 
 ## 容器操作要按条目判（`paths.first_sensitive_entry`）

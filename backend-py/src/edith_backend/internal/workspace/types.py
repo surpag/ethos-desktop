@@ -109,26 +109,6 @@ class WorkspaceResponse(BaseModel):
     local_root: str = ""
     # D-a：绑定的 Git 远端仓库地址（空 = 未绑定）；存于 metadata.gitRemoteUrl
     git_remote_url: str = ""
-    # 本工作区的档位**上限**（空 = 未设置 = 不收紧）。生效值还要与用户级、
-    # 会话级取最严者，所以它不是「这个工作区现在是几档」的答案。
-    permission_level: str = ""
-
-
-class WorkspaceLevelRequest(BaseModel):
-    """PUT /internal/workspaces/{id}/permission-level 的请求体。
-
-    传 `"read_only"` / `"approval"` / `"full"` = 设置上限；传 `""` = 清除上限。
-    非法值返回 400，不静默降级。
-    """
-
-    model_config = ConfigDict(
-        alias_generator=to_camel,
-        populate_by_name=True,
-        extra="forbid",
-    )
-
-    user_id: str = Field(..., min_length=1)
-    permission_level: str = ""
 
 
 class WorkspaceListResponse(BaseModel):

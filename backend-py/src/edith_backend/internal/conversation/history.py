@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from ..agentstream.outcome import derive_outcome
 from ..agentstream.types import PlanSnapshot
-from ..permissions.chain import LevelChain
 from ..session.plan_store import RunPlanStore
 from ..session.store import SessionStore
 from ..session.types import MessageRecord
@@ -35,15 +34,11 @@ class History:
         store: SessionStore,
         usage: Reader,
         plans: RunPlanStore | None = None,
-        levels: LevelChain | None = None,
     ) -> None:
         self.store = store
         self.usage = usage
         # 计划快照（可选依赖）：没有它时历史里不带计划，其余能力不受影响
         self.plans = plans
-        # 档位解析链（可选依赖）：没有它时只回会话级设置、不回到生效值。
-        # 少这一项界面会显示「本会话选了完全」，而实际可能被用户级压成只读。
-        self.levels = levels
 
     async def list(self, user_id: str, include_archived: bool = False) -> list[Conversation]:
         """返回用户全部会话的侧边栏摘要（默认排除已归档）。"""
@@ -81,29 +76,6 @@ class History:
             user_id.strip(), workspace_id.strip()
         )
 
-    async def level_state(self, user_id: str, session_id: str) -> tuple[str, str, str]:
-        """(本会话设置的上限, 实际生效档位, 收紧者)。
-
-        三者分开返回，是因为它们回答三个不同的问题：「我在这选了哪档」、
-        「实际会按哪档跑」、「为什么不是第一项」。合成一个值就会让界面不得不在
-        「显示用户的选择」和「显示真实行为」之间二选一，而两者都会误导。
-        """
-        session_level = await self.store.get_permission_level(user_id, session_id)
-        if self.levels is None:
-            return session_level, "", ""
-        workspace_id = await self.store.workspace_of(user_id, session_id)
-        resolution = await self.levels.resolve(
-            user_id, session_id=session_id, workspace_id=workspace_id
-        )
-        return session_level, str(resolution.level), resolution.binding
-
-    async def set_permission_level(
-        self, user_id: str, session_id: str, level: str
-    ) -> tuple[str, str, str]:
-        """写入本会话的档位上限，返回写入后的 (设置值, 生效值, 收紧者)。"""
-        await self.store.set_permission_level(user_id, session_id, level)
-        return await self.level_state(user_id, session_id)
-
     async def get(self, user_id: str, session_id: str) -> ConversationResponse:
         """返回一个会话的 Timeline 和服务器计算用量。"""
         records = await self.store.get_records(user_id.strip(), session_id.strip())
@@ -118,15 +90,11 @@ class History:
         # 任务状态是「还有没有没跑完的活」的权威来源：前端刷新后据此提示续跑，
         # 不再依赖 sessionStorage 里那份只存在于当前标签页的 pending 记录。
         task_status = await self.store.get_task_status(user_id, session_id)
-        session_level, effective, binding = await self.level_state(user_id, session_id)
         return ConversationResponse(
             timeline=_timeline(records),
             usage=usage_summary,
             plan=plan,
             task_status=task_status,
-            permission_level=session_level,
-            effective_permission_level=effective,
-            permission_binding=binding,
         )
 
 

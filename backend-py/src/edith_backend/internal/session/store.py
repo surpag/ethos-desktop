@@ -400,42 +400,6 @@ class SessionStore:
         await cursor.close()
         return (row["workspace_id"] or "") if row else ""
 
-    # ---- 会话级档位上限 ----
-    #
-    # 存的是**上限**不是最终值：最终生效档位由 service 层把用户级 / 工作区级 /
-    # 本次执行上限一起取最严者算出。所以这里读出空串是正常的——它表示「本会话
-    # 不额外收紧」，而不是「本会话是默认档」。
-
-    async def get_permission_level(self, user_id: str, session_id: str) -> str:
-        """读取本会话的档位上限；空串 = 未设置（不参与收紧）。"""
-        cursor = await self._db.execute(
-            "SELECT permission_level FROM session_meta "
-            "WHERE user_id = ? AND session_id = ?",
-            (user_id.strip(), session_id.strip()),
-        )
-        row = await cursor.fetchone()
-        await cursor.close()
-        return str(row["permission_level"] or "") if row else ""
-
-    async def set_permission_level(
-        self, user_id: str, session_id: str, level: str
-    ) -> None:
-        """写入本会话的档位上限；传空串表示撤销本会话的额外收紧。
-
-        空串必须是**显式**的「撤销」而不是「没传」：前者要把已有的值清掉，
-        后者不该动它。调用方（HTTP 层）负责区分这两种输入。
-        """
-        await self._db.execute(
-            """
-            INSERT INTO session_meta (user_id, session_id, permission_level)
-            VALUES (?, ?, ?)
-            ON CONFLICT(user_id, session_id)
-            DO UPDATE SET permission_level = excluded.permission_level
-            """,
-            (user_id.strip(), session_id.strip(), level),
-        )
-        await self._db.commit()
-
     # ---- 任务状态（断点续跑的恢复依据，与终止原因解耦）----
 
     async def set_task_status(self, user_id: str, session_id: str, status: str) -> None:

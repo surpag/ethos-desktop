@@ -17,7 +17,6 @@ from fastapi import APIRouter, File, Query, UploadFile, status
 
 from ..gitops.ssrf import CloneUrlRejected, assert_safe_clone_url
 from ..http_utils import EDITHError
-from ..permissions.policy import InvalidLevelValue, parse_level_input
 from .memory_store import WorkspaceMemoryStore
 from .store import DuplicateWorkspace, WorkspaceStore
 from .types import (
@@ -28,7 +27,6 @@ from .types import (
     InstructionRequest,
     InstructionResponse,
     WorkspaceCreateRequest,
-    WorkspaceLevelRequest,
     WorkspaceListResponse,
     WorkspaceMemoryCreateRequest,
     WorkspaceMemoryCreateResponse,
@@ -138,49 +136,9 @@ def build_workspace_router(
                     metadata=row["metadata"],
                     local_root=row["localRoot"],
                     git_remote_url=row["metadata"].get("gitRemoteUrl") or "",
-                    permission_level=row["permissionLevel"],
                 )
                 for row in rows
             ]
-        )
-
-    @router.put(
-        "/internal/workspaces/{workspace_id}/permission-level",
-        response_model=WorkspaceResponse,
-    )
-    async def set_permission_level(workspace_id: str, req: WorkspaceLevelRequest):
-        """设置/清除本工作区的档位上限。
-
-        语义是**上限**不是覆盖：它只能把这一档收得更严，不能把用户级的只读
-        放宽回完全（见 permissions/policy.py::resolve_chain）。
-
-        非法值 400 而不是静默改成最严档：用户选了完全却存成只读，界面与行为
-        不一致，他只会以为是自己没点对。
-        """
-        try:
-            level = parse_level_input(req.permission_level)
-        except InvalidLevelValue as exc:
-            raise EDITHError(
-                400,
-                "invalid_permission_level",
-                "permissionLevel 只能是 read_only / approval / full 或空",
-            ) from exc
-        updated = await store.set_permission_level(req.user_id, workspace_id, level)
-        if not updated:
-            raise EDITHError(404, "not_found", "workspace not found")
-        row = await store.get(req.user_id, workspace_id)
-        if row is None:  # 刚更新过还在，理论上到不了；到不了也要给一个可解释的结果
-            raise EDITHError(404, "not_found", "workspace not found")
-        logger.info(
-            "workspace %s permission ceiling set to %s", workspace_id, level or "(cleared)"
-        )
-        return WorkspaceResponse(
-            workspace_id=row["workspaceId"],
-            name=row["name"],
-            metadata=row["metadata"],
-            local_root=row["localRoot"],
-            git_remote_url=row["metadata"].get("gitRemoteUrl") or "",
-            permission_level=row["permissionLevel"],
         )
 
     @router.delete(

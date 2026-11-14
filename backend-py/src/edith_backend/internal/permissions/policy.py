@@ -227,36 +227,30 @@ class Resolution:
     errors: tuple[str, ...] = ()
 
 
-def resolve_chain(
-    *,
-    user: object = "",
-    workspace: object = "",
-    session: object = "",
-    ceiling: object = "",
-) -> Resolution:
-    """把多个作用域的档位 fold 成生效档位：**取最严者**。
+def resolve_chain(*, user: object = "", ceiling: object = "") -> Resolution:
+    """把用户级设置与本次执行上限折成生效档位：**取最严者**。
 
-    四个来源刻意用显式关键字参数而不是 `**sources`：拼错的来源名应当立刻
+    两个来源刻意用显式关键字参数而不是 `**sources`：拼错的来源名应当立刻
     `TypeError`，而不是被静默忽略掉——这条链是每轮 run 都跑的，一个打错的
-    kwarg 静默等于「这一级上限永远不生效」，而它在界面上看不出任何异常。
+    kwarg 静默等于「上限永远不生效」，而它在界面上看不出任何异常。
 
-    为什么子作用域只能收紧、不能放宽（这条是本节唯一的策略判断）：
+    为什么取最严而不是「后者胜」（这条是本节唯一的策略判断）：
 
-    - 档位是**安全边界**，不是偏好。会话能放宽到完全档，用户级设的只读就只是个
-      建议——而只读档的用处恰恰是「我确认这段对话不会写」；
-    - 同构的做法到处都是：OAuth 的 scope 只能缩、AWS 的权限边界只能减、
-      SELinux 的 bounding set 只能 drop。子层能加权限，边界就不叫边界。
+    - `user` 是用户**此刻**的意图，`ceiling` 是一次**授权记录**（定时任务创建时
+      用户允许它跑到几档）。授权记录不能比当前设置更宽：否则用户把档位调低之后，
+      历史定时任务成了例外——而例外恰恰在没人盯着的时候跑；
+    - 反方向是安全的：用户放宽之后，旧的严格快照仍会压住它，直到用户重新创建
+      任务。这是刻意的不便：自动执行宁可少做，不可多做。
 
-    所以「会话级 / 工作区级档位」在语义上是**上限（ceiling）**，不是覆盖（override）。
-    名字必须说清：叫覆盖，下一个人就会把 min 改成「后者胜」，而且看不出错。
+    没有第三、第四个来源：档位是「我允许 Agent 对我的机器做什么」，这个问题只有
+    一个回答者（用户设置）。工作区级 / 会话级上限曾经做过，已回退，见
+    `docs/archive/permissions-p3-scopes.md`。
 
-    空值 = 该来源未设置 = 不收紧（等价于默认档）。非法值 = 最严档
+    空值 = 该来源未设置 = 不参与收紧（等价于默认档）。非法值 = 最严档
     （`parse_level` 的既有约定：改坏一个字段不能提权）。
     """
     pairs = (
         ("user", user),
-        ("workspace", workspace),
-        ("session", session),
         ("ceiling", ceiling),
     )
     parsed: list[tuple[str, str, PermissionLevel]] = []
