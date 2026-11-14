@@ -15,7 +15,7 @@ from ..agentstream.types import Event
 from ..gateway.service import Service as GatewayService
 from ..gateway.types import WEB_CHANNEL, IncomingMessage
 from ..http_utils import EDITHError
-from .types import MessageRequest
+from .types import ApprovalDecisionRequest, MessageRequest
 
 
 def _gateway_error_to_http(error: Error) -> EDITHError:
@@ -116,4 +116,65 @@ class Adapter:
             if run_error is not None:
                 raise _gateway_error_to_http(run_error)
 
+        @router.get("/internal/approvals")
+        async def list_approvals(
+            userId: str = "", requestId: str = "", sessionId: str = ""
+        ) -> dict:
+            """待批准列表（刷新兜底）。
+
+            主路径是 SSE 的 `approval.requested`；这个接口只解决「刷新之后事件
+            日志已经归档」的情况，以及「切回会话时看一眼还有没有悬着的操作」。
+            """
+            items = await self.gateway.pending_approvals(
+                userId, request_id=requestId, session_id=sessionId
+            )
+            return {"approvals": [_approval_to_dict(item) for item in items]}
+
+        @router.post("/internal/approvals/{approval_id}")
+        async def decide_approval(
+            approval_id: str, body: ApprovalDecisionRequest
+        ) -> None:
+            """记录一次审批决策。
+
+            409 的语义是「你的点击来晚了」（另一个标签页先处理 / 已超时 / run 已取消），
+            不是错误：前端应静默关闭确认框，等 `approval.resolved` 事件同步终态。
+            """
+            decision = (body.decision or "").strip().lower()
+            if decision not in ("approve", "deny"):
+                raise EDITHError(
+                    400, "invalid_request", "decision must be 'approve' or 'deny'"
+                )
+            scope = (body.scope or "once").strip().lower()
+            if scope not in ("once", "run"):
+                scope = "once"
+            result = await self.gateway.decide_approval(
+                body.user_id, approval_id, approve=decision == "approve", scope=scope
+            )
+            if result == "not_found":
+                raise EDITHError(404, "not_found", "approval not found")
+            if result == "previous":
+                raise EDITHError(
+                    409, "approval_already_decided", "approval already decided"
+                )
+
         return router
+
+
+def _approval_to_dict(row: dict) -> dict:
+    """审批记录 → 前端契约（camelCase，与事件里的 approval 同构）。
+
+    刻意不带 `expiresAt`：落库时没有记（过期只对「正在等的那张票」有意义，
+    而那张票在进程内）。宁可不给，也不给一个永远是空串的字段——那会让前端
+    以为「这条不会过期」。
+    """
+    return {
+        "approvalId": row.get("approval_id", ""),
+        "requestId": row.get("request_id", ""),
+        "sessionId": row.get("session_id", ""),
+        "toolCallId": row.get("tool_call_id", ""),
+        "toolName": row.get("tool_name", ""),
+        "arguments": row.get("arguments", ""),
+        "capabilities": row.get("capabilities") or [],
+        "status": row.get("status", ""),
+        "scope": row.get("scope", ""),
+    }

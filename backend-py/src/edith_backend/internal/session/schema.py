@@ -83,6 +83,26 @@ _STATEMENTS = [
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 )""",
+    # 审批记录（P2-2）。**不是恢复依据**，只用于审计与刷新后展示：
+    # 进程死了那次被批准的调用也已经不存在，正确的处理是让 pending 变成 expired，
+    # 而不是让下一个进程去兑现一张过期的支票（对比 run_plans：计划必须能恢复，
+    # 因为不知道「做到第几步」会重做；审批不需要恢复，因为许可是针对某一次调用的）。
+    """CREATE TABLE IF NOT EXISTS run_approvals (
+    approval_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    tool_call_id TEXT NOT NULL,
+    tool_name TEXT NOT NULL,
+    capabilities TEXT NOT NULL DEFAULT '[]',   -- JSON 数组：它要什么权限
+    arguments TEXT NOT NULL DEFAULT '',        -- 原始参数串（截断）：它要做什么
+    status TEXT NOT NULL DEFAULT 'pending',    -- pending/approved/denied/expired/canceled
+    scope TEXT NOT NULL DEFAULT 'once',        -- once / run（仅 approved 有意义）
+    reason TEXT NOT NULL DEFAULT '',           -- 终止原因（诊断，不参与任何判定）
+    decided_by TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    decided_at TEXT
+)""",
 ]
 
 # 工作区归属索引：NULL = 普通对话（不属于任何工作区）
@@ -110,6 +130,15 @@ _INDEXES = [
     """CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_assistant_run_index
         ON chat_messages (user_id, session_id, role, request_id)
         WHERE request_id IS NOT NULL""",
+    # 一个 run 对同一次工具调用只会挂起一次：重复插入 = 有代码路径在重放裁决，
+    # 让它直接失败而不是在库里留两条互相矛盾的待批记录。
+    """CREATE UNIQUE INDEX IF NOT EXISTS run_approvals_call_index
+        ON run_approvals (request_id, tool_call_id)""",
+    # 刷新后按 run 取待批；按会话取是为了「切回来时看一眼还有没有悬着的操作」
+    """CREATE INDEX IF NOT EXISTS run_approvals_run_index
+        ON run_approvals (user_id, request_id, status)""",
+    """CREATE INDEX IF NOT EXISTS run_approvals_session_index
+        ON run_approvals (user_id, session_id, status)""",
 ]
 
 # 「一个工作区只能有一个未归档会话」的数据库不变式。

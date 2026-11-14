@@ -60,6 +60,13 @@ REASON_TOOL_UNKNOWN = "tool_unknown"
 REASON_INVALID_ARGUMENTS = "invalid_arguments"
 REASON_LEVEL_UNKNOWN = "level_unknown"
 
+#: 审批的四种「没有拿到许可」——都是拒绝，但对模型说的话完全不同：
+#: 前两个是「用户说了不行」，第三个是「这次运行被取消了」，第四个是「没人可问」。
+REASON_APPROVAL_DENIED = "approval_denied"
+REASON_APPROVAL_TIMEOUT = "approval_timeout"
+REASON_APPROVAL_CANCELED = "approval_canceled"
+REASON_APPROVAL_UNAVAILABLE = "approval_unavailable"
+
 
 @dataclass(frozen=True)
 class Verdict:
@@ -71,6 +78,22 @@ class Verdict:
     kind: str = ""
     reason: str = ""
     tool: str = ""
+
+    def granted(self) -> Verdict:
+        """用户批准之后的那份裁决：只解除档位裁决，不改任何其它字段。
+
+        `needed` / `level` 原样保留——它们是这次批准**覆盖了哪些能力**的记录，
+        抹掉就等于丢掉审计线索。特别地，这里**不**触碰安全约束：路径检查不在
+        这一层，批准也不会让它消失（见 docs/permissions-p2-approval.md §5）。
+        """
+        return Verdict(
+            allowed=True,
+            level=self.level,
+            needed=self.needed,
+            kind="",
+            reason="",
+            tool=self.tool,
+        )
 
     def error_payload(self) -> str:
         """拒绝时返回给模型的工具结果（结构化、可自救且明确「重试无用」）。"""
@@ -105,7 +128,7 @@ def _message(verdict: Verdict) -> str:
     if verdict.reason in (REASON_APPROVAL_REQUIRED,):
         return (
             f"当前档位「{label}」要求人工确认才能执行 {verdict.tool}"
-            f"（需要能力：{_caps_text(verdict.needed)}），而审批功能尚未启用"
+            f"（需要能力：{_caps_text(verdict.needed)}），本次执行没有完成确认"
         )
     if verdict.reason == REASON_LEVEL_UNKNOWN:
         return (
@@ -127,8 +150,8 @@ def _suggestion(verdict: Verdict) -> str:
         return "请重新生成这次调用，确保 arguments 是合法 JSON 对象。"
     if verdict.reason == REASON_APPROVAL_REQUIRED:
         return (
-            "不要重试。请把要执行的动作、目标路径和预期结果写清楚告诉用户，"
-            "由用户自己执行或调整权限档位。"
+            "不要原样重试。这次操作需要用户当场确认，而确认没有完成："
+            "请把要执行的动作、目标路径和预期结果写清楚告诉用户，由用户决定。"
         )
     return (
         "这是用户的权限设置，不是你的参数问题，重试无效。"
@@ -252,4 +275,51 @@ def evaluate_call(
         capabilities,
         registered=registered,
         level_was_invalid=level_was_invalid,
+    )
+
+
+#: 四种「没拿到许可」的措辞。分开写而不是一个模板，因为模型要靠它决定下一步：
+#: 被拒 = 换个做法；超时/取消 = 报告现状；没人可问 = 说明这是自动任务。
+_APPROVAL_TEXT: dict[str, tuple[str, str]] = {
+    REASON_APPROVAL_DENIED: (
+        "用户拒绝了这次操作，{tool} 未执行",
+        "不要重试同一个调用。请问用户希望怎么改，或改用不需要该权限的做法。",
+    ),
+    REASON_APPROVAL_TIMEOUT: (
+        "等待用户确认超时（{tool} 未执行）",
+        "用户可能没看到确认请求。请先汇报当前进展，并说明还需要这一步才能继续。",
+    ),
+    REASON_APPROVAL_CANCELED: (
+        "等待确认期间本次运行被取消，{tool} 未执行",
+        "本次运行已结束，不要再发起该操作。",
+    ),
+    REASON_APPROVAL_UNAVAILABLE: (
+        "这是无人值守的自动执行，{tool} 需要用户当场确认，因此未执行",
+        "自动任务不能弹确认框。请改用不需要写入/执行的方案；"
+        "确实需要时，请让用户手动执行或把该任务的权限档位调高。",
+    ),
+}
+
+
+def approval_refusal(verdict: Verdict, reason: str) -> str:
+    """没拿到许可时返回给模型的工具结果。
+
+    `kind` 恒为 `permission_denied`：四种原因都是**确定性**拒绝，重试同一个调用
+    必然还是同样的结局，因此不计熔断（`kind_counts_toward_breaker` 只认
+    `tool_failure`）。原因放在 `reason` 里，让模型读到「为什么」而不是「不许」。
+    """
+    message, suggestion = _APPROVAL_TEXT.get(
+        reason, ("{tool} 未执行：没有拿到用户确认", "不要重试同一个调用。")
+    )
+    return json.dumps(
+        {
+            "error": message.format(tool=verdict.tool),
+            "kind": PERMISSION_DENIED,
+            "retryable": False,
+            "level": str(verdict.level),
+            "needed": sorted(str(cap) for cap in verdict.needed),
+            "reason": reason,
+            "suggestion": suggestion,
+        },
+        ensure_ascii=False,
     )

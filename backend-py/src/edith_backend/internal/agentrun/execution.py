@@ -44,6 +44,7 @@ from ..trace import (
     new_tracer,
 )
 from ..usage.types import Tokens
+from .approval import ApprovalDesk, resolve_approval
 from .configuration import ConfiguredRun
 from .progress import ProgressRecorder
 from .run_log import RunEventLog
@@ -1145,8 +1146,10 @@ async def chat(
     tracer: Tracer | None = None,
     plans: RunPlanRegistry | None = None,
     progress: ProgressRecorder | None = None,
+    approvals: ApprovalDesk | None = None,
     *,
     permission_level: PermissionLevel,
+    interactive: bool = True,
 ) -> tuple[Tokens, str, int, str, int, str]:
     """执行一次流式对话（含工具调用循环）。
 
@@ -1154,6 +1157,11 @@ async def chat(
 
     `permission_level`：本次 run 的**生效档位**，由 service 层解析后显式传入。
     刻意不给默认值——漏传时必须立刻报错，而不是安静地按某个默认档位跑完整个任务。
+
+    `interactive`：本次执行**有没有人在场**。默认 True（Web/IM）；定时任务传 False，
+    此时审批档不会挂起等人，而是直接拒绝（`approval_unavailable`）。判断依据是
+    「谁发起的」这个确定事实，不是「用户此刻是否在线」——后者会让同一条定时任务
+    在不同时刻走不同路径。
 
     第一轮模型调用沿「当前模型 → 回退候选」尝试：openai SDK 的 max_retries=2
     已对网络/5xx/超时等可重试错误做指数退避重试，重试后仍失败才回退到下一个
@@ -1225,6 +1233,9 @@ async def chat(
     read_cache: dict[str, str] = {}
     # 本次新增：累积本轮工具调用记录，收尾时随 assistant 消息持久化（供刷新后历史展示）
     tool_call_records: list[dict[str, str]] = []
+    # 本次运行内被「全部允许」的工具名（scope=run）。**只活在内存**：run 结束即失效。
+    # 刻意不落库回读——一个能被读回来放行的内存等价物，就是一个跨 run 的提权开关。
+    approval_grants: set[str] = set()
 
     def emit(event: Event) -> None:
         """唯一出口：先送事件日志（可重放），再喂进度落库（刷新后可见）。
@@ -1584,6 +1595,29 @@ async def chat(
         ]
         messages.append(assistant_msg)
 
+        async def _apply_approval(
+            verdict: Verdict, tc: dict, tool_step: Any
+        ) -> tuple[Verdict, str | None]:
+            """审批档的挂起。返回 (最终裁决, 拒绝结果或 None)。
+
+            逻辑在 `approval.resolve_approval`（可单测）；这里只补上本 run 的上下文。
+            """
+            outcome = await resolve_approval(
+                verdict,
+                tool_call_id=tc["id"],
+                arguments=tc.get("arguments", ""),
+                grants=approval_grants,
+                desk=approvals,
+                interactive=interactive,
+                user_id=user_id,
+                session_id=session_id,
+                request_id=request_id,
+                emit=emit,
+            )
+            if outcome.meta:
+                tool_step.metadata["approval"] = outcome.meta
+            return outcome.verdict, outcome.refusal
+
         async def _run_one(tc: dict) -> tuple[str, Materialized, float, bool]:
             """执行单个工具，返回 (原始结果, 定型结果, 耗时 ms, 是否只读)。
 
@@ -1623,11 +1657,18 @@ async def chat(
                         )
                     ),
                 )
+                # 审批档的挂起在这里：裁决说「需要确认」时，这一行会阻塞到
+                # 用户决策 / 超时 / 取消。其余档位原样返回，不看也不等。
+                verdict, approval_denial = await _apply_approval(verdict, tc, tool_step)
                 tool_step.metadata["permission"] = _permission_metadata(verdict)
                 if not verdict.allowed:
                     # 拒绝也走完整的结果链路（trace / toast / 模型历史 / 工具卡），
                     # 否则「被拒绝」在系统里等于「没发生过」。
-                    result = verdict.error_payload()
+                    result = (
+                        approval_denial
+                        if approval_denial is not None
+                        else verdict.error_payload()
+                    )
                     logger.info(
                         "tool_denied request_id=%s tool_name=%s level=%s reason=%s needed=%s",
                         request_id,

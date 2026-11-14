@@ -62,6 +62,24 @@ class PlanSnapshot(BaseModel):
     items: list[PlanItemSnapshot] = Field(default_factory=list)
 
 
+class ApprovalSnapshot(BaseModel):
+    """一次待批准的调用（`approval.requested` / `approval.resolved` 携带）。
+
+    刻意只带「让人能做决定」的信息：哪一个工具、什么参数、要哪些能力、什么时候失效。
+    不带决策接口的路径或令牌——前端按 approvalId 调固定接口，鉴权在接口里做。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    approval_id: str
+    tool_call_id: str
+    tool_name: str
+    arguments: str = ""
+    capabilities: list[str] = Field(default_factory=list)
+    status: str = "pending"
+    expires_at: str = ""
+
+
 class Event(BaseModel):
     """AgentRun 向所有渠道输出的唯一事件格式。
 
@@ -111,5 +129,8 @@ class Event(BaseModel):
     # 计划快照：plan.updated 事件携带最新整份；run.completed 携带最终态。
     # 计划项标 done 必须绑定本轮真实工具调用，verified 由服务端核对后写入。
     plan: PlanSnapshot | None = None
+    # 审批卡片：approval.requested 携带待批信息，approval.resolved 携带终态。
+    # 走同一个事件日志，所以刷新/断流重连后仍能看到「有一条操作在等你确认」。
+    approval: ApprovalSnapshot | None = None
     # 本轮耗时（毫秒）：run.started → 终态事件。仅终态事件携带，供 UI 展示"完成时长"
     duration_ms: int | None = None

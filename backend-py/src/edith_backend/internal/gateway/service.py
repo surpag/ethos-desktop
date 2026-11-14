@@ -120,6 +120,28 @@ class Service:
         """停止一个属于某个用户的活跃任务。"""
         return self.agent_runs.cancel(user_id, request_id)
 
+    async def decide_approval(
+        self, user_id: str, approval_id: str, *, approve: bool, scope: str = "once"
+    ) -> str:
+        """一次审批决策（ok / not_found / previous）。
+
+        审批不经过渠道翻译：它认的是「哪个用户对哪一条待批说了什么」，与渠道无关。
+        """
+        if not user_id.strip() or not approval_id.strip():
+            return "not_found"
+        return await self.agent_runs.decide_approval(
+            user_id.strip(), approval_id.strip(), approve=approve, scope=scope
+        )
+
+    async def pending_approvals(
+        self, user_id: str, *, request_id: str = "", session_id: str = ""
+    ) -> list[dict]:
+        if not user_id.strip():
+            return []
+        return await self.agent_runs.pending_approvals(
+            user_id.strip(), request_id=request_id, session_id=session_id
+        )
+
 
 def new_service(agent_runs: AgentRunService) -> Service:
     """创建 Gateway；它不会创建 AgentRun 或渠道 Adapter。"""

@@ -43,6 +43,7 @@ from .internal.sandbox import Service as SandboxService
 from .internal.sandbox import create_schema as create_sandbox_schema
 from .internal.session import SessionStore
 from .internal.session import create_schema as create_session_schema
+from .internal.session.approval_store import ApprovalStore
 from .internal.session.constraint_store import ConstraintStore
 from .internal.session.plan_store import RunPlanStore
 from .internal.skills import HTTP as SkillsHTTP
@@ -195,11 +196,23 @@ async def lifespan(app: FastAPI):
             constraints=ConstraintStore(db),
             plans=run_plans,
             plan_store=plan_store,
+            approval_store=ApprovalStore(db),
             tool_definitions=tools.tool_definitions(),
             tool_executor=tools,
             traces=traces,
         )
     )
+    # 上一个进程遗留的待批准已经没有等待者了：留着它们，界面上会出现一张
+    # 「永远在等你确认」的幽灵卡片。run 侧的 task_status 仍是 in_progress，
+    # 走既有的续跑，与这里的过期处理互不依赖（见 docs/permissions-p2-approval.md）。
+    if agent_runs.approvals is not None:
+        try:
+            expired = await agent_runs.approvals.expire_stale()
+            if expired:
+                logger.info("approval_expired_on_startup count=%d", expired)
+        except Exception:  # 清理失败不阻塞启动
+            logger.warning("expire stale approvals failed", exc_info=True)
+
     gateway = new_gateway_service(agent_runs)
     web = Adapter(gateway)
     cron_adapter = CronAdapter(gateway)

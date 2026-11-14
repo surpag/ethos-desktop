@@ -556,6 +556,37 @@ def test_git_add_directory_ignores_gitignored_secrets(tmp_path, monkeypatch) -> 
     asyncio.run(body())
 
 
+def test_approval_cannot_bypass_sensitive_paths(sandbox_tools, tmp_path) -> None:
+    """批准只解除**档位**那一层；安全约束在工具内部，与批准无关。
+
+    这条是结构性的：`policy` 不认识路径，`sandbox/tools.py` 不认识档位。
+    写成「批准后重新裁决一次」就守不住了——那时批准会把两者一起放开。
+    """
+    verdict = evaluate_call(
+        APPROVAL, "sandbox_write_file", {"path": "work/.env", "content": "T=1"}
+    )
+    assert verdict.kind == APPROVAL_REQUIRED
+    granted = verdict.granted()
+    assert granted.allowed is True
+    assert granted.needed == verdict.needed  # 批准覆盖了哪些能力，原样留作审计
+
+    async def body() -> None:
+        result = json.loads(
+            await sandbox_tools.execute(
+                "sandbox_write_file",
+                {"path": "work/.env", "content": "T=1"},
+                "u1",
+                "s1",
+                "",
+            )
+        )
+        assert result["kind"] == PERMISSION_DENIED
+        assert result["reason"] == "sensitive_path"
+        assert not (tmp_path / "sandbox" / "u1" / "s1" / "work" / ".env").exists()
+
+    asyncio.run(body())
+
+
 def _make_link(link, target, *, directory: bool) -> bool:
     """在 `link` 处建一个指向 `target` 的链接/联接；不支持时返回 False。
 

@@ -30,6 +30,9 @@ class IncomingMessage:
     workspace_id: str = ""
     #: 本次执行的档位上限（定时任务的权限快照）。空 = 只看用户当前设置。
     permission_level: str = ""
+    #: 本次执行**有没有人在场**。Web/IM 为 True；定时任务为 False（审批不等人）。
+    #: 判断依据是「谁发起的」这个确定事实，不是「用户此刻是否在线」。
+    interactive: bool = True
 
 
 def to_agentrun_request(msg: IncomingMessage, user_id: str, session_id: str) -> Request:
@@ -45,4 +48,5 @@ def to_agentrun_request(msg: IncomingMessage, user_id: str, session_id: str) -> 
         reasoning_option_id=msg.reasoning_option_id,
         workspace_id=msg.workspace_id,
         permission_level=msg.permission_level,
+        interactive=msg.interactive,
     )

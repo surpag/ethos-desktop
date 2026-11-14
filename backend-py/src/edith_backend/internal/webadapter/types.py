@@ -27,3 +27,18 @@ class MessageRequest(BaseModel):
     model_id: str = ""
     reasoning_option_id: str = ""
     workspace_id: str = ""
+
+
+class ApprovalDecisionRequest(BaseModel):
+    """一次审批决策。`userId` 由 BFF 在服务端注入，不信任浏览器传来的身份。"""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="forbid",
+    )
+
+    user_id: str
+    decision: str  # approve / deny
+    #: once = 只这一次；run = 本次运行内同名工具不再问（不跨 run）
+    scope: str = "once"

@@ -31,6 +31,9 @@ class Request:
     #: 本次执行的档位**上限**（定时任务的权限快照）。空 = 用用户当前设置。
     #: 生效档位由 service 层取「当前设置」与它的更严者，不在这里解析。
     permission_level: str = ""
+    #: 本次执行**有没有人在场**：False 时审批档不会挂起等人，而是直接拒绝。
+    #: 由渠道声明（Web/IM = True，定时任务 = False），不由「用户是否在线」推断。
+    interactive: bool = True
 
 
 @dataclass

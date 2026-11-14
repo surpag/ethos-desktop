@@ -33,6 +33,9 @@ class Adapter:
                 request_id=uuid4().hex,
                 message=job.prompt,
                 permission_level=job.permission_level,
+                # 无人值守：审批档下需要确认的调用**不会**等人（没人可问），
+                # 而是直接拒绝。让它挂起等于把会话锁死到一个永远不会来的点击上。
+                interactive=False,
             )
         )
         if run_error is not None:

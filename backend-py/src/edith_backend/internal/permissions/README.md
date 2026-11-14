@@ -66,6 +66,17 @@ plan_update = {METADATA}
 熔断判据是 `kind == tool_failure`。旧实现用 `retryable is False` 反推，于是只读档下
 连试三次写文件 = 三次「系统故障」= 整轮任务被杀。
 
+## 审批（`approval_required` 现在真的会等人）
+
+`policy.py` 只负责说「这一次需要人确认」，**不负责等**——等待在
+`agentrun/approval.py`（进程内）与 `session/approval_store.py`（审计）里。
+这样切开的好处：`policy` 保持纯函数，审批基础设施不可用时（无落库端、定时任务）
+它照样给出正确裁决，只是那句话变成「没人在场」。
+
+三种「没拿到许可」的原因分开写（`approval_denied` / `approval_timeout` /
+`approval_canceled` / `approval_unavailable`），因为模型对它们的正确反应不同：
+被拒要换做法，超时/取消要报告现状，没人可问要说明这是自动任务。
+
 ## 上下文（`context.py`）
 
 只用于**记录**（`create_cron_job` 写权限快照），不用于**判断**。默认值是 `None`：

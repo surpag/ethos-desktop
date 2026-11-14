@@ -20,6 +20,7 @@ from ..agentstream.outcome import derive_outcome
 from ..agentstream.types import APIError, Event, SessionUsage
 from ..models.catalog import DEFAULT_MODEL_ID, Catalog, ModelDefinition
 from ..permissions.policy import resolve_level
+from ..session.approval_store import ApprovalStore
 from ..session.constraint_store import ConstraintStore, constraints_enabled
 from ..session.plan_store import RunPlanStore
 from ..session.store import SessionStore, WorkspaceSessionConflict
@@ -43,6 +44,7 @@ from ..usage.recorder import Recorder, RunAlreadyExists
 from ..usage.types import Run, Summary, Tokens
 from ..userconfig.providers import Providers
 from ..userconfig.settings import Settings
+from .approval import ApprovalDesk
 from .configuration import ConfiguredRun, RunConfigurations
 from .execution import (
     ToolCircuitBreakerError,
@@ -83,6 +85,8 @@ class Dependencies:
     plans: RunPlanRegistry | None = None
     # 计划快照表：续跑时从这里取「上次排到哪一步」（注册表在 run 结束时已清空）
     plan_store: RunPlanStore | None = None
+    # 审批记录的落库端；为 None 时审批档退化为「不等待、直接拒绝」
+    approval_store: ApprovalStore | None = None
     tool_definitions: list[dict] = field(default_factory=list)
     tool_executor: object | None = None
     traces: TraceStore | None = None
@@ -117,6 +121,11 @@ class Service:
         self.constraints = deps.constraints
         self.plans = deps.plans
         self.plan_store = deps.plan_store
+        # 审批等待台：一个 Service 一份，按 approval_id 分键（跨 run 共享）。
+        # 没有落库端就没有等待台 —— 此时审批档直接拒绝，而不是装作能等人。
+        self.approvals = (
+            ApprovalDesk(deps.approval_store) if deps.approval_store is not None else None
+        )
         self.usage = deps.usage
         self.tool_definitions = deps.tool_definitions
         self.tool_executor = deps.tool_executor
@@ -388,8 +397,31 @@ class Service:
         if run is None or run.user_id != user_id:
             return Error("not_found", "agent run not found")
         self.user_stops.mark(request_id)
+        # 先唤醒审批等待者再取消 task：反过来会留下一个「没人唤醒的 await」，
+        # 表现为取消之后要等满审批超时才真正结束。
+        if self.approvals is not None:
+            self.approvals.cancel_run(request_id)
         run.task.cancel()
         return None
+
+    async def decide_approval(
+        self, user_id: str, approval_id: str, *, approve: bool, scope: str = "once"
+    ) -> str:
+        """记录一次审批决策。返回 ok / not_found / previous（HTTP 层映射 404 / 409）。"""
+        if self.approvals is None:
+            return "not_found"
+        return await self.approvals.decide(
+            user_id, approval_id, approve=approve, scope=scope
+        )
+
+    async def pending_approvals(
+        self, user_id: str, *, request_id: str = "", session_id: str = ""
+    ) -> list[dict]:
+        if self.approvals is None:
+            return []
+        return await self.approvals.pending(
+            user_id, request_id=request_id, session_id=session_id
+        )
 
     # 标记事件开始，取消，结束，记录过程中的token消耗。在关闭事件前先关闭mcp连接
     async def _run(
@@ -503,7 +535,9 @@ class Service:
                 tracer=tracer,
                 plans=self.plans,
                 progress=progress,
+                approvals=self.approvals,
                 permission_level=permission_level,
+                interactive=request.interactive,
             )
             # 任务状态：仅"模型主动完成"写 completed 并清进度；
             # rounds_exhausted 等未完成终止保持 in_progress（供下次续跑）
@@ -623,6 +657,18 @@ class Service:
             # 否则注册表里会留下一条「活跃计划」，下次同会话的 run 只能覆盖它。
             if self.plans is not None:
                 self.plans.close(request.request_id)
+            # 审批同理，但落库口径不同：run 都结束了还没人决策的那条待批，
+            # 再也不可能被批准（没有等待者了）。留在库里就是一张幽灵卡片，
+            # 刷新后还会提示用户来点一个点了也没用的按钮。
+            if self.approvals is not None:
+                try:
+                    await self.approvals.close_run(request.request_id, "run_ended")
+                except Exception:  # 收尾失败不影响 run 的结论
+                    logger.warning(
+                        "close pending approvals failed request_id=%s",
+                        request.request_id,
+                        exc_info=True,
+                    )
             self.lanes.release(request.user_id, request.session_id, request.request_id)
             self.workspace_lanes.release(
                 request.user_id, request.workspace_id, request.session_id
