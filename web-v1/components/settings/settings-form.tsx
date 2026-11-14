@@ -31,7 +31,6 @@ import { formatContextWindow } from "@/lib/models/type";
 import { notifyModelsChanged } from "@/lib/models/events";
 import type { UserSettingsResponse, PermissionLevel } from "@/lib/userconfig/type";
 import { CustomModelDialog } from "./custom-model-dialog";
-import { WorkspacePermissions } from "./workspace-permissions";
 import { WorkspaceSettings } from "./workspace-settings";
 
 const NEW_PROVIDER = "__new__";
@@ -386,7 +385,6 @@ export function SettingsForm() {
               ? "正在读取当前档位…"
               : "敏感路径（.git、.ssh、密钥、凭据等）在任何档位下都不可读写；这是平台的安全约束，与档位无关。"}
           </p>
-          <WorkspacePermissions />
         </section>
 
         <section className="ui-surface overflow-hidden">
