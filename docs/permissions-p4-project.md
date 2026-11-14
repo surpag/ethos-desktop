@@ -74,7 +74,13 @@ OAuth 的 scope 只能缩，因为子层是**别人的应用**，扩权就是越
 | HTTP | `PUT /internal/workspaces/{id}/permission-level` | `{"userId","permissionLevel"}`；空串 = 清除；非法值 400（不静默降级） |
 | 响应 | `WorkspaceResponse.permissionLevel` | 列表与创建/重命名都带 |
 | BFF | `PUT /api/workspaces/{id}/permission-level` | 注入 `userId`，其余透传 |
-| 前端 | 设置 → 工作区指令 → 执行权限 | 四选一：跟随用户设置 / 只读 / 每次确认 / 完全 |
+| 前端 | 设置 → **执行权限** → 底部「按项目覆盖」列表 | 每行一个工作区，四选一：跟随用户设置 / 只读 / 每次确认 / 完全；改完即生效（无保存按钮） |
+
+**位置为什么在和全局档位同一段**：档位回答的是「Agent 能对这些文件做什么」，
+它就该长在提出这个问题的地方。第一版把这段放在「工作区指令」编辑器里、还要求先在
+下拉里选中一个工作区才渲染——一个必须「先选中才可能看到」的开关，等于默认不存在，
+用户打开设置找了两次都没找到。改成固定列表后，打开就能看见自己有哪些项目、各自是
+哪一档，也顺带回答了「哪些项目没跟全局」。
 
 解析入口仍是单一函数 `chain.resolve_effective_level(load_user, user_id,
 load_workspace=..., workspace_id=..., ceiling=...)`，run 执行只调它一次；
