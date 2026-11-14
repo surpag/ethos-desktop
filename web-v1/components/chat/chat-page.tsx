@@ -22,6 +22,7 @@ import type { AvailableModelCatalogResponse, ModelInfo } from "@/lib/models/type
 import { subscribeModelsChanged } from "@/lib/models/events";
 
 import { ChatComposer } from "./chat-composer";
+import { PermissionMenu } from "./permission-menu";
 import { ConversationList } from "./conversation-list";
 import { TimelineView, type TimelineRunNotice } from "./timeline";
 import { SandboxPanel } from "./sandbox-panel";
@@ -1138,6 +1139,15 @@ export function ChatPage() {
           onModelChange={selectModel}
           onReasoningOptionChange={setReasoningOptionID}
           onSend={sendMessage}
+          toolbarLeading={
+            <PermissionMenu
+              disabled={activeRunning || !!activeSession.archived}
+              workspaceID={activeWorkspaceID}
+              workspaceName={
+                workspaces.find((item) => item.workspaceId === activeWorkspaceID)?.name
+              }
+            />
+          }
           topLeft={
             <WorkspaceSwitcher
               ref={workspaceSwitcherRef}

@@ -323,3 +323,63 @@ def test_project_level_route_404_for_unknown_workspace(client) -> None:
         json={"userId": "u1", "permissionLevel": "full"},
     )
     assert response.status_code == 404
+
+
+# ── 六、全局档位专用写入路由（聊天页档位菜单在没有工作区时用它）─────
+
+
+def test_user_level_route_changes_only_the_level(client) -> None:
+    """改全局档位不许顺手冲掉别的设置。
+
+    这条路径存在的原因就是「只为改一个下拉，不该回写整份设置」——所以用例也
+    必须盯住这一点：先写一套人格/默认模型，改档位之后它们必须原封不动。
+    如果哪天有人把它实现成「PUT 整份设置」，这个断言会立刻红。
+    """
+    user = "test-scope-user-level"
+    saved = client.put(
+        "/internal/user-settings",
+        json={
+            "userId": user,
+            "personality": "简洁",
+            "defaultModelId": "qwen3.7-flash",
+            "timezone": "Asia/Shanghai",
+            "permissionLevel": "approval",
+            "providers": [],
+        },
+    )
+    assert saved.status_code == 200, saved.text
+
+    response = client.put(
+        "/internal/user-settings/permission-level",
+        json={"userId": user, "permissionLevel": "read_only"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["permissionLevel"] == "read_only"
+
+    settings = client.get("/internal/user-settings", params={"userId": user}).json()
+    assert settings["permissionLevel"] == "read_only"
+    assert settings["personality"] == "简洁"
+    assert settings["defaultModelId"] == "qwen3.7-flash"
+    assert settings["timezone"] == "Asia/Shanghai"
+
+
+def test_user_level_route_rejects_invalid_value(client) -> None:
+    response = client.put(
+        "/internal/user-settings/permission-level",
+        json={"userId": "test-scope-user-invalid", "permissionLevel": "god_mode"},
+    )
+    assert response.status_code == 400
+
+    # 非法值没写进去：读回来仍是默认档，不是「最严档」也不是那个非法值
+    settings = client.get(
+        "/internal/user-settings", params={"userId": "test-scope-user-invalid"}
+    ).json()
+    assert settings["permissionLevel"] == "full"
+
+
+def test_user_level_route_requires_user_id(client) -> None:
+    response = client.put(
+        "/internal/user-settings/permission-level",
+        json={"userId": "   ", "permissionLevel": "full"},
+    )
+    assert response.status_code == 400

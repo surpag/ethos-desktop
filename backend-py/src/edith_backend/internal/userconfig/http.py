@@ -8,7 +8,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from ..http_utils import EDITHError
-from ..permissions.policy import parse_level
+from ..permissions.policy import InvalidLevelValue, parse_level, parse_level_input
 from .gitcredentials import GitCredentials
 from .providers import Providers
 from .settings import Settings
@@ -16,6 +16,8 @@ from .types import (
     AgentSettings,
     GitCredentialRequest,
     GitCredentialsResponse,
+    PermissionLevelRequest,
+    PermissionLevelResponse,
     ProviderCredentialState,
     SettingsRequest,
     SettingsResponse,
@@ -102,6 +104,36 @@ class HTTP:
             )
             await self.providers.save(user_id, credentials)
             return await self._write_settings(user_id)
+
+        @router.put(
+            "/internal/user-settings/permission-level",
+            response_model=PermissionLevelResponse,
+        )
+        async def save_permission_level(
+            body: PermissionLevelRequest,
+        ) -> PermissionLevelResponse:
+            """只改用户级执行档位。
+
+            存在的理由：聊天页输入框旁边的档位菜单要能在「没有工作区」时改全局档，
+            而整份设置接口要求 personality / defaultModelId / providers 全套字段——
+            为了一个下拉去回写整份设置，等于给这条路径一个顺手冲掉别的字段的机会。
+
+            非法值 400（`parse_level_input`），不静默降级：写侧静默降级会让用户
+            以为「完全」存住了，实际库里是只读。
+            """
+            user_id = body.user_id.strip()
+            if not user_id:
+                raise EDITHError(400, "invalid_request", "userId is required")
+            try:
+                level = parse_level_input(body.permission_level)
+            except InvalidLevelValue as exc:
+                raise EDITHError(
+                    400,
+                    "invalid_permission_level",
+                    "permissionLevel 只能是 read_only / approval / full 或空",
+                ) from exc
+            await self.settings.save_permission_level(user_id, level)
+            return PermissionLevelResponse(permission_level=level)
 
         @router.get("/internal/git-credentials", response_model=GitCredentialsResponse)
         async def get_git_credentials(userId: str = "") -> GitCredentialsResponse:

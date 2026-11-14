@@ -93,6 +93,32 @@ class SettingsResponse(BaseModel):
     providers: list[ProviderCredentialState]
 
 
+class PermissionLevelRequest(BaseModel):
+    """PUT /internal/user-settings/permission-level 的请求体。
+
+    只改这一列。刻意不复用 `SettingsRequest`：那个接口要 personality、
+    defaultModelId、providers 全套字段，聊天页为了改一个下拉去回写整份设置，
+    等于给了它一个「顺手冲掉别的字段」的机会。这里少一个字段就少一条路。
+    """
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="forbid",
+    )
+
+    user_id: str = ""
+    permission_level: str = ""
+
+
+class PermissionLevelResponse(BaseModel):
+    """写入后的用户级档位（已归一：非法值在写侧就被拒了）。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    permission_level: str
+
+
 class GitCredentialRequest(BaseModel):
     """浏览器提交的 Git 凭据（PAT）。userId 由 BFF 注入。"""
 

@@ -27,6 +27,9 @@ type ChatComposerProps = {
   onReasoningOptionChange: (reasoningOptionID: string) => void;
   onSend: (message: string, imageIDs: string[], uploadPaths: string[]) => Promise<boolean>;
   topLeft?: ReactNode;
+  // 工具栏里模型选择器左边的插槽（执行档位菜单）。做成插槽而不是在这里
+  // 直接取数：输入框不该知道工作区、档位、接口这些东西。
+  toolbarLeading?: ReactNode;
 };
 
 type SelectedImage = {
@@ -53,6 +56,7 @@ export function ChatComposer({
   onReasoningOptionChange,
   onSend,
   topLeft,
+  toolbarLeading,
 }: ChatComposerProps) {
   const [message, setMessage] = useState("");
   const [images, setImages] = useState<SelectedImage[]>([]);
@@ -213,6 +217,7 @@ export function ChatComposer({
           <button aria-label="添加图片" className="ui-icon-button disabled:cursor-not-allowed disabled:text-faint" disabled={!canUseVision || isLoading || isRunning || isSending || archived} onClick={() => imageInput.current?.click()} title={canUseVision ? "添加图片" : "当前模型不支持图片识别"} type="button"><ImagePlus className="size-4" /></button>
           <button aria-label="添加文件" className="ui-icon-button disabled:cursor-not-allowed disabled:text-faint" disabled={isLoading || isRunning || isSending || archived} onClick={() => fileInput.current?.click()} title="添加文件（单个不超过 50MB）" type="button"><FileUp className="size-4" /></button>
           <span className="mx-1 h-4 w-px bg-border" aria-hidden />
+          {toolbarLeading}
           <ModelPicker
               disabled={isLoading || isRunning || isSending || archived}
             modelID={modelID}
