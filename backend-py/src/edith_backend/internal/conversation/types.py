@@ -57,6 +57,42 @@ class ConversationResponse(BaseModel):
     # 这是「还有没跑完的活」的**权威来源**：刷新后仍然存在，
     # 不依赖前端 sessionStorage 里那份一次性的 pending 记录。
     task_status: str | None = None
+    # 本会话设置的档位**上限**（空 = 未设置）。
+    permission_level: str = ""
+    # 实际生效档位：与用户级 / 工作区级取最严者。**界面应当展示这个**，
+    # 否则用户在会话里选了「完全」、看到的下拉也是「完全」，而实际按只读在跑。
+    effective_permission_level: str = ""
+    # 把档位压到 effective 的那一级（user/workspace/session）；空 = 没人收紧。
+    # 用途只有一个：让「为什么不是完全档」有答案，而不是让用户以为开关坏了。
+    permission_binding: str = ""
+
+
+class ConversationLevelRequest(BaseModel):
+    """PUT /internal/conversations/{id}/permission-level 的请求体。
+
+    传三档之一 = 设置本会话上限；传 `""` = 清除（回到「本会话不额外收紧」）。
+    非法值 400，不静默降级。
+    """
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="forbid",
+    )
+
+    user_id: str = Field(..., min_length=1)
+    permission_level: str = ""
+
+
+class ConversationLevelResponse(BaseModel):
+    """写入后的档位状态：设置值 + 生效值 + 收紧者（三者的区别见 History.level_state）。"""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    session_id: str
+    permission_level: str = ""
+    effective_permission_level: str = ""
+    permission_binding: str = ""
 
 
 class UserImage(BaseModel):

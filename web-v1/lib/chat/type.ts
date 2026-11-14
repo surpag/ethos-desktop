@@ -171,6 +171,13 @@ export type ConversationResponse = {
    *  这是「还有没跑完的活」的权威来源：刷新后仍然存在，
    *  不依赖 sessionStorage 里那份只属于当前标签页的 pending 记录。 */
   taskStatus?: string | null;
+  /** 本会话设置的档位**上限**（空 = 未设置，不额外收紧） */
+  permissionLevel?: string;
+  /** 实际生效档位：已与用户级 / 工作区级取最严。
+   *  界面必须显示这个 —— 显示用户选的值会出现「选了完全、实际只读」的静默偏差。 */
+  effectivePermissionLevel?: string;
+  /** 把档位压到 effective 的那一级：user / workspace / session（空 = 没人收紧） */
+  permissionBinding?: string;
 };
 
 /** 计划项状态。四档是固定的：多一档就多一种「自己发明语义」的机会。 */

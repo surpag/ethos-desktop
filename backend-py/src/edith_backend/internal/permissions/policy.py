@@ -179,23 +179,112 @@ def min_level(left: PermissionLevel, right: PermissionLevel) -> PermissionLevel:
     return left if LEVEL_ORDER.index(left) <= LEVEL_ORDER.index(right) else right
 
 
-def resolve_level(current_raw: object, ceiling_raw: object = "") -> PermissionLevel:
-    """算出一次 run 的生效档位。
+class InvalidLevelValue(ValueError):
+    """写入侧的档位取值非法。"""
 
-    `current_raw`：用户当前设置。
-    `ceiling_raw`：本次执行的额外上限（定时任务创建时的快照）。
+    def __init__(self, raw: object) -> None:
+        self.raw = str(raw or "")
+        super().__init__(f"invalid permission level: {self.raw!r}")
 
-    为什么取更严的一档而不是直接信快照：
-    - 只看当前值 → 「改一次全局设置」等于给所有历史任务批量重新授权，不用经过
-      任何准入检查；
-    - 只看快照 → 用户把档位调低之后，定时任务成了这条意图的例外。
+
+def parse_level_input(raw: object) -> str:
+    """**写**侧严格校验：返回规范化字符串，空串表示「清除本作用域的限制」。
+
+    与 `parse_level` 的分工必须分清，否则两处会互相污染：
+
+    - `parse_level` 是**读**侧的容错解析：库里的值可能是历史脏数据，遇到非法值
+      降级到最严档（fail-closed），因为「读不懂」不能变成「放行」；
+    - 这里是**写**侧：值来自本次请求，非法就拒绝。静默改成最严档等于骗人——
+      用户选了「完全」，存进去的是「只读」，界面显示和行为不一致，他会以为
+      自己没点对，然后反复点。
     """
-    current, _ = parse_level(current_raw)
-    ceiling_text = str(ceiling_raw or "").strip()
-    if not ceiling_text:
-        return current
-    ceiling, _ = parse_level(ceiling_text)
-    return min_level(current, ceiling)
+    text = str(raw or "").strip().lower()
+    if not text:
+        return ""
+    try:
+        return str(PermissionLevel(text))
+    except ValueError as exc:
+        raise InvalidLevelValue(raw) from exc
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """一次 run 的档位解析结果：**生效值 + 它是被谁压下来的**。
+
+    `binding` 不是装饰：界面上「本次会话选了完全，为什么实际是只读」必须有答案，
+    否则用户只会认为开关坏了，然后去关掉它。
+    """
+
+    level: PermissionLevel
+    #: 参与解析的来源（名称 → 原始值）。含空值，便于判断「未设置」与「设成了空」。
+    sources: tuple[tuple[str, str], ...] = ()
+    #: 把档位压到 `level` 的来源名；空 = 没有任何来源在收紧（生效值就是默认值）。
+    binding: str = ""
+    #: 值非法、已被按最严档处理的来源名。
+    invalid: tuple[str, ...] = ()
+    #: 读取失败的来源名（DB 异常等）。与 `invalid` 分开：前者是「库里的值坏了」，
+    #: 这里是「根本没读到」，两种故障的排查方向完全不同。
+    errors: tuple[str, ...] = ()
+
+
+def resolve_chain(
+    *,
+    user: object = "",
+    workspace: object = "",
+    session: object = "",
+    ceiling: object = "",
+) -> Resolution:
+    """把多个作用域的档位 fold 成生效档位：**取最严者**。
+
+    四个来源刻意用显式关键字参数而不是 `**sources`：拼错的来源名应当立刻
+    `TypeError`，而不是被静默忽略掉——这条链是每轮 run 都跑的，一个打错的
+    kwarg 静默等于「这一级上限永远不生效」，而它在界面上看不出任何异常。
+
+    为什么子作用域只能收紧、不能放宽（这条是本节唯一的策略判断）：
+
+    - 档位是**安全边界**，不是偏好。会话能放宽到完全档，用户级设的只读就只是个
+      建议——而只读档的用处恰恰是「我确认这段对话不会写」；
+    - 同构的做法到处都是：OAuth 的 scope 只能缩、AWS 的权限边界只能减、
+      SELinux 的 bounding set 只能 drop。子层能加权限，边界就不叫边界。
+
+    所以「会话级 / 工作区级档位」在语义上是**上限（ceiling）**，不是覆盖（override）。
+    名字必须说清：叫覆盖，下一个人就会把 min 改成「后者胜」，而且看不出错。
+
+    空值 = 该来源未设置 = 不收紧（等价于默认档）。非法值 = 最严档
+    （`parse_level` 的既有约定：改坏一个字段不能提权）。
+    """
+    pairs = (
+        ("user", user),
+        ("workspace", workspace),
+        ("session", session),
+        ("ceiling", ceiling),
+    )
+    parsed: list[tuple[str, str, PermissionLevel]] = []
+    invalid: list[str] = []
+    for name, raw in pairs:
+        text = str(raw or "").strip()
+        source_level, was_invalid = parse_level(text)
+        if was_invalid:
+            invalid.append(name)
+        parsed.append((name, text, source_level))
+
+    level = DEFAULT_LEVEL
+    for _, _, source_level in parsed:
+        level = min_level(level, source_level)
+
+    # binding 只在**确实有来源把它压下来**时才有值：全员等于默认档时没有元凶。
+    binding = ""
+    if level != DEFAULT_LEVEL:
+        for name, _, source_level in parsed:
+            if source_level == level:
+                binding = name
+                break
+    return Resolution(
+        level=level,
+        sources=tuple((name, text) for name, text, _ in parsed),
+        binding=binding,
+        invalid=tuple(invalid),
+    )
 
 
 def allowed_capabilities(level: PermissionLevel) -> frozenset[Capability]:

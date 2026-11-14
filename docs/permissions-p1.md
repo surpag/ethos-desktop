@@ -331,11 +331,14 @@ effective = min(current_user_level, job.permission_level_snapshot)   # 序：rea
 
 ## 10. P1 不做
 
-- 审批挂起 / 恢复（`approval_required` 只是拒绝理由）；
-- 会话级、工作区级覆盖（只有用户级全局档位）；
+- 审批挂起 / 恢复（`approval_required` 只是拒绝理由）。**已在 P2-2 完成**，见
+  `permissions-p2-approval.md`；
+- 会话级、工作区级档位（只有用户级全局档位）。**已在 P3 完成**，且做成了**上限**
+  而不是覆盖——子作用域只能收紧，见 `permissions-p3-scopes.md`；
 - 前端档位切换 UI（只加后端字段与接口）。**已在 P2-3 完成**：BFF 的
   `parseSaveUserSettingsRequest` 已放行 `permissionLevel`（严格三档，非法整份拒绝），
-  设置页有「执行权限」三选一；见 `permissions-p2-approval.md` §14.4；
+  设置页有「执行权限」三选一；P3 补了聊天页顶部的会话级与工作区设置里的工作区级；
+  见 `permissions-p2-approval.md` §14.4；
 - Shell 命令层的敏感路径保护；
 - **用户自己的操作**不经过档位：文件面板、图片上传、设置页是人在操作，档位约束的
   是 Agent（`sandbox/http.py` 因此一行都没改）；

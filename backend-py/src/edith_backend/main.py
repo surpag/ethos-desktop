@@ -25,6 +25,7 @@ from .internal.agentrun import Dependencies, Service
 from .internal.agentrun.plan_tools import PlanToolSet
 from .internal.agentrun.run_plan import RunPlanRegistry
 from .internal.conversation import new_module as new_conversation_module
+from .internal.permissions.chain import LevelChain
 from .internal.cronadapter import Adapter as CronAdapter
 from .internal.cronjob import create_schema as create_cronjob_schema
 from .internal.cronjob import new_module as new_cronjob_module
@@ -145,9 +146,18 @@ async def lifespan(app: FastAPI):
     # 活跃计划注册表：plan_update 工具写入、run 收尾读取、历史走 plan_store，
     # 三者共用一个实例，避免出现「工具改了、收尾看不到」的双份状态。
     run_plans = RunPlanRegistry()
-    conversations = new_conversation_module(session_store, usage.reader, plan_store)
 
     workspaces = WorkspaceStore(db)
+    # 档位解析链：三个持久化来源装成一份，run 与「读会话」共用同一个实现。
+    # 分开装配的话，界面算出的生效档位与实际执行用的会漂移，而且没有任何报错。
+    levels = LevelChain(
+        user_level=users.settings.load_permission_level,
+        workspace_level=workspaces.get_permission_level,
+        session_level=session_store.get_permission_level,
+    )
+    conversations = new_conversation_module(
+        session_store, usage.reader, plan_store, levels
+    )
     # 工作区文件就是磁盘上的一个目录：未绑定用户目录时落在
     # `<data_root>/workspace-volumes/{id}`，绑定后读写直连用户目录本身。
     # 本地沙箱把 `workspace/{id}` junction 到同一个位置，所以两边看到的是同一份文件。
@@ -188,6 +198,7 @@ async def lifespan(app: FastAPI):
             providers=users.providers,
             store=session_store,
             usage=usage.recorder,
+            levels=levels,
             skills=skills,
             images=images.agent_input,
             files=sandbox_input,

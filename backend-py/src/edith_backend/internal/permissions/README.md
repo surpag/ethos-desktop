@@ -84,6 +84,31 @@ plan_update = {METADATA}
 - `None` → 调用方必须显式决定（cron 工具回落到用户设置并写进结果）；
 - 默认成 `FULL` 等于给任何漏传的长路径发一张全额授权书。
 
+## 档位来源：四个，取最严（`policy.resolve_chain` + `chain.LevelChain`）
+
+```
+effective = min(user, workspace, session, ceiling)
+```
+
+子作用域是**上限**不是覆盖：会话级不能把用户级的只读放宽回完全。理由是安全边界
+不能由子层扩增（OAuth scope 只能缩、AWS 权限边界只能减）。所以这里没有「谁覆盖谁」，
+也就不需要在换绑工作区时重算或快照。
+
+两个函数的边界：
+
+| 函数 | 侧 | 遇到非法值 |
+| --- | --- | --- |
+| `parse_level` | 读（库里的历史数据） | 降级到最严档 |
+| `parse_level_input` | 写（本次请求） | 抛 `InvalidLevelValue`，HTTP 转 400 |
+
+写侧静默降级会骗人：用户选「完全」，存进去「只读」，界面与行为不一致。
+
+`chain.LevelChain` 是**取数**端，被 run 执行与会话详情共用——两处各写一遍 `min`，
+迟早漂移成「界面显示完全、实际按只读跑」，且没有任何报错。
+
+读失败（DB 异常）→ 该来源按只读，并记在 `Resolution.errors`。当「没设置」处理等于
+「数据库抖一下就能提权」，但让异常穿出去会让整轮 run 挂掉，所以降级 + 记日志。
+
 ## 容器操作要按条目判（`paths.first_sensitive_entry`）
 
 `check_path` 只看得到信封。`rm -rf work/archive`、`git add work/archive` 的目标路径

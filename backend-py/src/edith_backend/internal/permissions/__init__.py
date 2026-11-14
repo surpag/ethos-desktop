@@ -12,16 +12,20 @@
 """
 
 from .catalog import MCP_CAPABILITIES, capabilities_of, is_readonly
+from .chain import LevelChain
 from .context import bind_level, current_level
 from .paths import check_path
 from .policy import (
+    InvalidLevelValue,
+    Resolution,
     Verdict,
     allowed_capabilities,
     evaluate,
     evaluate_call,
     min_level,
     parse_level,
-    resolve_level,
+    parse_level_input,
+    resolve_chain,
 )
 from .types import (
     APPROVAL_REQUIRED,
@@ -42,9 +46,12 @@ __all__ = [
     "COMMAND_ERROR",
     "Capability",
     "INVALID_ARGUMENTS",
+    "InvalidLevelValue",
+    "LevelChain",
     "MCP_CAPABILITIES",
     "PERMISSION_DENIED",
     "PermissionLevel",
+    "Resolution",
     "TOOL_FAILURE",
     "Verdict",
     "allowed_capabilities",
@@ -60,6 +67,7 @@ __all__ = [
     "kind_status",
     "min_level",
     "parse_level",
-    "resolve_level",
+    "parse_level_input",
+    "resolve_chain",
     "result_kind",
 ]

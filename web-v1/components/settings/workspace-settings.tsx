@@ -1,6 +1,6 @@
 "use client";
 
-import { BookOpen, Save, Send, Trash2 } from "lucide-react";
+import { BookOpen, Save, Send, Shield, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 const STORAGE_KEY = "ethos.workspaceId";
@@ -12,6 +12,8 @@ type Workspace = {
   name: string;
   // D-a：绑定的 Git 远端仓库地址（空 = 未绑定）
   gitRemoteUrl?: string;
+  // 该工作区的档位**上限**（空 = 不额外收紧）
+  permissionLevel?: string;
 };
 
 // 工作区指令编辑器（设置页）：只编辑「已有工作区」的指令，不在此创建。
@@ -21,6 +23,9 @@ export function WorkspaceSettings() {
   const [selectedId, setSelectedId] = useState("");
   const [instruction, setInstruction] = useState("");
   const [gitRemote, setGitRemote] = useState("");
+  // 空串 = 不额外收紧。刻意不用 "full" 当初始值：读取失败时带着猜出来的
+  // 档位去保存，等于替用户做了一次授权决定。
+  const [level, setLevel] = useState("");
   const [message, setMessage] = useState("");
 
   useEffect(() => {
@@ -37,6 +42,7 @@ export function WorkspaceSettings() {
       if (match) {
         setSelectedId(match.workspaceId);
         setGitRemote(match.gitRemoteUrl ?? "");
+        setLevel(match.permissionLevel ?? "");
         void loadInstruction(match.workspaceId);
       }
     }
@@ -58,8 +64,34 @@ export function WorkspaceSettings() {
     localStorage.setItem(STORAGE_KEY, workspaceId);
     const match = workspaces.find((w) => w.workspaceId === workspaceId);
     setGitRemote(match?.gitRemoteUrl ?? "");
+    setLevel(match?.permissionLevel ?? "");
     void loadInstruction(workspaceId);
     setMessage("已切换工作区，聊天将自动带上该工作区指令。");
+  }
+
+  async function saveLevel() {
+    if (!selectedId) return;
+    const response = await fetch(
+      `/api/workspaces/${encodeURIComponent(selectedId)}/permission-level`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ permissionLevel: level }),
+      },
+    );
+    if (!response.ok) {
+      const body = (await response.json().catch(() => null)) as { error?: string } | null;
+      setMessage(body?.error ?? "保存权限上限失败。");
+      return;
+    }
+    const value = (await response.json()) as { permissionLevel: string };
+    setWorkspaces((current) =>
+      current.map((w) =>
+        w.workspaceId === selectedId ? { ...w, permissionLevel: value.permissionLevel } : w,
+      ),
+    );
+    setLevel(value.permissionLevel);
+    setMessage(value.permissionLevel ? "权限上限已保存。" : "已取消这个工作区的额外限制。");
   }
 
   async function saveGitRemote() {
@@ -221,6 +253,30 @@ export function WorkspaceSettings() {
               推送会把当前会话沙箱里该工作区的提交推到上面的仓库（凭据只在服务端使用）。
               需先在「设置 → Git 仓库」连接 GitHub。
             </p>
+
+            <label className="block text-xs font-medium text-muted">
+              执行权限上限
+              <select
+                className="ui-field mt-2 h-9 w-full px-3"
+                value={level}
+                onChange={(event) => setLevel(event.target.value)}
+              >
+                <option value="">不限制（跟随你的全局设置）</option>
+                <option value="read_only">只读</option>
+                <option value="approval">每次确认</option>
+                <option value="full">完全</option>
+              </select>
+            </label>
+            <p className="text-[11px] leading-4 text-muted">
+              这是<strong className="text-ink">上限</strong>：它只能让这个工作区更严，不能越过你的全局设置。
+              全局设为只读时，这里选「完全」也不会放宽——想放宽请改全局设置。
+            </p>
+            <div className="flex items-center gap-2">
+              <button className="ui-button-secondary" type="button" onClick={() => void saveLevel()}>
+                <Shield className="size-4" />
+                保存权限上限
+              </button>
+            </div>
           </>
         )}
 

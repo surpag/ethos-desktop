@@ -38,7 +38,7 @@ from edith_backend.internal.permissions.policy import (
     evaluate_call,
     min_level,
     parse_level,
-    resolve_level,
+    resolve_chain,
 )
 from edith_backend.internal.permissions.types import (
     APPROVAL_REQUIRED,
@@ -282,11 +282,16 @@ def test_parse_level_fails_closed() -> None:
     assert parse_level("superuser") == (READ_ONLY, True)
 
 
+def _level(user: str = "", ceiling: str = "") -> PermissionLevel:
+    """旧 (当前, 上限) 二元解析的手写替身，便于逐条保留原断言的语义。"""
+    return resolve_chain(user=user, ceiling=ceiling).level
+
+
 def test_resolve_level_takes_the_stricter_one() -> None:
-    assert resolve_level("full", "full") == FULL
-    assert resolve_level("read_only", "full") == READ_ONLY  # 用户后来调低 → 更严生效
-    assert resolve_level("full", "approval") == APPROVAL  # 快照是上限 → 升级不回溯
-    assert resolve_level("approval", "") == APPROVAL  # 无上限 → 只看当前
+    assert _level("full", "full") == FULL
+    assert _level("read_only", "full") == READ_ONLY  # 用户后来调低 → 更严生效
+    assert _level("full", "approval") == APPROVAL  # 快照是上限 → 升级不回溯
+    assert _level("approval", "") == APPROVAL  # 无上限 → 只看当前
     assert min_level(FULL, READ_ONLY) == READ_ONLY
 
 
@@ -709,11 +714,11 @@ def test_legacy_cron_job_gets_snapshot_backfilled() -> None:
 def test_cron_effective_level_is_min_of_snapshot_and_current() -> None:
     """三条现实场景：降权、提权、无权。"""
     # 创建时 full，用户后来调成只读 → 任务降级
-    assert resolve_level("read_only", "full") == READ_ONLY
+    assert _level("read_only", "full") == READ_ONLY
     # 创建时只读，用户后来调成 full → 任务不自动升级
-    assert resolve_level("full", "read_only") == READ_ONLY
+    assert _level("full", "read_only") == READ_ONLY
     # 两边都是 full → 照旧
-    assert resolve_level("full", "full") == FULL
+    assert _level("full", "full") == FULL
 
 
 # ── 七、Registry 的错误分类 ──────────────────────────────────────────
