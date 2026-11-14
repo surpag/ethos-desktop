@@ -73,6 +73,28 @@ plan_update = {METADATA}
 - `None` → 调用方必须显式决定（cron 工具回落到用户设置并写进结果）；
 - 默认成 `FULL` 等于给任何漏传的长路径发一张全额授权书。
 
+## 容器操作要按条目判（`paths.first_sensitive_entry`）
+
+`check_path` 只看得到信封。`rm -rf work/archive`、`git add work/archive` 的目标路径
+一个敏感段都没有，真正被删/被暂存的是目录里的每一条。所以这两个入口有两层问法：
+
+| 入口 | 问谁 | 位置 |
+| --- | --- | --- |
+| `sandbox_delete_path <目录>` | 问文件系统（`first_sensitive_entry` 遍历） | `sandbox/tools.py::_sensitive_subtree_violation` |
+| `git add <目录>` | 问 git（`git add -n` 只出计划、不写索引） | `gitops/executor.py::plan_git_add` |
+
+为什么不是都用遍历：`git add` 的展开结果受 `.gitignore` 与 pathspec 影响，自己走目录
+会把被忽略的 `.env.bak` 也算成「会被暂存」——误拒比漏判安全，但会让人开始怀疑这条
+规则在保护什么。删除没有「先报告再执行」的通道，只能自己遍历。
+
+仍未被覆盖的两条（如实记录，不是遗漏）：
+
+- `sandbox_run_command` 与 `bash -c "git ..."` 是**通用绕道**，路径层与条目层都挡不住
+  ——这是方案 A 的明示取舍（命令层无法可靠证明副作用），真正的解法是别把密钥放在
+  Agent 可达的磁盘上；
+- 提交前不复核索引：如果索引里已经有敏感文件（只能靠 shell 绕进去），`commit` 不会
+  再拦一次。加这一层没有意义——同一条 shell 能直接 `commit && push`。
+
 ## ⚠️ 新增工具时必须做的事
 
 1. 在 `catalog.TOOL_CAPABILITIES` 加一行（否则运行时默认拒绝）；
@@ -80,12 +102,8 @@ plan_update = {METADATA}
    检查靠它知道哪些参数是路径）；
 3. 跑 `tests/test_permissions.py::test_every_registered_tool_is_declared`。
 
-## 已知边界（路径层挡不住「容器层」）
+## 已知边界（路径层 + 条目层之外）
 
-敏感检查保护的是「这次操作指向哪个路径」，不是「这个路径里面每一条」：
-
-- `sandbox_delete_path <目录>`：目录名干净、内含 `.env`，会被连带删掉；
-- `git add <目录>`：同上，暂存集合里会出现 `.env`，之后 `commit + push` 就能外送。
-
-堵它们要在「按条目判定」的位置做（删除前遍历、`add` 后核对 `git diff --cached
---name-only`），不是再加一层路径字符串判断。详见 `docs/permissions-p1.md` §14。
+敏感检查保护的是「这次操作指向哪个路径」以及「这个路径展开后有哪些条目」，
+但不能阻止一条命令自己去找东西：`sandbox_run_command` 在 `full` 档仍能读到 `.env`
+（方案 A 的明示取舍，见 `docs/permissions-p1.md` §13 末）。

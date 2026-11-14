@@ -7,7 +7,7 @@ M2 落地安全护栏 + 只读执行器；M3 放开本地写（add/commit）；�
 """
 
 from .env import git_identity_env, non_interactive_env, resolve_git_identity
-from .executor import run_git
+from .executor import plan_git_add, run_git
 from .policy import GitCommandRejected, validate_git_command
 from .redact import redact_git_output
 from .ssrf import CloneUrlRejected, assert_safe_clone_url
@@ -18,6 +18,7 @@ __all__ = [
     "assert_safe_clone_url",
     "git_identity_env",
     "non_interactive_env",
+    "plan_git_add",
     "redact_git_output",
     "resolve_git_identity",
     "run_git",

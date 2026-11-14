@@ -16,10 +16,11 @@ from collections.abc import Awaitable, Callable
 from ..gitops import (
     CloneUrlRejected,
     GitCommandRejected,
+    plan_git_add,
     resolve_git_identity,
     run_git,
 )
-from ..permissions.paths import check_path
+from ..permissions.paths import check_path, first_sensitive_entry
 from ..permissions.types import PERMISSION_DENIED
 from ..skills.budget import charge_skill_load
 from ..skills.types import SKILL_FILE, SKILLS_PATH
@@ -228,6 +229,67 @@ def _sensitive_git_violation(arguments: dict) -> str:
         hit = check_path(str(arg))
         if hit:
             return hit
+    return ""
+
+
+def _sensitive_refusal(
+    error: str, suggestion: str, *, reason: str = "sensitive_path"
+) -> dict:
+    """敏感路径拒绝的统一出口（三个入口共用同一个 shape）。
+
+    `kind` 是 `permission_denied` 而不是 `command_error`：命中敏感段时换哪个工具、
+    换哪个档位都成功不了，是**确定性**拒绝。写成业务错误的话，模型会按
+    「换个路径再试」处理，而这条路径永远试不过；被拒的写入还会被当成
+    「已产生变更」污染完成证据。
+
+    `reason` 用来区分「确实命中」与「无法核对所以不放行」：两者都是 fail-closed，
+    但前者是「换个路径」，后者是「换个问法」。
+    """
+    return {
+        "error": error,
+        "kind": PERMISSION_DENIED,
+        "retryable": False,
+        "reason": reason,
+        "suggestion": suggestion,
+    }
+
+
+async def _sensitive_subtree_violation(
+    sandbox: LocalSandbox, name: str, args: dict, workspace_id: str
+) -> str:
+    """第三遍：容器操作要**按条目**判，目标路径干净不代表里面干净。
+
+    `sandbox_delete_path work/archive` 的路径串里一个敏感段都没有，但
+    `files.remove` 对目录是递归删除的——真正被删掉的是目录里的每一条。
+    只判目标路径等于只看信封。
+
+    只用在会产生「整棵树」效果的入口（当前是 `sandbox_delete_path`）。
+    `git add` 同样需要按条目判，但它的问法不同（要问 git 而不是问文件系统，
+    否则 `.gitignore` 会让结果不准），见 `gitops.plan_git_add`。
+    """
+    for key in _PATH_FIELDS.get(name, ()):
+        value = args.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            virtual = workspace_path(
+                value, allow_root=True, current_workspace_id=workspace_id
+            )
+            real = os.path.realpath(sandbox.resolve(virtual))
+        except SandboxPathError:
+            # 越界在 `_sensitive_real_violation` 已经拒过；这里不抢错误语义
+            continue
+        except (PermissionError, ValueError):
+            continue
+        except Exception:  # noqa: BLE001 - 无法解析真实落点 = 无法判定
+            return "路径无法解析为真实位置"
+        try:
+            hit = first_sensitive_entry(real)
+        except OSError as exc:
+            # 读不到目录就不能说「里面没问题」
+            return f"目录内条目无法核对（{exc.__class__.__name__}）"
+        if hit:
+            return f"目录内条目 {hit}"
     return ""
 
 
@@ -508,6 +570,13 @@ class SandboxToolSet:
                     sensitive = _sensitive_real_violation(
                         sandbox, name, arguments, workspace_id
                     )
+                if not sensitive and name == "sandbox_delete_path":
+                    # 第三遍按条目展开：`files.remove` 对目录是**递归删除**，
+                    # 目标路径干净不代表里面的每一条都干净。
+                    # 新增「整棵树」效果的入口时，名字要加到这一行。
+                    sensitive = await _sensitive_subtree_violation(
+                        sandbox, name, arguments, workspace_id
+                    )
                 if sensitive:
                     logger.warning(
                         "sensitive path blocked tool=%s user=%s session=%s workspace=%s: %r",
@@ -518,21 +587,13 @@ class SandboxToolSet:
                         sensitive,
                     )
                     return json.dumps(
-                        {
-                            "error": f"敏感路径不可访问：{sensitive}",
-                            # 硬约束：换个工具名也成功不了，所以是确定性拒绝。
-                            # 用 command_error 的话，模型会按「换个路径再试」处理，
-                            # 而这条路径永远试不过——三次无效重试还会污染证据分级。
-                            "kind": PERMISSION_DENIED,
-                            "retryable": False,
-                            "reason": "sensitive_path",
-                            "suggestion": (
-                                f"路径命中敏感段 {sensitive!r}"
-                                "（版本库元数据 / 密钥 / 凭据），任何档位下都不允许"
-                                "读写或删除。这是平台的安全约束，重试同一个路径无效；"
-                                "请改操作其他文件。"
-                            ),
-                        },
+                        _sensitive_refusal(
+                            f"敏感路径不可访问：{sensitive}",
+                            f"路径命中敏感段 {sensitive!r}"
+                            "（版本库元数据 / 密钥 / 凭据），任何档位下都不允许"
+                            "读写或删除。这是平台的安全约束，重试同一个路径无效；"
+                            "请改操作其他文件。",
+                        ),
                         ensure_ascii=False,
                     )
             elif name == "git":
@@ -545,16 +606,11 @@ class SandboxToolSet:
                         sensitive,
                     )
                     return json.dumps(
-                        {
-                            "error": f"敏感路径不可加入版本库：{sensitive}",
-                            "kind": PERMISSION_DENIED,
-                            "retryable": False,
-                            "reason": "sensitive_path",
-                            "suggestion": (
-                                "该路径属于版本库元数据、密钥或凭据，不允许提交。"
-                                "若要提交代码，请只 add 源码与文档路径。"
-                            ),
-                        },
+                        _sensitive_refusal(
+                            f"敏感路径不可加入版本库：{sensitive}",
+                            "该路径属于版本库元数据、密钥或凭据，不允许提交。"
+                            "若要提交代码，请只 add 源码与文档路径。",
+                        ),
                         ensure_ascii=False,
                     )
             # git 工具需要工作区根作为 cwd，单独分发（其余工具走统一 handler）
@@ -862,11 +918,19 @@ class SandboxToolSet:
                     "retryable": True, "suggestion": "请先在顶部选择工作区，再使用 git 工具。"}
         subcmd = (args.get("subcommand") or "").strip()
         argv = [str(a) for a in (args.get("args") or [])]
+        root = WORKSPACE.workspace_path(workspace_id)
+        if subcmd == "add":
+            # 按条目判定：`git add work/archive` 的路径串一个敏感段都没有，
+            # 真正被暂存的是目录里的每一条。问 git 自己（`add -n`）而不是自己
+            # 遍历目录——`.gitignore` 与 pathspec 的展开结果只有 git 算得准。
+            denial = await self._git_add_sensitive(sandbox, root, argv)
+            if denial is not None:
+                return denial
         identity = await self._resolve_git_identity(user_id)
         try:
             result = await run_git(
                 sandbox,
-                WORKSPACE.workspace_path(workspace_id),
+                root,
                 subcmd,
                 argv,
                 identity=identity,
@@ -887,6 +951,39 @@ class SandboxToolSet:
             resp["kind"] = COMMAND_ERROR
             resp["retryable"] = True
         return resp
+
+    async def _git_add_sensitive(
+        self, sandbox: LocalSandbox, root: str, argv: list[str]
+    ) -> dict | None:
+        """`add` 前的按条目判定；返回要交回给模型的错误，None 表示放行。
+
+        为什么不能并进 `_sensitive_git_violation`（参数层那个）：参数层只看得到
+        `add` 后面写了什么，看不到目录里有什么。两层都要留着——参数层在
+        「工作区还不是 git 仓库」时也能拦住 `.env`，而这一层管的是目录展开。
+        """
+        try:
+            planned, plan_error = await plan_git_add(sandbox, root, argv)
+        except GitCommandRejected:
+            # 白名单本来就会拒这次调用，让它自己报（那套文案更具体）
+            return None
+        if plan_error:
+            return _sensitive_refusal(
+                f"无法核对这次 add 会暂存什么，已拒绝：{plan_error}",
+                "暂存范围无法确定时不执行写入（说不清会暂存什么，就不能假设它不含密钥）。"
+                "请确认工作区是 git 仓库、路径真实存在，或改为 add 明确的具体文件"
+                "（不要用目录）。",
+                reason="sensitive_path_unverified",
+            )
+        for path in planned:
+            hit = check_path(path)
+            if hit:
+                logger.warning("sensitive git add blocked path=%s hit=%s", path, hit)
+                return _sensitive_refusal(
+                    f"敏感路径不可加入版本库：{path}（命中 {hit}）",
+                    "这个目录展开后包含密钥、凭据或版本库元数据，add 会把它一并暂存，"
+                    "之后 commit + push 就等于外送。请改为 add 明确的具体文件。",
+                )
+        return None
 
     async def _op_git_push(
         self, args: dict, user_id: str, session_id: str, workspace_id: str

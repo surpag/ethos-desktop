@@ -15,12 +15,17 @@
    忘了校验，这一层仍然挡得住）。
 3. **符号链接**：逻辑路径可以完全干净，落点却是 `~/.ssh/id_rsa`。所以调用方必须
    对**宿主真实路径**再调一次本函数（第二遍）。
+4. **容器操作**：`rm -rf work/archive`、`git add work/archive` 的目标路径一个敏感段
+   都没有，真正被删/被暂存的是**目录里的每一条**。这类入口不能只看目标路径，
+   必须按条目展开——见 `first_sensitive_entry` 与调用方 `gitops.plan_git_add`。
 
 无法可靠解析的路径（含 NUL 字符）默认拒绝：说不清它指向哪，就只能假设它指向最坏
 的地方。真实路径解析本身失败（`OSError`）时同理——那是调用方的责任。
 """
 
 from __future__ import annotations
+
+import os
 
 #: 段级精确匹配（小写比较）
 _SEGMENT_EXACT = frozenset(
@@ -96,3 +101,34 @@ def check_path(raw: object) -> str:
     if ".." in parts:
         return "路径含 '..'，无法可靠判定落点"
     return _match_segments(parts)
+
+
+def first_sensitive_entry(root: str) -> str:
+    """遍历目录，返回第一个命中敏感规则的**相对路径**；没有命中返回空串。
+
+    这是「按条目判定」的那一半：目标路径干净不代表里面干净。用在容器操作上
+    （递归删除、目录级 `git add`），因为那些操作展开的是目录里的每一条，
+    而 `check_path` 只看得到信封。
+
+    不跟随符号链接与目录联接：`rmtree` 删的是链接本身而不是它指向的东西，
+    跟着走会把外部目录当成待删内容判（既不准，也可能走不完）。
+    目录不存在或本来就是文件时返回空串——那种情况由 `check_path` 判过。
+
+    遍历失败（`OSError`）向上抛，由调用方按「无法核对 = 拒绝」处理：
+    这一层不能把「读不到目录」当成「里面没问题」。
+    """
+    if not os.path.isdir(root):
+        return ""
+    stack: list[tuple[str, str]] = [("", root)]
+    while stack:
+        prefix, current = stack.pop()
+        with os.scandir(current) as entries:
+            for entry in entries:
+                shown = f"{prefix}{entry.name}"
+                if check_path(shown):
+                    return shown
+                # follow_symlinks=False：链接与目录联接不进栈（见 docstring）
+                if entry.is_dir(follow_symlinks=False):
+                    stack.append((f"{shown}/", entry.path))
+    return ""
+

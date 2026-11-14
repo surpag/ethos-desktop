@@ -322,8 +322,12 @@ effective = min(current_user_level, job.permission_level_snapshot)   # 序：rea
 | 19 | 未注册工具名 | 未知 | `_run_one` | 拒绝 | 拒绝 | 拒绝 | `test_unknown_tool_denied_at_every_level` |
 | 20 | 未声明能力的已注册工具 | 未知 | `_run_one` | 拒绝 | 拒绝 | 拒绝 | `test_undeclared_tool_denied` |
 | 21 | 参数非 JSON | 未知 | `_run_one` | 拒绝 | 拒绝 | 拒绝 | `test_invalid_arguments_denied` |
+| 22 | `sandbox_delete_path <目录>`（目录内含敏感条目） | `{WRITE}` | `sandbox/tools.py`（条目展开） | 拒绝* | 拒绝* | **拒绝** | `test_delete_path_checks_entries` |
+| 23 | `git add <目录>`（展开后含敏感条目） | `{WRITE}` | `gitops.plan_git_add`（问 git） | 拒绝* | 拒绝* | **拒绝** | `test_git_add_directory_checks_expansion` / `test_git_add_directory_ignores_gitignored_secrets` |
+| 24 | `git add` 无法核对暂存计划 | 未知 | 同上 | 拒绝 | 拒绝 | 拒绝 | `test_plan_git_add_fails_closed` / `test_plan_git_add_surfaces_git_error` |
 
-\* 16~18 在低档位下被档位裁决先拦住，测的是「`full` 也拦」这一列。
+\* 16~18、22~23 在低档位下被档位裁决先拦住，测的是「`full` 也拦」这一列。
+22~24 是 P2 补的（P1 交付时这三条是敞开的，见 §14/§15）。
 
 ## 10. P1 不做
 
@@ -352,14 +356,14 @@ effective = min(current_user_level, job.permission_level_snapshot)   # 序：rea
 | `internal/cronadapter/adapter.py` | 传快照档位（执行身份 = 任务所有者） |
 | `internal/userconfig/{schema,settings,types,http}.py` | `user_agents.permission_level` 列与读写 |
 | `internal/sandbox/tools.py` | 敏感检查去 `workspace_id` 条件、扩展规则、真实路径复核、`git add` 路径检查 |
-| `tests/test_permissions.py` | 新增覆盖矩阵 21 行 + 声明完整性 + HTTP 边界（55 例） |
+| `tests/test_permissions.py` | 新增覆盖矩阵 24 行 + 声明完整性 + HTTP 边界（60 例） |
 
 ## 12. 验收
 
 ```bash
 cd backend-py
 ./.venv/Scripts/python.exe -m pytest tests --basetemp=.pytest-tmp-<新名字> -q
-# 483 passed, 1 skipped（其中 tests/test_permissions.py 55 例）
+# 491 passed, 1 skipped（其中 tests/test_permissions.py 60 例）
 ```
 
 外加三条手工验证（不进单测，因为要真沙箱 + 真模型）：
@@ -385,21 +389,67 @@ cd backend-py
 纳入路径检查，那需要命令解析器，且注定被 `bash -c` 绕过；真正的解法是别把密钥放在
 Agent 可达的磁盘上。
 
-## 14. 已知边界（路径层挡不住「容器层」）
+## 14. 已知边界（P1 交付时敞开，P2 已关闭）
 
-这两条不是遗漏，是**当前架构无法覆盖的位置**，先记下来而不是硬塞一个看起来有效的
-检查：
+P1 只判「这次操作指向哪个路径」。下面两个入口的目标路径可以完全干净，真正起作用的是
+目录里的每一条：
 
 | 入口 | 现象 | 为什么路径检查挡不住 | 影响 |
 | --- | --- | --- | --- |
 | `sandbox_delete_path <目录>` | 目录名干净，内含 `.env` / `.git` | 敏感判定是**逐条路径**的，而递删是**容器操作**：目标路径本身没有任何敏感段 | 破坏：密钥文件被连带删除；不构成泄露 |
 | `git add <目录>` | 目录名干净，内含 `.env` | 同上：白名单只看参数里的路径串，不看被展开的文件集合 | **外送前置**：暂存后 `commit + git_push` 就能把密钥推到远端 |
 
-要堵它们，正确的位置是「按条目判定」——删除前遍历目录、`add` 之后核对暂存集合
-（`git diff --cached --name-only`），而不是在路径字符串上再加判断。这需要一次真实的
-遍历/回滚动作，属于 P2 的候选，且优先级是：`git add <目录>` ＞ 递删（前者泄露，
-后者破坏）。
+P1 交付时这两条是敞开的（当时只有档位兜着：只读/审批档根本用不了这两个工具）。
+P2 用「按条目判定」把它们关掉了，见 §15。
 
-在此之前，能挡住这两条的是档位本身：`sandbox_delete_path` 与 `git` 在只读/审批档
-根本不可用。`full` 档下它们可用，所以这两条边界必须明示——它和「Shell 不受路径保护」
-是同一类取舍：**敏感检查保护的是「这次操作指向哪个路径」，不是「这个路径里面每一条」。**
+## 15. P2：按条目判定（关闭 §14 的两条）
+
+### 15.1 两个入口，两种问法
+
+同一个原则（看展开后的每一条），但取证方式必须不同：
+
+| 入口 | 问谁 | 实现 | 为什么不能互换 |
+| --- | --- | --- | --- |
+| `sandbox_delete_path <目录>` | 文件系统 | `paths.first_sensitive_entry` 遍历子树，`sandbox/tools.py::_sensitive_subtree_violation` | 递删没有「先报告再执行」的通道，只能自己走一遍 |
+| `git add <目录>` | git | `gitops.plan_git_add`（`git add -n`，只出计划不写索引） | 展开结果受 `.gitignore` 与 pathspec 影响，自己走目录会把被忽略的 `.env.bak` 也当成「会被暂存」 |
+
+被忽略的文件其实不会被暂存，所以用遍历去判 `add` 会**误拒**。误拒比漏判安全，但会让人
+开始怀疑这条规则到底在保护什么——一旦如此，下一个人就会把它注释掉。
+
+### 15.2 拒绝发生在写入之前
+
+`git add` 采用「先问计划、再执行」，不是「先暂存、发现敏感再撤回」：
+
+- 不产生「已暂存、又被撤回」的中间态。那种中间态解释不清（谁能证明撤干净了？），
+  而撤回本身是第二次写入——安全检查不该以先破坏为前提；
+- 失败时 `git diff --cached --name-only` 必须为空 —— 这是可断言的事实，写进了
+  `test_git_add_directory_checks_expansion`。
+
+计划拿不到（非仓库、路径不存在、输出无法解析）时 `reason` 是 `sensitive_path_unverified`
+而不是 `sensitive_path`：前者是「换个问法」（换成具体文件），后者是「换个路径」。两者
+都是 `permission_denied` + `retryable=false`，都不计熔断。
+
+### 15.3 仍然敞开的三条
+
+| 敞开的入口 | 为什么不再堵 |
+| --- | --- |
+| `sandbox_run_command` 读 `.env` | 方案 A 的明示取舍（§13 末）：命令层无法可靠证明副作用 |
+| `bash -c "git add .env && git commit && git push"` | 通用绕道。给 git 再加检查不影响这条，只会让人以为已经堵住了 |
+| 索引里已有敏感文件时的 `commit` | 只能靠上面那条绕进去。同一入口既然能直接 `commit && push`，在 `commit` 上再加一道就是剧场 |
+
+一句话：**容器层的洞可以逐个堵，命令层的洞堵不住。** 所以真正的位置是「别把密钥放在
+Agent 可达的磁盘上」，而不是继续在路径字符串上加判断。
+
+有一条副作用要提前说清：**删一个内含 `.git` 的项目目录现在会被拒**（`.git` 在敏感表里）。
+这是刻意的——整目录删除不该是「顺手」操作，而 `.git` 被连带删掉会让 git 能力整段失效。
+代价可控：`sandbox_delete_path` 与 `sandbox_run_command` 都只在 `full` 档可用，所以
+任何「能删」的档位也「能跑 shell」，没有真正的功能损失，只是把一次误删变成了必须显式
+选择的行为。
+
+### 15.4 验收
+
+```bash
+./.venv/Scripts/python.exe -m pytest tests/test_permissions.py tests/test_gitops.py -q
+# 105 passed（新增 5 例入口级 + 3 例 plan 解析）
+```
+

@@ -12,6 +12,7 @@ from edith_backend.internal.gitops import (
     GitCommandRejected,
     assert_safe_clone_url,
     non_interactive_env,
+    plan_git_add,
     redact_git_output,
     run_git,
     validate_git_command,
@@ -226,6 +227,56 @@ def test_executor_treats_nonzero_exit_as_result() -> None:
         assert result["exitCode"] == 128
         assert "ghp_LEAKED" not in result["stderr"]
         assert "<redacted>" in result["stderr"]
+
+    asyncio.run(go())
+
+
+# ---- add 的按条目判定（plan 只问不写）----
+
+def test_plan_git_add_parses_plan_without_writing() -> None:
+    """`git add -n` 里 `remove` 行不是暂存，只有 `add` 行算。"""
+    async def go():
+        cmds = FakeCommands()
+        cmds.output = "add 'sub/.env'\nremove 'old.txt'\nadd 'sub/a.txt'\n"
+        planned, error = await plan_git_add(SimpleNamespace(commands=cmds), "/w", ["sub"])
+        assert error == ""
+        assert planned == ["sub/.env", "sub/a.txt"]
+        # 关键：问的是 `-n`，不是真的 add
+        assert cmds.calls[0]["cmd"] == "git add -n -- sub"
+
+    asyncio.run(go())
+
+
+def test_plan_git_add_fails_closed() -> None:
+    """解析不了 = 不知道会暂存什么 = 失败（不能当成「没有敏感文件」）。"""
+    async def go():
+        cmds = FakeCommands()
+        sandbox = SimpleNamespace(commands=cmds)
+        cmds.output = "add 'truncated-without-quote\n"
+        planned, error = await plan_git_add(sandbox, "/w", ["sub"])
+        assert planned == []
+        assert "无法解析" in error
+        # 参数校验与真实执行同一套：目录推进来也是白名单先拒
+        with pytest.raises(GitCommandRejected):
+            await plan_git_add(sandbox, "/w", ["."])
+
+    asyncio.run(go())
+
+
+def test_plan_git_add_surfaces_git_error() -> None:
+    """非仓库等情况把 git 自己的话交回去，不翻译成「敏感路径」。"""
+    class Failing:
+        async def run(self, cmd: str, **kwargs) -> SimpleNamespace:
+            return SimpleNamespace(
+                exit_code=128, stdout="", stderr="fatal: not a git repository\n"
+            )
+
+    async def go():
+        planned, error = await plan_git_add(
+            SimpleNamespace(commands=Failing()), "/w", ["sub"]
+        )
+        assert planned == []
+        assert "not a git repository" in error
 
     asyncio.run(go())
 

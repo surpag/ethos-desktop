@@ -62,11 +62,57 @@ async def run_git(
     }
 
 
+async def plan_git_add(
+    sandbox, workspace_path: str, args: list[str]
+) -> tuple[list[str], str]:
+    """问 git：这次 `add` 会暂存哪些文件（**不写索引**）。
+
+    返回 `(仓库相对路径列表, 失败原因)`；失败原因为空串表示拿到了可信的计划。
+
+    为什么问 git 而不是自己遍历目录：`.gitignore`、pathspec 展开、已跟踪文件的
+    新增/修改，这三件事只有 git 自己算得准。自己 `os.walk` 会把被忽略的文件
+    算进「会被暂存」，于是 `git add src/` 只要目录里有个被忽略的 `.env.bak`
+    就误拒——误拒比漏判安全，但会让人开始怀疑这条规则到底在保护什么。
+
+    参数校验与真实执行**完全同一套**（`validate_git_command`），否则
+    「计划里没有、实际却暂存了」这种不对称会变成一个绕道。
+    """
+    validate_git_command("add", args)
+    command = "git add -n -- " + " ".join(shlex.quote(str(a)) for a in args)
+    result = await sandbox.commands.run(
+        command,
+        cwd=workspace_path,
+        envs=non_interactive_env(),
+        timeout=DEFAULT_GIT_TIMEOUT,
+    )
+    if (result.exit_code or 0) != 0:
+        # 非仓库 / pathspec 非法等：把 git 自己的话原样交回去，
+        # 不翻译成「敏感路径」——那会让人以为命中了密钥。
+        return [], redact_git_output(result.stderr or "").strip() or "git add -n 执行失败"
+
+    planned: list[str] = []
+    for line in (result.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        # 两种行：`add 'path'`；大小写不敏感文件系统上可能出现的 `remove 'path'`
+        for verb in ("add '", "remove '"):
+            if line.startswith(verb) and line.endswith("'"):
+                name = line[len(verb) : -1]
+                if verb == "add '":
+                    planned.append(name)
+                break
+        else:
+            # 解析不了就等于「不知道会暂存什么」，按失败处理（fail-closed）
+            return [], f"无法解析 git 的暂存计划：{line[:120]!r}"
+    return planned, ""
+
+
 __all__ = [
     "GitCommandRejected",
     "assert_safe_clone_url",
     "git_identity_env",
     "non_interactive_env",
+    "plan_git_add",
     "redact_git_output",
     "run_git",
     "validate_git_command",

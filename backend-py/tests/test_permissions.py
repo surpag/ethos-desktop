@@ -413,6 +413,149 @@ def test_git_add_sensitive_path(sandbox_tools) -> None:
     asyncio.run(body())
 
 
+def test_delete_path_checks_entries(sandbox_tools, tmp_path) -> None:
+    """递删是**容器操作**：`work/archive` 的路径串干净，但 `files.remove` 删的是里面每一条。
+
+    P1 只判目标路径，于是 `sandbox_delete_path work/archive` 会把目录里的 `.env`
+    一起删掉——路径检查保护的是「这次操作指向哪个路径」，不是「这个路径里面每条」。
+    """
+    archive = tmp_path / "sandbox" / "u1" / "s1" / "work" / "archive"
+    (archive / "deep").mkdir(parents=True)
+    (archive / "notes.md").write_text("ok", encoding="utf-8")
+    (archive / "deep" / ".env").write_text("TOKEN=1", encoding="utf-8")
+
+    async def body() -> None:
+        result = json.loads(
+            await sandbox_tools.execute(
+                "sandbox_delete_path", {"path": "work/archive"}, "u1", "s1", ""
+            )
+        )
+        assert result["kind"] == PERMISSION_DENIED
+        assert result["reason"] == "sensitive_path"
+        # 报的是目录内**相对**条目，模型据此能自己判断该怎么改
+        assert "deep/.env" in result["error"]
+        assert (archive / "deep" / ".env").exists()
+        assert (archive / "notes.md").exists()
+
+    asyncio.run(body())
+
+
+def test_delete_path_allows_clean_tree(sandbox_tools, tmp_path) -> None:
+    """按条目判定不能顺带把正常目录删不掉（全拒绝不是安全，是无能）。"""
+    archive = tmp_path / "sandbox" / "u1" / "s1" / "work" / "archive"
+    (archive / "sub").mkdir(parents=True)
+    (archive / "sub" / "a.md").write_text("ok", encoding="utf-8")
+
+    async def body() -> None:
+        raw = await sandbox_tools.execute(
+            "sandbox_delete_path", {"path": "work/archive"}, "u1", "s1", ""
+        )
+        assert "error" not in json.loads(raw), raw
+        assert not archive.exists()
+
+    asyncio.run(body())
+
+
+def _init_repo(repo, files: dict[str, str]) -> None:
+    for name, text in files.items():
+        target = repo / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, timeout=30)
+
+
+def test_git_add_directory_checks_expansion(tmp_path, monkeypatch) -> None:
+    """`git add <目录>` 会按条目展开：路径串里没有敏感段，暂存集合里有。
+
+    这是完整的外送链路第一步——`add` 目录 → `commit` → `git_push`。
+    """
+    monkeypatch.setenv("ETHOS_DATA_DIR", str(tmp_path))
+    sandbox = LocalSandbox.open("u1", "s1")
+    tools = SandboxToolSet(_FakeService(sandbox))
+    repo = sandbox.resolve("workspace/w1")
+    _init_repo(repo, {"sub/a.txt": "ok", "sub/.env": "TOKEN=1"})
+
+    async def body() -> None:
+        result = json.loads(
+            await tools.execute(
+                "git", {"subcommand": "add", "args": ["sub"]}, "u1", "s1", "w1"
+            )
+        )
+        assert result["kind"] == PERMISSION_DENIED, result
+        assert result["reason"] == "sensitive_path"
+        assert "sub/.env" in result["error"]
+        # 拒绝发生在**写索引之前**：不是先暂存再撤回
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert staged.stdout.strip() == ""
+
+    asyncio.run(body())
+
+
+def test_git_add_explicit_file_still_works(tmp_path, monkeypatch) -> None:
+    """目录里有 `.env` 时，add 明确的具体文件仍然可行（否则等于把 git 工具废掉）。"""
+    monkeypatch.setenv("ETHOS_DATA_DIR", str(tmp_path))
+    sandbox = LocalSandbox.open("u1", "s1")
+    tools = SandboxToolSet(_FakeService(sandbox))
+    repo = sandbox.resolve("workspace/w1")
+    _init_repo(repo, {"sub/a.txt": "ok", "sub/.env": "TOKEN=1"})
+
+    async def body() -> None:
+        result = json.loads(
+            await tools.execute(
+                "git", {"subcommand": "add", "args": ["sub/a.txt"]}, "u1", "s1", "w1"
+            )
+        )
+        assert result.get("exitCode") == 0, result
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert staged.stdout.strip() == "sub/a.txt"
+
+    asyncio.run(body())
+
+
+def test_git_add_directory_ignores_gitignored_secrets(tmp_path, monkeypatch) -> None:
+    """被 `.gitignore` 忽略的 `.env` 根本不会进暂存集合，就不该被拒。
+
+    这条是「问 git 而不是自己遍历目录」的理由：自己走一遍会把忽略规则算错，
+    于是 `git add src/` 只要目录里有个 `.env` 就永久失败。误拒比漏判安全，
+    但一条会误拒的规则会被下一个人注释掉。
+    """
+    monkeypatch.setenv("ETHOS_DATA_DIR", str(tmp_path))
+    sandbox = LocalSandbox.open("u1", "s1")
+    tools = SandboxToolSet(_FakeService(sandbox))
+    repo = sandbox.resolve("workspace/w1")
+    _init_repo(repo, {"sub/a.txt": "ok", "sub/.env": "TOKEN=1", ".gitignore": ".env\n"})
+
+    async def body() -> None:
+        result = json.loads(
+            await tools.execute(
+                "git", {"subcommand": "add", "args": ["sub"]}, "u1", "s1", "w1"
+            )
+        )
+        assert result.get("exitCode") == 0, result
+        staged = subprocess.run(
+            ["git", "diff", "--cached", "--name-only"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert staged.stdout.strip() == "sub/a.txt"
+
+    asyncio.run(body())
+
+
 def _make_link(link, target, *, directory: bool) -> bool:
     """在 `link` 处建一个指向 `target` 的链接/联接；不支持时返回 False。
 
