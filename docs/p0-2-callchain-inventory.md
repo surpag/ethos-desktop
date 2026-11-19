@@ -194,9 +194,9 @@ grep 证据：`bind_local_root` 只出现在前两个文件，且两者都不 im
 
 ## 7. 尚待验证
 
-1. `[待验证]`（**优先级最高**）用户绑定目录本身是 git 仓库时，`git` / `git_push` 的完整行为（含 `.git` 会不会被敏感路径规则拦掉）。它直接决定「绑定一个已有仓库」是不是产品路径。
-2. `[待验证]` 网络盘 / UNC 作为 `local_root`（本机 C、D 均为本地盘）。
-3. `[待验证]` `merge_existing=True` 在 UI 上是否可达；不可达则 `legacy_dir` 的合并路径实际是死代码。
+1. `[已实测]`（**优先级最高**）用户绑定目录本身是 git 仓库时，`git` / `git_push` 的完整行为（含 `.git` 会不会被敏感路径规则拦掉）。它直接决定「绑定一个已有仓库」是不是产品路径。→ 见 §9.1，已补齐（`git_push` 远端段除外）。
+2. `[待验证]` 网络盘 / UNC 作为 `local_root`。本机 C、D 均 `DriveType=3`（本地盘），此环境无法构造，需要真实 `\\server\share`。
+3. `[已确认]`（源码）`merge_existing=True` **在 UI 上可达**：`web-v1/components/chat/workspace-switcher.tsx:487-503` 有勾选框「合并存量文件」，条件是 `create.mode === "bind" && create.targetWorkspaceId`（绑定已有工作区，不是新建），默认 `false`，经 `app/api/workspaces/[id]/bind-local-root/route.ts:44` 透传。→ `legacy_dir` 的合并路径是**活代码**，不是死分支；见 §9.2。
 
 ---
 
@@ -208,3 +208,37 @@ grep 证据：`bind_local_root` 只出现在前两个文件，且两者都不 im
 - `test_sandbox_path_contract.py` 的 26 条路径矩阵与 `test_unbound_workspace_still_uses_volume` 就是在钉这个状态。
 
 也就是说，任何让「绑定态」收敛到单一根的做法，都必须让「未绑定态」的落点、越界判定、以及 `workspace-volumes/{id}` 这个物理位置保持不变——这是 P0-2 的硬约束，不是可选项。
+
+---
+
+## 9. 待验证项补齐（2026-11-19 追加，仍为只读探针）
+
+### 9.1 绑定目录本身是 git 仓库
+
+构造：临时 `ETHOS_DATA_DIR`；绑定目录里 `git init -b main` + 1 个提交（`app.py`）+ 一个未跟踪的 `.env` + `origin` 指向本地 bare 仓库并已推送 `main`。然后 `bind_local_root` → `LocalSandbox` → 走工具层。全程不改代码、不碰真实数据。
+
+| # | 调用 | 实测结果 | 状态 |
+| --- | --- | --- | --- |
+| A | `files.list("/home/user/workspace/ws-repo")` | `[]`（`app.py` / `.env` / `.git` 一个都看不到） | `[已实测]` |
+| B | `git status` | `exitCode=128`，`fatal: not a git repository (or any of the parent directories): .git` | `[已实测]` |
+| C | `git log --oneline -3` / `git commit -m x` | 同 B（`exitCode=128` + 同一句 fatal） | `[已实测]` |
+| D | `git add app.py` | `kind=permission_denied`、`retryable=false`，消息：「无法核对这次 add 会暂存什么，已拒绝：fatal: not a git repository …」 | `[已实测]` |
+| E | `git add .` | 参数层先拒：`git add only accepts explicit paths, got '.'`（`kind=command_error`） | `[已实测]` |
+| F | `check_path("workspace/ws-repo/.git/config")` | 命中 `.git`（任何档位都拦；同判 `.git` 目录本身） | `[已实测]` |
+| G | `check_path("workspace/ws-repo/.env")` / `app.py` | 命中 `.env` / 放行 | `[已实测]` |
+| H | 绑定目录的 HEAD / 工作区状态 / 远端分支 | `HEAD` 前后一致、状态仍只有 `?? .env`、远端 `main` 仍在 → **整条链路对该目录零写入** | `[已实测]` |
+| I | `workspace-volumes/ws-repo` | 空目录，`.git` 不存在 | `[已实测]` |
+
+由此得到三条与设计无关的事实：
+
+1. **「绑定一个已有仓库」当前不是可用路径**：Agent 既看不到工作树（A），也看不到历史（B/C），`git status` 的报错还是「不是仓库」而不是「你绑定的目录不在这里」——模型无从纠正。
+2. **D 是一处诊断失真**（不是新缺陷，是既有行为被这条路径暴露）：真实原因是「cwd 不是仓库」，返回给模型的却是 `permission_denied` + 「无法核对这次 add 会暂存什么」。模型读到「权限」会转去换路径，而问题根本不在权限。记录事实，不在 P0-1/P0-2 里顺手改。
+3. **`.git` 的拦截与绑定无关，且改造后依然生效**：F 是 `permissions/paths.py` 的固定段规则（不可配置、`full` 档也生效）。所以即便 P0-2 把权威根切到绑定目录，文件工具读 `.git` 这条路仍然永久不可用——历史只能经 `git` 工具（真实 git 进程，不受字符串规则约束）拿。这决定了「Agent 能否理解一个已有仓库」必须靠 git 工具，而不是读文件。
+
+未覆盖：`git_push` 的远端段（需要 DB + 注入的 push 能力 + 真实远端凭据），当前只能按 F-4 认定它推的是 volume 仓库；E 也说明 Agent 想提交真实仓库时必须逐个文件 add。
+
+### 9.2 `merge_existing` 是活路径
+
+`workspace-switcher.tsx:487-503` 的勾选框「合并存量文件」只在 `mode === "bind" && targetWorkspaceId`（绑定**已有**工作区）时出现，默认关闭，经 `bind-local-root/route.ts:44` 透传到 `volume_service.bind(... merge_existing=...)`。所以 `merge_dir_add_only` / `legacy_dir` 是**产品可达**的分支——绑定已有工作区时，「旧 volume 副本里的文件要不要搬进本地目录」是用户可选的开关。
+
+对 P0-2 的含义（只陈述约束，不给方案）：绑定态一旦换根，**未勾选合并的旧 volume 内容会变成不可见**。这不是新行为（现在旧内容本来也不可见，只是反过来），但换根后它从「volume 里有、面板看不到」变成「volume 里有、谁都不看它」，需要一个明确处置口径。
