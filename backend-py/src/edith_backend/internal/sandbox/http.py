@@ -12,6 +12,7 @@ from fastapi import APIRouter, UploadFile
 from fastapi.responses import StreamingResponse
 
 from ..http_utils import EDITHError
+from .local import SandboxMountError
 from .service import SandboxNotFound, Service
 from .workspace import relative_path, workspace_path
 
@@ -44,6 +45,14 @@ class HTTP:
         self.router = self._build_router()
 
     async def _existing(self, user_id: str, session_id: str, path: str, allow_root: bool):
+        """校验路径 + 打开已存在的沙箱。
+
+        **不碰文件系统挂载**：只用 DB 查工作区上下文、纯字符串拼虚拟路径、`root.is_dir()`
+        打开沙箱，全程不调 `sandbox.resolve()`（那会触发 `_ensure_*_mount`）。
+        这个约束有调用方依赖——`list_files` 的 `except SandboxMountError` 只包住
+        `sandbox.files.list()`。若将来在这里加路径解析，那处异常映射会漏捕，
+        挂载损坏会退化成不带错误码的 500。
+        """
         if not user_id.strip() or not session_id.strip():
             raise EDITHError(400, "invalid_request", "userId and sessionId are required")
         # 文件面板只拿得到 sessionId，工作区上下文要从会话本身取：
@@ -79,6 +88,10 @@ class HTTP:
             sandbox, real_path = await self._existing(userId, sessionId, path, allow_root=True)
             try:
                 entries = await sandbox.files.list(real_path, depth=1)
+            except SandboxMountError as exc:
+                # 挂载点坏了不是「目录为空」。这个分支原本把所有异常吞成空列表，
+                # 会把「两个视图分裂」伪装成「工作区里没有文件」——正是要修的病。
+                raise EDITHError(500, "sandbox_mount_broken", str(exc)) from exc
             except Exception:  # noqa: BLE001
                 # 目录不存在（如工作区 Volume 尚未挂载到当前沙箱）→ 按空目录处理，避免 500
                 entries = []

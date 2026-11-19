@@ -32,6 +32,69 @@ _LOCAL_ROOT = (
 )
 
 
+class LocalRootError(ValueError):
+    """绑定入口的路径不能用作工作区根。
+
+    继承 ValueError：HTTP 层原本就把「本地目录不合法」映射成 400，
+    不需要再引入新的错误家族。子类只区分**原因**，不区分处理方式。
+    """
+
+    code = "invalid_local_root"
+
+
+class LocalRootNotAbsolute(LocalRootError):
+    """相对路径：落点取决于进程 cwd，桌面端会写进安装目录。"""
+
+    code = "local_root_not_absolute"
+
+
+class LocalRootMissing(LocalRootError):
+    """路径（或链接目标）不存在。"""
+
+    code = "local_root_missing"
+
+
+class LocalRootNotDirectory(LocalRootError):
+    """存在但不是目录。"""
+
+    code = "local_root_not_directory"
+
+
+class LocalRootUnavailable(LocalRootError):
+    """存在性未知：权限不足、网络盘掉线、重解析点损坏。原始 `OSError` 在 `__cause__`。"""
+
+    code = "local_root_unavailable"
+
+
+def normalize_local_root(raw: str | Path, *, strict: bool = False) -> Path:
+    """把绑定入口的路径规范化为**唯一形式**：绝对 + 真实大小写 + 展开 8.3 短名/联接。
+
+    为什么必须归一：`is_relative_to` 比较的是路径字符串，而磁盘上同一个目录有很多
+    写法（`Proj` / `proj` / `PROJ~1` / 联接的真实目标）。只要一侧是别名、另一侧是
+    真实路径，判定就失败——表现得像「文件明明在，却 403」。所以在入口归一一次，
+    内部只使用归一后的路径，之后每次比较都不必猜对方是哪种写法。
+
+    `strict=True` 用于**绑定新目录**：要求真实存在，失败按原因分三类报出，
+    不合并成一句「绑定失败」（不存在 / 不是目录 / 不可用，后者带 `__cause__`）。
+    `strict=False` 用于**从库里读回**旧绑定：目录被删不该让会话起不来，
+    错误应该从真实读写时冒出来，而不是在启动期把整条链打断。
+    """
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise LocalRootNotAbsolute(f"工作区根必须是绝对路径: {raw}")
+    try:
+        resolved = path.resolve(strict=strict)
+    except FileNotFoundError as exc:
+        raise LocalRootMissing(f"工作区根不存在: {path}") from exc
+    except OSError as exc:
+        raise LocalRootUnavailable(
+            f"工作区根不可用（权限不足/网络盘掉线/链接损坏）: {path}: {exc}"
+        ) from exc
+    if strict and not resolved.is_dir():
+        raise LocalRootNotDirectory(f"工作区根必须是目录: {resolved}")
+    return resolved
+
+
 class LocalVolumeBackend:
     """workspace → 本地目录。绑定用户目录后读写直连。"""
 
@@ -46,8 +109,20 @@ class LocalVolumeBackend:
     def bind_local_root(
         self, workspace_id: str, local_root: str, prefix: str = ""
     ) -> None:
-        """把 workspace 绑定到用户本地目录（消除副本）。"""
-        self._local_roots[workspace_id] = Path(local_root)
+        """把 workspace 绑定到用户本地目录（消除副本）。
+
+        **登记即归一**：注册表里只允许出现规范化后的路径。否则沙箱层每次
+        `is_relative_to` 都要猜对面写法，而绑定之后 `workspace-volumes/{id}`
+        必然是联接，猜错就是 403。
+        归一失败（盘不可达、权限不足）不等于绑定成功：保留原样并告警，让错误在
+        真正读写时冒出来——在会话启动期抛异常会连累整个对话，且看不出原因。
+        """
+        try:
+            root = normalize_local_root(local_root)
+        except LocalRootError as exc:
+            logger.warning("local root not normalized (%s): %s", exc.code, exc)
+            root = Path(local_root)
+        self._local_roots[workspace_id] = root
         self._prefixes[workspace_id] = (prefix or "").strip().strip("/")
 
     def unbind_local_root(self, workspace_id: str) -> None:

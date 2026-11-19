@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 from .merge import merge_dir_add_only, plan_merge
 from .store import WorkspaceStore
-from .volume_backend import LocalVolumeBackend
+from .volume_backend import LocalVolumeBackend, normalize_local_root
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +77,12 @@ class WorkspaceVolumeService:
         if root:
             prefix = await self._store.get_local_root_prefix(user_id, workspace_id)
             self._backend.bind_local_root(workspace_id, root, prefix)
+            # 日志打注册表里的值（= 归一后的），与沙箱层实际用的路径逐字一致：
+            # 库里可能是 8.3 短名，而真实比较用的是长名，两边不一致时排查毫无线索。
             logger.info(
                 "workspace %s bound to local root %s (prefix=%r)",
                 workspace_id,
-                root,
+                self.local_root_of(workspace_id),
                 prefix,
             )
         return root
@@ -101,18 +102,21 @@ class WorkspaceVolumeService:
         期间的产物）**默认不合并**——绑定一个既有目录不应附带全量文件迁移；调用方如需旧
         产物，显式传 ``merge_existing=True``（仍**只新增不覆盖**）。
 
+        **顺序**：先归一 + 校验，再写库。反过来会留下两种坏状态——失败却永久写进一条
+        指向不可用目录的记录，或者把原来那条有效绑定覆盖掉。
+
         返回 BindOutcome：本次合并文件数 + 旧副本中仍未合并（本地缺失）的文件数，
         后者供 UI 提示「还有 N 个文件未合并」。
         """
-        await self._store.bind_local_root(user_id, workspace_id, local_root, prefix)
+        root = normalize_local_root(local_root, strict=True)
+        await self._store.bind_local_root(user_id, workspace_id, str(root), prefix)
         self._local_root_loaded.add(workspace_id)
-        self._backend.bind_local_root(workspace_id, local_root, prefix)
+        self._backend.bind_local_root(workspace_id, str(root), prefix)
 
         legacy = self._backend.legacy_dir(workspace_id)
-        dst = Path(local_root)
-        merged = merge_dir_add_only(legacy, dst, prefix=prefix) if merge_existing else 0
+        merged = merge_dir_add_only(legacy, root, prefix=prefix) if merge_existing else 0
         # 合并后重算：仍在旧副本、本地没有的文件（含合并失败项）
-        unmerged = len(plan_merge(legacy, dst, prefix=prefix))
+        unmerged = len(plan_merge(legacy, root, prefix=prefix))
         return BindOutcome(merged_files=merged, unmerged_files=unmerged)
 
     def local_root_prefix_of(self, workspace_id: str) -> str:

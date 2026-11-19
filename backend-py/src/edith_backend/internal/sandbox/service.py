@@ -100,7 +100,7 @@ class Service:
         """返回可用的沙箱；目录不存在就建。
 
         workspace_id 不参与创建：`workspace/{id}` 的联接是在第一次解析工作区路径时
-        按需建立的（`LocalSandbox._ensure_workspace_mount`）。会话可以换绑工作区，
+        按需建立的（`LocalSandbox._workspace_volume_dir`）。会话可以换绑工作区，
         在这里预先按当前 workspace_id 建一次，反而会在换绑后留下指向旧工作区的联接。
         """
         user_id, session_id = user_id.strip(), session_id.strip()

@@ -38,6 +38,7 @@ from .types import (
     WorkspaceRenameRequest,
     WorkspaceResponse,
 )
+from .volume_backend import LocalRootError, normalize_local_root
 from .volume_service import WorkspaceVolumeService
 
 logger = logging.getLogger(__name__)
@@ -52,13 +53,16 @@ _ALLOWED_LOCAL_ROOTS = [
 
 
 def _validate_local_root(raw: str) -> str:
-    """校验本地目录：必须是存在的绝对路径，且在白名单内（未配置白名单则放行并告警）。"""
-    path = Path(raw).expanduser()
-    if not path.is_absolute():
-        raise EDITHError(400, "invalid_local_root", "localRoot must be an absolute path")
-    resolved = path.resolve()
-    if not resolved.exists() or not resolved.is_dir():
-        raise EDITHError(400, "invalid_local_root", f"localRoot not a directory: {resolved}")
+    """校验本地目录：存在的绝对路径 + 是目录 + 在白名单内（未配置白名单则放行并告警）。
+
+    归一化本身用 `normalize_local_root`（与沙箱层同一个实现），这里只负责把
+    「为什么不能用」翻成 HTTP 语义：路径不合法 → 400（带原因码），越白名单 → 403。
+    重复实现一遍的好处只有一种——两边慢慢变得不一样。
+    """
+    try:
+        resolved = normalize_local_root(raw, strict=True)
+    except LocalRootError as exc:
+        raise EDITHError(400, exc.code, str(exc)) from exc
     if _ALLOWED_LOCAL_ROOTS:
         allowed = [Path(p).expanduser().resolve() for p in _ALLOWED_LOCAL_ROOTS]
         if not any(resolved == a or a in resolved.parents for a in allowed):

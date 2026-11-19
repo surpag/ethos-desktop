@@ -139,8 +139,8 @@ def test_bind_local_root_defaults_to_no_merge(tmp_path: Path) -> None:
 
     assert outcome == BindOutcome(merged_files=0, unmerged_files=2)
     assert list(dst.rglob("*")) == []  # 一个文件都没搬
-    # 绑定本身仍然生效
-    assert backend.local_root_of("w1") == dst
+    # 绑定本身仍然生效（注册表存归一后的路径，与沙箱层比较时同一规范化平面）
+    assert backend.local_root_of("w1") == dst.resolve()
 
 
 def test_bind_local_root_merges_when_requested(tmp_path: Path) -> None:
