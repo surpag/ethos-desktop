@@ -231,6 +231,7 @@ S2 与 S3 必须分开：S2 改的是 Agent 执行链的数据根，S3 改的是
 | S1-① | `workspace/context.py`：探测层 / 解析层 / 不可变快照；未绑定态基线（18 条，sha256 冻结于改码之前） | 完成 |
 | S1-② | 快照接入 `_run`（`run.started` 之后、`set_task_status` 之前）+ `workspace_unavailable` 错误类型 + §1.5 的 ①②③ 租约用例 | 完成 |
 | S2 | 文件工具与 Git 消费快照：绑定态落 `local_root`、异常态 fail-closed、不建副本 | 完成 |
+| S3 | 面板与执行链同源：绑定态不再回落读旧副本（`UNAVAILABLE` → 409） | 完成 |
 
 S2 之后仍然没有接线的是 **Shell 与面板**：Shell 的 cwd 仍由 `_op_sandbox_run_command`
 硬编码为 `/home/user/work`（S4），面板快速路径仍是 `local_workspace_path`（S3）。
