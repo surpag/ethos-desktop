@@ -519,8 +519,8 @@ class Service:
             )
 
             # 工作区快照：绑定状态在 run 内只读一次，运行中换绑不影响本次语义。
-            # 本阶段（S1）只用于 fail-closed——路径映射还没接它（S2 才接文件工具与 Git）。
-            await self._capture_workspace_context(request)
+            # 异常态在这里就失败（fail-closed），不进入工具循环。
+            workspace_context = await self._capture_workspace_context(request)
 
             # 任务状态：run 启动即标记 in_progress（后续只有"模型主动完成/用户取消"会改走，
             # 其余异常终止一律不改——因此崩溃后状态天然停留在 in_progress，可被恢复）
@@ -624,6 +624,7 @@ class Service:
                 approvals=self.approvals,
                 permission_level=permission_level,
                 interactive=request.interactive,
+                workspace_context=workspace_context,
             )
             # 任务状态：仅"模型主动完成"写 completed 并清进度；
             # rounds_exhausted 等未完成终止保持 in_progress（供下次续跑）

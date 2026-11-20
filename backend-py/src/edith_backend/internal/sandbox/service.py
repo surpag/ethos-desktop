@@ -14,6 +14,7 @@ import logging
 
 import aiosqlite
 
+from ..workspace.context import WorkspaceContext
 from ..workspace.store import WorkspaceStore
 from ..workspace.volume_service import WorkspaceVolumeService
 from .local import LocalSandbox
@@ -95,18 +96,25 @@ class Service:
         return backend.resolve_workspace_path(relative)
 
     async def workspace(
-        self, user_id: str, session_id: str
+        self,
+        user_id: str,
+        session_id: str,
+        context: WorkspaceContext | None = None,
     ) -> LocalSandbox:
         """返回可用的沙箱；目录不存在就建。
 
         workspace_id 不参与创建：`workspace/{id}` 的联接是在第一次解析工作区路径时
         按需建立的（`LocalSandbox._workspace_volume_dir`）。会话可以换绑工作区，
         在这里预先按当前 workspace_id 建一次，反而会在换绑后留下指向旧工作区的联接。
+
+        `context` 是**本次执行**的工作区快照，原样交给沙箱：绑定状态由此进入
+        执行链（S2）。缺省 `None` = 调用方没有上下文，路径行为与改造前一致
+        （面板 / 旧调用路径）。
         """
         user_id, session_id = user_id.strip(), session_id.strip()
         if not user_id or not session_id:
             raise ValueError("sandbox requires a user ID and session ID")
-        sandbox = LocalSandbox.open(user_id, session_id)
+        sandbox = LocalSandbox.open(user_id, session_id, context=context)
 
         # `user_sandboxes` 仍要记：UI 的沙箱面板和 `existing_workspace` 都读它。
         existing = await self._load_sandbox_id(user_id, session_id)

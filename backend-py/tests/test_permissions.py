@@ -353,7 +353,12 @@ class _FakeService:
     def __init__(self, sandbox: LocalSandbox) -> None:
         self._sandbox = sandbox
 
-    async def workspace(self, user_id: str, session_id: str) -> LocalSandbox:
+    async def workspace(
+        self,
+        user_id: str,
+        session_id: str,
+        context=None,  # noqa: ANN001 - 与 Service.workspace 同签名；本替身只做转发
+    ) -> LocalSandbox:
         return self._sandbox
 
 

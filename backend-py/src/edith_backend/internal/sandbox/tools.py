@@ -25,6 +25,7 @@ from ..permissions.types import PERMISSION_DENIED
 from ..skills.budget import charge_skill_load
 from ..skills.types import SKILL_FILE, SKILLS_PATH
 from ..tools import COMMAND_ERROR, TOOL_FAILURE, command_stderr_hint, tool_error_result
+from ..workspace.context import WorkspaceContext
 from .local import LocalSandbox, SandboxPathError
 from .service import Service
 from .types import FileType
@@ -502,12 +503,19 @@ class SandboxToolSet:
         user_id: str,
         session_id: str,
         workspace_id: str = "",
+        context: WorkspaceContext | None = None,
     ) -> str:
         """统一执行入口。
 
         本次修改：新增 workspace_id 参数（默认空串，向后兼容）——
         Web 场景下模型没有「当前目录」概念，由工具层在文件类工具执行前
         自动把相对路径补全到 workspace/{workspace_id}/ 下，模型无需拼 ID。
+
+        `context`：本次执行的工作区快照（S2）。它决定 `workspace/{id}` 落到
+        哪个真实目录——绑定态落在用户目录，未绑定态落在 `workspace-volumes/{id}`。
+        缺省 `None` = 调用方没有上下文，路径行为与改造前完全一致。
+        **必须由调用方按调用传入**：这里不读注册表、不读绑定记录，
+        否则"执行中被换绑"会让同一个 run 的落点漂移。
         """
         handler = getattr(self, f"_op_{name}", None)
         if handler is None:
@@ -522,7 +530,9 @@ class SandboxToolSet:
             except Exception as exc:  # noqa: BLE001 - 与下方统一错误出口一致
                 return tool_error_result(name, exc)
         try:
-            sandbox = await self._service.workspace(user_id, session_id)
+            sandbox = await self._service.workspace(
+                user_id, session_id, context=context
+            )
         except Exception as exc:  # noqa: BLE001 - 沙箱不可用降级：工具结果返回错误，Agent 转纯文本
             logger.warning("sandbox unavailable tool=%s user=%s error=%s", name, user_id, exc)
             return json.dumps(

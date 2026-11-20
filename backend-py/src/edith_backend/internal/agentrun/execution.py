@@ -34,6 +34,7 @@ from ..permissions.types import (
 from ..session.store import SessionStore
 from ..skills.budget import bind_skill_load_budget, new_skill_load_budget
 from ..tools import tool_error_result
+from ..workspace.context import WorkspaceContext
 from ..trace import (
     DEGRADE_SUMMARY,
     LLM_CALL,
@@ -1150,6 +1151,7 @@ async def chat(
     *,
     permission_level: PermissionLevel,
     interactive: bool = True,
+    workspace_context: WorkspaceContext | None = None,
 ) -> tuple[Tokens, str, int, str, int, str]:
     """执行一次流式对话（含工具调用循环）。
 
@@ -1170,6 +1172,11 @@ async def chat(
     started_at：本轮任务起点（time.monotonic）。由调用方传入以覆盖 MCP 连接等准备阶段；
     缺省则以本函数入口为起点。耗时随 assistant 消息一并落库，刷新历史仍可见。
     tracer：链路追踪打点器；缺省为空转（不影响任何行为）。
+
+    workspace_context：本次执行的工作区快照（S2）。它沿调用链**显式**传给工具层，
+    决定 `workspace/{id}` 落到哪个真实目录。刻意不用 ContextVar 之类的隐式状态：
+    这里需要的作用域是"某一次工具调用的工作区"，而隐式状态会把
+    「授权层带了 workspace_id、执行层没带」那个老缺口换个形式请回来。
     """
     if started_at is None:
         started_at = time.monotonic()
@@ -1709,9 +1716,15 @@ async def chat(
                     if is_mcp:
                         result = await mcp_tools.execute(name, arguments)
                     elif tool_executor is not None:
-                        # 透传当前会话 workspace_id，使 Sandbox 工具层能自动补全工作区路径
+                        # 透传当前会话 workspace_id，使 Sandbox 工具层能自动补全工作区路径；
+                        # 同时透传本次执行的上下文快照，决定工作区路径的真实落点（S2）
                         result = await tool_executor.execute(
-                            name, arguments, user_id, session_id, workspace_id_arg
+                            name,
+                            arguments,
+                            user_id,
+                            session_id,
+                            workspace_id_arg,
+                            context=workspace_context,
                         )
                     else:
                         result = json.dumps(

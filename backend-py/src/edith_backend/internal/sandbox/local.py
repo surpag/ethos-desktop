@@ -33,6 +33,7 @@ from typing import Any
 
 from ...config import data_root
 from ..skills.types import SKILLS_PATH
+from ..workspace.context import BindingState, WorkspaceContext, WorkspaceUnavailableError
 from ..workspace.layout import WORKSPACE
 from .types import FileType
 
@@ -512,24 +513,46 @@ class LocalSandbox:
     # tools.py 依据这个标记跳过 sed 分支——那个分支在 Windows 上没有 sed 可执行。
     supports_large_read = True
 
-    def __init__(self, root: Path, sandbox_id: str) -> None:
+    def __init__(
+        self,
+        root: Path,
+        sandbox_id: str,
+        context: WorkspaceContext | None = None,
+    ) -> None:
         self._root = root
         self.sandbox_id = sandbox_id
+        #: 本次执行的工作区上下文快照。`None` = 调用方没有提供（面板 / 旧调用路径），
+        #: 此时完全走改造前的路径（`workspace-volumes/{id}` + 按需创建）。
+        #: **它是一次执行认定的根，不是"当前绑定"**：run 内不重新读取，换绑不影响。
+        self._context = context
         self.files = LocalFiles(self)
         self.commands = LocalCommands(self)
         # 后台进程登记表：pid → asyncio 子进程。只用于 list/kill，
         # 进程退出后由 `_reap` 摘掉，避免无限增长。
         self._background: dict[int, asyncio.subprocess.Process] = {}
 
+    @property
+    def workspace_context(self) -> WorkspaceContext | None:
+        """本次执行认定的工作区上下文（可能为 `None`，见 `__init__`）。"""
+        return self._context
+
     # ---- 生命周期 ----
 
     @classmethod
-    def open(cls, user_id: str, session_id: str) -> LocalSandbox:
+    def open(
+        cls,
+        user_id: str,
+        session_id: str,
+        context: WorkspaceContext | None = None,
+    ) -> LocalSandbox:
         """打开（或重建）本地沙箱。
 
         与远端沙箱的关键差别：目录被外部删掉时这里直接重建，不会像失效的
         `sandbox_id` 那样让 `connect` 永远失败。本地模式下「沙箱」就是一个目录，
         重建的代价是零。
+
+        `context` 只影响**工作区路径的落点**（见 `_workspace_volume_dir`），
+        不影响沙箱自身的目录结构：沙箱根永远按会话建。
         """
         root = sandbox_root_for(user_id, session_id)
         root.mkdir(parents=True, exist_ok=True)
@@ -539,17 +562,30 @@ class LocalSandbox:
         # `skills/` 是固定挂载点，不依赖任何参数，所以这里就能建。
         for name in (WORKSPACE.uploads, WORKSPACE.work, WORKSPACE.artifacts):
             (root / name).mkdir(parents=True, exist_ok=True)
-        sandbox = cls(root, f"local-{_safe_segment(user_id)}-{_safe_segment(session_id)}")
+        sandbox = cls(
+            root,
+            f"local-{_safe_segment(user_id)}-{_safe_segment(session_id)}",
+            context=context,
+        )
         sandbox._ensure_skills_mount()
         return sandbox
 
     @classmethod
-    def attach(cls, user_id: str, session_id: str) -> LocalSandbox:
+    def attach(
+        cls,
+        user_id: str,
+        session_id: str,
+        context: WorkspaceContext | None = None,
+    ) -> LocalSandbox:
         """只打开已存在的沙箱，不创建。不存在时抛 FileNotFoundError。"""
         root = sandbox_root_for(user_id, session_id)
         if not root.is_dir():
             raise FileNotFoundError(f"本地沙箱目录不存在: {root}")
-        return cls(root, f"local-{_safe_segment(user_id)}-{_safe_segment(session_id)}")
+        return cls(
+            root,
+            f"local-{_safe_segment(user_id)}-{_safe_segment(session_id)}",
+            context=context,
+        )
 
     async def kill(self) -> None:
         """结束所有后台进程。**不删目录**：工作区文件是用户的，不能随沙箱一起没。"""
@@ -716,20 +752,99 @@ class LocalSandbox:
         return volumes
 
     def _workspace_volume_dir(self, workspace_id: str) -> Path:
-        """`workspace/{id}` 的权威副本目录（真实路径，按需创建）。
+        """`workspace/{id}` 的权威根目录（真实路径）。
 
-        与 `_ensure_workspace_mount()` 同一契约：绝对 + 已归一 + 存在。
+        两种情况泾渭分明：
 
-        归一在这里做而不是留给调用方：`workspace-volumes/{id}` 一旦是联接
-        （绑定本地目录后必然如此），`(base / sub).resolve()` 会跟到目标目录，
-        而未归一的 `base` 还停在联接上，`is_relative_to` 直接判越界。
-        这也是为什么 8.3 短名 / 大小写别名必须在**入口**归一：比较的双方
-        必须出自同一规范化平面。
+        - **调用方没给工作区上下文**（面板 / 旧调用路径）→ 走改造前的唯一行为：
+          `workspace-volumes/{id}`，按需创建。这条分支逐字节不变。
+        - **给了上下文**（Agent 执行链）→ 按 `_contextual_workspace_dir` 的状态表
+          分流：未绑定与改造前一致，绑定态落在用户目录，异常态 fail-closed。
+
+        为什么不在这里统一读一次注册表：注册表是**运行期缓存**，而上下文是
+        **一次执行的认定**。读缓存会让"执行中被换绑"改变当前 run 的落点，
+        而读上下文不会——这也是 S1 把快照做成不可变对象的原因。
+        """
+        if self._context is not None:
+            return self._contextual_workspace_dir(workspace_id)
+        return self._volume_copy_dir(workspace_id)
+
+    def _volume_copy_dir(self, workspace_id: str) -> Path:
+        """未绑定态的权威副本目录：`workspace-volumes/{id}`，**按需创建**。
+
+        这是 S1 之前唯一的行为，必须原样保留：未绑定工作区的目录由执行链按需
+        初始化，去掉这一步新工作区就没有目录可用（"禁止 mkdir"只对绑定态成立）。
         """
         volumes = self._ensure_workspace_mount()
         volume = volumes / _safe_segment(workspace_id)
         volume.mkdir(parents=True, exist_ok=True)
         return volume.resolve()
+
+    def _contextual_workspace_dir(self, workspace_id: str) -> Path:
+        """按本次执行的工作区上下文决定权威根。
+
+        | 状态 | 落点 | 是否创建 |
+        | --- | --- | --- |
+        | `UNBOUND` | `workspace-volumes/{id}` | 按需创建（同改造前） |
+        | `BOUND_READY` | 绑定目录 `local_root` | **不创建** |
+        | missing / denied / offline | 抛 `WorkspaceUnavailableError` | 不创建 |
+
+        **异常态绝不回退到 Volume**：一旦回退，用户读到的是旧副本，而且没有任何
+        信号说明"这不是你绑定的目录"——那正是 P0-2 要消灭的静默切换。
+
+        **绑定态不创建**：权威根由用户提供，执行链只是使用者。目录被改名后
+        如果在这里 mkdir，就会在原路径造出一个空目录（`LocalFiles.write` 与
+        `LocalCommands.run` 都会对"解析出来的父目录"mkdir），用户把原目录
+        恢复回来时会看到两份内容不同。
+        """
+        context = self._context
+        if context is None:  # pragma: no cover - 由 _workspace_volume_dir 保证
+            return self._volume_copy_dir(workspace_id)
+
+        # 一次执行固定在一个工作区上。路径指向别的工作区时必须拒绝：
+        # 授权层（`_scope_violation`）正常情况下已经拦住了，这里是执行层的
+        # 第二道——两层用的是同一个 id，不该出现"授权通过、执行落到别处"。
+        if context.workspace_id and context.workspace_id != workspace_id:
+            raise SandboxPathError(
+                f"路径指向工作区 {workspace_id}，本次执行固定为 {context.workspace_id}"
+            )
+
+        if not context.executable:
+            raise WorkspaceUnavailableError(context)
+
+        if context.state is BindingState.UNBOUND:
+            return self._volume_copy_dir(workspace_id)
+
+        root = context.root
+        if not root:  # pragma: no cover - BOUND_READY 必有 root
+            raise WorkspaceUnavailableError(context)
+        if context.prefix:
+            # 带前缀的绑定：虚拟视图里多一层目录（`workspace/{id}/Data/…` ↔
+            # `local_root/…`），而 Agent 的相对路径补全不带这一层。半映射的结果是
+            # "读得到一部分、写错另一部分"，所以宁可停在这里。
+            raise SandboxPathError(
+                f"该工作区绑定目录带前缀层 {context.prefix!r}，虚拟路径与本地路径"
+                "不是一一对应，当前版本未接入这种绑定。请在工作区设置里重新绑定"
+                "到实际的工作目录。"
+            )
+
+        # 仍然维护 `{root}/workspace` 联接：S4 之前 shell 走联接，撤掉它会让
+        # shell 从"看到旧副本"退化成"目录不存在"，后者更难解释。它只创建
+        # 联接与 `workspace-volumes` 根本身，不会创建 `{id}` 子目录。
+        self._ensure_workspace_mount()
+
+        root_path = Path(root)
+        # 快照说 ready，不代表现在还 ready：目录可能在 run 期间被移动、改名或
+        # 所在磁盘掉线。这里必须**事后再确认一次**，因为下游有多个"看到路径就
+        # mkdir 父目录"的调用点（`LocalFiles.write` 的 `parent.mkdir`、
+        # `LocalCommands.run` 对 cwd 的 mkdir）——不在这里拦住，它们会在原路径
+        # 重建一条空目录树，用户把原目录恢复回来就看到两份内容不同。
+        if not root_path.is_dir():
+            raise WorkspaceUnavailableError(
+                context,
+                "绑定目录在本次执行期间已不可访问（可能被移动、改名，或所在磁盘掉线）",
+            )
+        return root_path.resolve()
 
     def virtual(self, real: Path) -> str:
         """真实路径 → 虚拟路径（回给模型的路径必须是 `/home/user/...`）。
@@ -756,6 +871,27 @@ class LocalSandbox:
         if rel is not None:
             posix = rel.as_posix()
             return WORKSPACE.root if posix in ("", ".") else posixpath.join(WORKSPACE.root, posix)
+
+        # 绑定工作区：权威根既不在沙箱树里，也不是 `workspace-volumes`，
+        # 必须在这里还原。否则文件工具返回的是宿主绝对路径（`C:\Users\…`），
+        # 模型把它原样传回来会被 `resolve()` 判成越界——表现为"刚写完就读不到"，
+        # 而且模型会把同一个路径重试到熔断。
+        context = self._context
+        if (
+            context is not None
+            and context.state is BindingState.BOUND_READY
+            and context.root
+        ):
+            bound = Path(context.root)
+            for candidate in (raw, raw.resolve()):
+                bound_rel = _relative_or_none(candidate, bound)
+                if bound_rel is None:
+                    continue
+                base = posixpath.join(
+                    WORKSPACE.root, WORKSPACE.workspace, context.workspace_id
+                )
+                posix = bound_rel.as_posix()
+                return base if posix in ("", ".") else posixpath.join(base, posix)
 
         resolved = raw.resolve()
 

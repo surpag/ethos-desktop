@@ -111,13 +111,20 @@ class WorkspaceUnavailableError(RuntimeError):
     定义在领域层而不是执行层，因为「绑定状态决定能不能跑」是工作区的语义，
     与具体消费者（Agent run / 面板 / 定时任务）无关。带上快照本身，
     上层既可以只显示文案，也可以拿 `state`/`detail` 做更细的诊断。
+
+    `detail` 用于**快照之后**才发生的失效：快照固定的是"这次执行用哪个根"，
+    而"根此刻还在不在"是 I/O 事实。两者不能混：快照时探测失败是状态问题
+    （`state` 就不是 ready），执行期间目录被移走是运行期失败（`state` 仍是
+    ready，但不能再继续）。把后者硬塞进 `state` 就等于允许路径语义在 run 内漂移。
     """
 
-    def __init__(self, context: WorkspaceContext) -> None:
+    def __init__(self, context: WorkspaceContext, detail: str | None = None) -> None:
         self.context = context
+        #: 覆盖文案里的原因（`None` = 用快照时的探测详情）
+        self.detail = context.detail if detail is None else detail
         super().__init__(
             f"工作区绑定目录不可用（{context.state.value}）："
-            f"{context.detail or '未提供具体原因'}。"
+            f"{self.detail or '未提供具体原因'}。"
             "请确认该目录仍然存在且可访问，或在工作区设置里重新绑定。"
         )
 
