@@ -222,6 +222,19 @@ def _decode_output(raw: bytes) -> str:
 # 后面的分隔符涵盖引号、空白、管道与重定向——这些都是命令字符串里真实会出现的边界。
 _VIRTUAL_ROOT_RE = re.compile(r"/home/user(?=[/\s'\"`;|&)]|$)")
 
+# 虚拟路径前缀后面必须跟分隔符或行尾，否则 `workspace/ws-1` 会匹配到 `workspace/ws-10`。
+_VIRTUAL_BOUNDARY = r"(?=[/\s'\"`;|&)]|$)"
+
+# 输出归一化：从 `/home/user` 起、到命令分隔符为止的一段（内含反斜杠混排要拉平）。
+_VIRTUAL_SEGMENT_RE = re.compile(r"/home/user[^\s'\"`;|&)]*")
+
+
+def _replace_virtual_prefix(cmd: str, virtual: str, real: str) -> str:
+    """把命令里出现的 `virtual` 前缀替换成 `real`（带边界，不误伤同前缀的兄弟路径）。"""
+    if virtual not in cmd or not real:
+        return cmd
+    return re.sub(re.escape(virtual) + _VIRTUAL_BOUNDARY, lambda _m: real, cmd)
+
 
 def _relative_or_none(path: Path, root: Path) -> Path | None:
     """`path` 在 `root` 之下就返回相对路径，否则 None。
@@ -828,9 +841,10 @@ class LocalSandbox:
                 "到实际的工作目录。"
             )
 
-        # 仍然维护 `{root}/workspace` 联接：S4 之前 shell 走联接，撤掉它会让
-        # shell 从"看到旧副本"退化成"目录不存在"，后者更难解释。它只创建
-        # 联接与 `workspace-volumes` 根本身，不会创建 `{id}` 子目录。
+        # 仍然维护 `{root}/workspace` 联接。S4 之后 shell 不再依赖它（cwd 是工作区根、
+        # 命令里的虚拟路径由 `_translate` 分流），但**未绑定态**与面板仍在用它，
+        # 撤掉会让 `ls workspace` 从"看到旧副本"退化成"目录不存在"，后者更难解释。
+        # 它只创建联接与 `workspace-volumes` 根本身，不会创建 `{id}` 子目录。
         self._ensure_workspace_mount()
 
         root_path = Path(root)
@@ -1096,22 +1110,75 @@ class LocalCommands:
                     virtual,
                     text,
                 )
-        return text
+        # 宿主路径的 `str()` 形式用反斜杠，替换之后虚拟前缀后面会留下 `\`：
+        # `C:\p\ws\app.py` → `/home/user/workspace/ws1\app.py`。`resolve()` 能靠
+        # `replace("\\", "/")` 救回来，但两种分隔符混排会留在工具结果和历史里，
+        # 徒增歧义；绑定态尤其明显，因为绑定根只有 `str()` 形式会命中。
+        return _VIRTUAL_SEGMENT_RE.sub(lambda m: m.group(0).replace("\\", "/"), text)
 
     def _path_pairs(self) -> list[tuple[str, str]]:
-        """(宿主路径写法, 虚拟路径) —— 覆盖 bash 的 `/c/...` 与 Windows 的两种写法。"""
+        """(宿主路径写法, 虚拟路径) —— 覆盖 bash 的 `/c/...` 与 Windows 的两种写法。
+
+        绑定态多一条：用户目录 ↔ `workspace/{id}`。少了它，`ls` 的输出里会是
+        `C:\\Users\\...` 而不是模型刚写过的虚拟路径，模型会照着宿主路径再调一次
+        文件工具，而那个路径会被 `resolve()` 判成越界（它确实不在虚拟命名空间里）。
+        """
         root = self._sb.root
         volumes = data_root() / "workspace-volumes"
+        targets: list[tuple[Path, str]] = []
+        context = self._sb.workspace_context
+        if context is not None and context.state is BindingState.BOUND_READY and context.root:
+            targets.append(
+                (
+                    Path(context.root),
+                    posixpath.join(WORKSPACE.root, WORKSPACE.workspace, context.workspace_id),
+                )
+            )
+        targets.append((volumes, f"{WORKSPACE.root}/{WORKSPACE.workspace}"))
+        targets.append((root, WORKSPACE.root))
         pairs: list[tuple[str, str]] = []
-        for real_path, virtual in ((volumes, f"{WORKSPACE.root}/{WORKSPACE.workspace}"), (root, WORKSPACE.root)):
+        for real_path, virtual in targets:
             for form in (self._shell_path_of(real_path), real_path.as_posix(), str(real_path)):
                 pairs.append((form, virtual))
-        # 长的先换：workspace-volumes 与 sandbox 根互不为前缀，但保险起见按长度倒序。
+        # 长的先换：绑定目录可能整个包住沙箱根（用户绑到 data_root 的上级），
+        # 也可能被沙箱根包住；按长度倒序是唯一不需要假设两者关系的排法。
+        pairs.sort(key=lambda item: len(item[0]), reverse=True)
+        return pairs
+
+    def _virtual_pairs(self) -> list[tuple[str, str]]:
+        """(虚拟路径前缀, shell 写法) —— 长的在前，供 `_translate` 使用。
+
+        与 `_path_pairs` 是同一张表的两个方向，但**不能直接复用**：后者为每个真实
+        路径生成三种写法（`/c/...` / `C:/...` / `C:\\...`），而虚拟路径在命令里
+        只会以 `/home/user/...` 这一种形式出现。
+
+        `workspace/{id}` 在绑定态必须排在最前：否则 `/home/user/workspace/ws-1`
+        会被更短的 `/home/user/workspace` 先吃掉，翻译成 `workspace-volumes/ws-1`
+        ——那正是 S4 要消灭的旧副本视图。
+        """
+        workspace_base = posixpath.join(WORKSPACE.root, WORKSPACE.workspace)
+        pairs: list[tuple[str, str]] = []
+        context = self._sb.workspace_context
+        if context is not None and context.state is BindingState.BOUND_READY and context.root:
+            pairs.append(
+                (
+                    posixpath.join(workspace_base, context.workspace_id),
+                    self._shell_path_of(Path(context.root)),
+                )
+            )
+        pairs.append((workspace_base, self._shell_path_of(data_root() / "workspace-volumes")))
+        pairs.append(
+            (
+                posixpath.join(WORKSPACE.root, SKILLS_PATH),
+                self._shell_path_of(data_root() / SKILLS_PATH),
+            )
+        )
+        pairs.append((WORKSPACE.root, self._shell_path_of(self._sb.root)))
         pairs.sort(key=lambda item: len(item[0]), reverse=True)
         return pairs
 
     def _translate(self, cmd: str) -> str:
-        """把命令里的 `/home/user` 换成真实的沙箱根。
+        """把命令里的虚拟路径换成真实路径，**长的前缀优先**。
 
         这是**唯一**一处替模型做路径翻译的地方，和文件原语里的 `resolve()` 是同一件事：
         模型永远只需要知道 `/home/user`（prompt、工具描述、历史记录都这么写），
@@ -1120,11 +1187,19 @@ class LocalCommands:
         为什么不能靠"让模型用 Windows 路径"绕过：`/home/user` 写在 prompt 里，
         改成 `D:\\...` 会让同一条规则在不同执行环境里都不一样，
         而且模型对 `/home/user` 的先验远比对一个 UUID 目录强。
+
+        **为什么不再只换 `/home/user` 一个前缀**：绑定态下 `workspace/{id}` 与
+        `workspace-volumes/{id}` 是两份数据。只换沙箱根，命令里的
+        `/home/user/workspace/ws-1/a.txt` 会经 `{root}/workspace` 联接落到旧副本上，
+        而文件工具写的是用户目录——模型「刚写完就 cat 不到」，同一个路径重试到熔断。
+        按前缀分流之后，绝对虚拟路径与 cwd 走的是同一个根。
+
+        **不宣称越界隔离**：命令本身是 `unrestricted`，`cd /` 照样能读整台机器。
+        这里只保证"模型写的虚拟路径指向它以为的那份数据"，不是沙箱边界。
         """
-        root = WORKSPACE.root
-        if root not in cmd:
-            return cmd
-        return _VIRTUAL_ROOT_RE.sub(lambda _m: self._shell_path_of(self._sb.root), cmd)
+        for virtual, real in self._virtual_pairs():
+            cmd = _replace_virtual_prefix(cmd, virtual, real)
+        return cmd
 
     @staticmethod
     def _shell_path_of(real: Path) -> str:

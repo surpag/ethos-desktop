@@ -25,7 +25,7 @@ from ..permissions.types import PERMISSION_DENIED
 from ..skills.budget import charge_skill_load
 from ..skills.types import SKILL_FILE, SKILLS_PATH
 from ..tools import COMMAND_ERROR, TOOL_FAILURE, command_stderr_hint, tool_error_result
-from ..workspace.context import WorkspaceContext
+from ..workspace.context import WorkspaceContext, WorkspaceUnavailableError
 from .local import LocalSandbox, SandboxPathError
 from .service import Service
 from .types import FileType
@@ -69,12 +69,35 @@ def _join_argv(command: str, argv: list[str] | None) -> str:
     return " ".join([command, *(shlex.quote(str(a)) for a in argv)])
 
 
-# 需要做工作区路径补全的文件类工具（进程类工具不动，cwd 固定 work/）
+def _command_cwd(workspace_id: str) -> str:
+    """进程类工具的初始 cwd：有工作区就是工作区根，没有就是 `work/`。
+
+    返回的是**虚拟路径**，由 `LocalSandbox.resolve()` 落地（未绑定态
+    `workspace-volumes/{id}` 按需创建、绑定态用户目录）。这里不能自己拼真实
+    路径：绑定判定只有一处，散到第二个地方就必然出现"文件工具写 A、shell 读 B"。
+
+    为什么不固定 `work/`：绑定态下文件工具落在用户目录，而 `work/` 在沙箱树里，
+    shell 里 `ls`/`cat` 看到的是 `workspace-volumes` 那份旧副本。同一轮里两个视图，
+    模型会把同一个路径重试到熔断（S4 之前就是这个状态）。
+    """
+    if workspace_id:
+        return WORKSPACE.workspace_path(workspace_id)
+    return WORKSPACE.work_path()
+
+
+# 需要做工作区路径补全的文件类工具（进程类工具只改 cwd，路径仍按虚拟名称原样传）
 # 本次新增：配合 workspace_id 的「隐式工作区」能力（Web 场景模型无当前目录概念）
 _FILE_TOOLS = {
     "sandbox_list_files", "sandbox_read_file", "sandbox_write_file",
     "sandbox_make_directory", "sandbox_move_path", "sandbox_delete_path",
 }
+
+# 需要把「当前工作区」传给 `_op_*` 的工具。分两类理由，但都指向同一件事：
+# 执行层必须知道这次执行落在哪个工作区，而不是自己猜。
+# - 文件类：`workspace_path` 用它判定越权、补全缺省的 ID 段；
+# - 进程类：cwd 要落在工作区根（S4）。漏了这一条，shell 仍以 `work/` 起进程，
+#   与文件工具看两个目录——「刚写完就 cat 不到」正是这么回来的。
+_WORKSPACE_SCOPED_TOOLS = _FILE_TOOLS | {"sandbox_run_command", "sandbox_start_process"}
 
 # 方案 B（B2/B3）：可能改变沙箱文件内容的工具 → 触发本地↔沙箱增量同步
 _MUTATING_TOOLS = {
@@ -198,6 +221,10 @@ def _sensitive_real_violation(
                 value, allow_root=True, current_workspace_id=workspace_id
             )
             real = os.path.realpath(sandbox.resolve(virtual))
+        except WorkspaceUnavailableError:
+            # 绑定目录不可用**不是**「路径可疑」。在这里把它翻成敏感路径，用户收到的
+            # 建议会是「改操作其他文件」——方向完全错。交给执行层的 fail-closed 报准确原因。
+            raise
         except SandboxPathError:
             # 解析到沙箱根之外 = 落点不可控。可能与符号链接无关（路径本身越界），
             # 但两种情况下我们都不能说「它没问题」——按不可判定拒绝。
@@ -277,6 +304,9 @@ async def _sensitive_subtree_violation(
                 value, allow_root=True, current_workspace_id=workspace_id
             )
             real = os.path.realpath(sandbox.resolve(virtual))
+        except WorkspaceUnavailableError:
+            # 同 `_sensitive_real_violation`：不可用不是「路径可疑」，别抢错误语义。
+            raise
         except SandboxPathError:
             # 越界在 `_sensitive_real_violation` 已经拒过；这里不抢错误语义
             continue
@@ -451,14 +481,15 @@ class SandboxToolSet:
             _tool("sandbox_delete_path", _guide("删除当前会话 Sandbox 中的文件或目录。"),
                   {"path": {"type": "string", "description": "Workspace-relative path"}}, ["path"]),
             _tool("sandbox_run_command", _guide(
-                      "在当前会话 Sandbox 的 work/ 目录中前台执行程序，并返回输出。"
+                      "在当前工作区目录中前台执行程序，并返回输出（没有工作区的对话则在 work/ 执行）。"
                       "注意：命令不受工作区路径白名单限制，可在沙箱内访问任意路径；"
                       "只有落在当前工作区内的改动才会同步回用户本地目录。"),
                   {"command": {"type": "string", "description": "Program to execute"},
                    "args": {"type": "array", "items": {"type": "string"}},
                    "envs": {"type": "object", "additionalProperties": {"type": "string"}},
                    "timeoutMs": {"type": "integer"}}, ["command"]),
-            _tool("sandbox_start_process", _guide("在当前会话 Sandbox 的 work/ 目录中启动长期进程。"),
+            _tool("sandbox_start_process", _guide(
+                      "在当前工作区目录中启动长期进程（没有工作区的对话则在 work/ 启动）。"),
                   {"command": {"type": "string", "description": "Long-running program"},
                    "args": {"type": "array", "items": {"type": "string"}}}, ["command"]),
             _tool("sandbox_list_processes", _guide("列出当前会话 Sandbox 中正在运行的进程。"), {}, []),
@@ -631,9 +662,8 @@ class SandboxToolSet:
                 result = await self._op_git_push(
                     arguments, user_id, session_id, workspace_id
                 )
-            elif name in _FILE_TOOLS:
-                # 文件类工具把「当前会话的工作区」一起交给 _op_*：路径校验
-                # （workspace_path）要用它判定越权、补全 `workspace` 缺省的 ID 段。
+            elif name in _WORKSPACE_SCOPED_TOOLS:
+                # 文件类与进程类都带上「当前会话的工作区」。
                 # 授权层与执行层必须是同一个上下文——曾经只给了校验、没给执行层，
                 # 报出来的两条错互相矛盾。
                 result = await handler(sandbox, arguments, workspace_id)
@@ -843,7 +873,9 @@ class SandboxToolSet:
 
     # ---- 进程操作 ----
 
-    async def _op_sandbox_run_command(self, sandbox: LocalSandbox, args: dict) -> dict:
+    async def _op_sandbox_run_command(
+        self, sandbox: LocalSandbox, args: dict, workspace_id: str = ""
+    ) -> dict:
         command = (args.get("command") or "").strip()
         if not command:
             raise ValueError("command is required")
@@ -869,7 +901,7 @@ class SandboxToolSet:
         result = await sandbox.commands.run(
             _join_argv(command, args.get("args")),
             envs=args.get("envs"),
-            cwd=WORKSPACE.work_path(),
+            cwd=_command_cwd(workspace_id),
             timeout=timeout / 1000,
         )
         stdout, stdout_truncated = _shorten(result.stdout or "")
@@ -888,13 +920,15 @@ class SandboxToolSet:
                 resp["suggestion"] = suggestion
         return resp
 
-    async def _op_sandbox_start_process(self, sandbox: LocalSandbox, args: dict) -> dict:
+    async def _op_sandbox_start_process(
+        self, sandbox: LocalSandbox, args: dict, workspace_id: str = ""
+    ) -> dict:
         command = (args.get("command") or "").strip()
         if not command:
             raise ValueError("command is required")
         handle = await sandbox.commands.run(
             _join_argv(command, args.get("args")),
-            cwd=WORKSPACE.work_path(),
+            cwd=_command_cwd(workspace_id),
             background=True,
         )
         pid = handle.pid if hasattr(handle, "pid") else 0
