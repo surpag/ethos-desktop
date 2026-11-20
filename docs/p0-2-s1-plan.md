@@ -152,3 +152,23 @@ with os.scandir(path): pass   # 能列举吗（stat 通不过权限错误，这�
 第一阶段的产物是"可被调用但无人调用的模块 + 一条钉住现状的基线"，**零运行时行为变化**。
 
 **第二阶段（未授权）**：`Dependencies` 增加 `WorkspaceContextSource` Protocol（定义在 `agentrun`，`WorkspaceVolumeService` 实现，`main.py` 装配）；`service.py` 在 `_run()` 的 `try` 内、`run.started` 之后、`set_task_status("in_progress")` 之前生成快照，并新增 `workspace_unavailable` 错误类型；§1.5 的 ①②③ 租约用例。**`agentrun` 不访问 `_local_roots`、数据库或磁盘**——绑定加载、探测、状态解析全部由提供方负责，`agentrun` 只请求一次快照。
+
+---
+
+## 6. 实施结果（2026-11-20）
+
+两阶段均已落地，与上文计划的差异只有三处，逐条说明理由。
+
+| 项 | 计划 | 实际 | 理由 |
+| --- | --- | --- | --- |
+| `WorkspaceUnavailableError` 的归属 | 未指定 | `workspace/context.py` | "绑定状态决定能不能跑"是工作区语义，与消费者无关；面板、定时任务将来要用同一套判定，放执行层会让它们各自复制一份 |
+| `capture()` 的落点 | `WorkspaceVolumeService` 实现 Protocol | 同计划 | 绑定记录、缓存、归一化都在这个类里；放别处它要反过来抄一遍取数逻辑 |
+| `volume_service.py` | 只加 `capture()` | 另修正 `_local_root_loaded` 的标记时机 | 原实现在读库**之前**就标记"已加载"：那次查询一旦抛错，该工作区被永久标记却什么都没注册，之后 `capture()` 会把"已绑定"读成 `UNBOUND` → 静默回退到 Volume。这正是 P0-2 要消灭的行为，不修等于在第二阶段把 bug 装回去 |
+
+**快照目前不参与路径映射**：`_run` 拿到快照后只判 `executable`，没有消费者用它决定根路径。
+文件工具、Git、Shell、面板仍走原来的 `_workspace_volume_dir`，因此绑定态的路径分裂
+与 S1 之前**完全一致**。这不是遗漏，而是分步可验证的前提：先证明"绑定状态进入了执行链"
+（本阶段），再逐个入口改读快照（S2–S4），否则无法归因是哪一步改变了行为。
+
+**验收**：`pytest tests --basetemp=…` → `629 passed, 1 skipped`（S1 前 593+1，第一阶段 +31，第二阶段 +5）。
+未绑定态 18 条基线逐字节未变——第一阶段冻结的清单在第二阶段改完 `service.py` 后仍然通过。
