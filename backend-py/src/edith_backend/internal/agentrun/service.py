@@ -45,6 +45,7 @@ from ..usage.recorder import Recorder, RunAlreadyExists
 from ..usage.types import Run, Summary, Tokens
 from ..userconfig.providers import Providers
 from ..userconfig.settings import Settings
+from ..workspace.context import WorkspaceContext, WorkspaceUnavailableError
 from .approval import ApprovalDesk
 from .configuration import ConfiguredRun, RunConfigurations
 from .execution import (
@@ -76,6 +77,19 @@ class WorkspaceLevelSource(Protocol):
     async def get_permission_level(self, user_id: str, workspace_id: str) -> str: ...
 
 
+class WorkspaceContextSource(Protocol):
+    """工作区上下文快照的取数端（由 `workspace.WorkspaceVolumeService` 实现）。
+
+    只声明这一件事。**绑定记录加载、磁盘探测、状态解析都留在实现侧**：agentrun
+    不碰 `_local_roots`、不读库、不 stat 磁盘，否则执行服务会被拖成半个工作区模块。
+
+    依赖的只有 `WorkspaceContext` 这个不可变数据契约（五个状态 + 根路径），
+    不是具体存储实现——这是刻意接受的依赖：执行层必须知道"这次执行认定哪个根"，
+    否则绑定状态永远进不了决策过程（P0-2 的核心缺陷）。
+    """
+
+    async def capture(self, user_id: str, workspace_id: str) -> WorkspaceContext: ...
+
 
 @dataclass
 class Dependencies:
@@ -101,6 +115,8 @@ class Dependencies:
     approval_store: ApprovalStore | None = None
     #: 项目级档位来源；为 None 时只按用户级解析（单测与老装配路径）
     workspaces: WorkspaceLevelSource | None = None
+    #: 工作区上下文快照来源；为 None 时不做绑定状态判定（单测与老装配路径）
+    workspace_contexts: WorkspaceContextSource | None = None
     tool_definitions: list[dict] = field(default_factory=list)
     tool_executor: object | None = None
     traces: TraceStore | None = None
@@ -157,6 +173,7 @@ class Service:
         self.models = deps.models
         self.settings = deps.settings
         self.workspaces = deps.workspaces
+        self.workspace_contexts = deps.workspace_contexts
         self.providers = deps.providers
         self.memories = deps.memories
         # trace 落盘器；为 None 时打点全部空转（可作总开关）
@@ -438,6 +455,36 @@ class Service:
             user_id, request_id=request_id, session_id=session_id
         )
 
+    async def _capture_workspace_context(
+        self, request: Request
+    ) -> WorkspaceContext | None:
+        """抓一次工作区快照；没有工作区、或没装配取数端时返回 None。
+
+        **绑定态异常直接抛 `WorkspaceUnavailableError`**（fail-closed）：本次执行拒绝
+        开始，由 `_run` 的既有异常收尾报 `workspace_unavailable`——绝不回退到未绑定的
+        `workspace-volumes/{id}`，否则用户会看到"绑定目录里的文件凭空消失"。
+
+        调用点约束（见 `docs/p0-2-preflight-verification.md` §1.3）：必须在 `_run` 的
+        `try` 内、`set_task_status("in_progress")` 之前。放到 `try` 外面，就要多一处
+        手写租约释放（现在有五处，已经很脆）；放到后面，失败会把会话留在 `in_progress`，
+        侧边栏一直显示"这个会话还有没跑完的活"。
+        """
+        if self.workspace_contexts is None or not request.workspace_id:
+            return None
+        context = await self.workspace_contexts.capture(
+            request.user_id, request.workspace_id
+        )
+        logger.info(
+            "workspace context request_id=%s ws=%s state=%s root=%s",
+            request.request_id,
+            context.workspace_id,
+            context.state.value,
+            context.root,
+        )
+        if not context.executable:
+            raise WorkspaceUnavailableError(context)
+        return context
+
     # 标记事件开始，取消，结束，记录过程中的token消耗。在关闭事件前先关闭mcp连接
     async def _run(
         self,
@@ -470,6 +517,10 @@ class Service:
                     assistant_id=assistant_id,
                 )
             )
+
+            # 工作区快照：绑定状态在 run 内只读一次，运行中换绑不影响本次语义。
+            # 本阶段（S1）只用于 fail-closed——路径映射还没接它（S2 才接文件工具与 Git）。
+            await self._capture_workspace_context(request)
 
             # 任务状态：run 启动即标记 in_progress（后续只有"模型主动完成/用户取消"会改走，
             # 其余异常终止一律不改——因此崩溃后状态天然停留在 in_progress，可被恢复）
@@ -647,6 +698,30 @@ class Service:
                 )
             )
             raise
+        except WorkspaceUnavailableError as exc:
+            # 绑定工作区不可用：这是**产品语义**（fail-closed），不是内部故障。
+            # 单独一支的目的是错误类型能到 UI——落进下面的 internal_error 时，
+            # 用户只会看到"内部错误"，而真正该做的是去看那个绑定目录。
+            reason = "error"
+            trace_error = exc
+            logger.warning(
+                "agentrun workspace_unavailable request_id=%s ws=%s state=%s detail=%s",
+                request.request_id,
+                request.workspace_id,
+                exc.context.state.value,
+                exc.context.detail[:200],
+            )
+            await self.usage.fail(request.request_id)
+            events.publish(
+                Event(
+                    type="run.error",
+                    request_id=request.request_id,
+                    session_id=request.session_id,
+                    assistant_id=assistant_id,
+                    duration_ms=elapsed_ms(start_time),
+                    error=APIError(type="workspace_unavailable", message=str(exc)),
+                )
+            )
         except ToolCircuitBreakerError as exc:
             # 工具连续系统故障熔断：明确报错，而非空转到 completed
             reason = "error"

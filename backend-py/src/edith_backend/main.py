@@ -199,6 +199,9 @@ async def lifespan(app: FastAPI):
             approval_store=ApprovalStore(db),
             # 项目级档位的取数端：有工作区的 run 先看项目设置，没有就跟着用户级走
             workspaces=workspaces,
+            # 工作区上下文快照的取数端：绑定状态必须在 run 开始时进入执行链，
+            # 否则「绑定目录」只活在面板那条链里（P0-2 的根因）
+            workspace_contexts=workspace_volumes,
             tool_definitions=tools.tool_definitions(),
             tool_executor=tools,
             traces=traces,

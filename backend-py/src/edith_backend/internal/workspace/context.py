@@ -44,6 +44,10 @@ class BindingState(str, Enum):
     BOUND_OFFLINE = "bound_offline"
 
 
+#: 允许本次执行继续的状态。其余三个（missing/denied/offline）一律失败关闭。
+_EXECUTABLE_STATES = frozenset({BindingState.UNBOUND, BindingState.BOUND_READY})
+
+
 class ProbeReason(str, Enum):
     """探测层的客观结论。不含"该怎么办"——策略在 `resolve_state()`。"""
 
@@ -90,6 +94,32 @@ class WorkspaceContext:
     detail: str = ""
     #: 只用于诊断与 trace，**不参与任何判定**
     captured_at: float = 0.0
+
+    @property
+    def executable(self) -> bool:
+        """本次执行是否被允许。
+
+        只有两种状态放行：`UNBOUND`（沿用改造前的路径，行为必须逐字节不变）与
+        `BOUND_READY`（探测通过）。异常态一律不放行——**不回退到 Volume**。
+        """
+        return self.state in _EXECUTABLE_STATES
+
+
+class WorkspaceUnavailableError(RuntimeError):
+    """绑定工作区不可用：本次执行必须失败，不得回退到未绑定的 Volume。
+
+    定义在领域层而不是执行层，因为「绑定状态决定能不能跑」是工作区的语义，
+    与具体消费者（Agent run / 面板 / 定时任务）无关。带上快照本身，
+    上层既可以只显示文案，也可以拿 `state`/`detail` 做更细的诊断。
+    """
+
+    def __init__(self, context: WorkspaceContext) -> None:
+        self.context = context
+        super().__init__(
+            f"工作区绑定目录不可用（{context.state.value}）："
+            f"{context.detail or '未提供具体原因'}。"
+            "请确认该目录仍然存在且可访问，或在工作区设置里重新绑定。"
+        )
 
 
 # ---- 探测层（唯一 I/O） ----

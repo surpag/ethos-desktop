@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+from .context import BindingRecord, WorkspaceContext, build_context, probe_root
 from .merge import merge_dir_add_only, plan_merge
 from .store import WorkspaceStore
 from .volume_backend import LocalVolumeBackend, normalize_local_root
@@ -72,7 +73,6 @@ class WorkspaceVolumeService:
         """
         if workspace_id in self._local_root_loaded:
             return self.local_root_of(workspace_id)
-        self._local_root_loaded.add(workspace_id)
         root = await self._store.get_local_root(user_id, workspace_id)
         if root:
             prefix = await self._store.get_local_root_prefix(user_id, workspace_id)
@@ -85,6 +85,10 @@ class WorkspaceVolumeService:
                 self.local_root_of(workspace_id),
                 prefix,
             )
+        # 只有读成功才标记"已加载"：原来这一句在读库**之前**，一旦那次查询抛错，
+        # 该工作区就被永久标记成"已加载"却什么都没注册 —— 之后每次读都拿到 None，
+        # 把"绑定态"误报成"未绑定"，正好是本模块要消灭的那类静默回退。
+        self._local_root_loaded.add(workspace_id)
         return root
 
     async def bind_local_root(
@@ -127,6 +131,34 @@ class WorkspaceVolumeService:
         """返回已注册的本地目录（未绑定返回 None）。"""
         root = self._backend.local_root_of(workspace_id)
         return str(root) if root else None
+
+    # ---- 执行上下文快照（P0-2 / S1 第二阶段）----
+
+    async def capture(self, user_id: str, workspace_id: str) -> WorkspaceContext:
+        """抓取一次不可变的工作区上下文快照（agentrun 的 `WorkspaceContextSource`）。
+
+        三步，缺一不可：
+
+        1. 把绑定记录从库里加载进运行期缓存。**`local_root_of()` 不是权威来源**：
+           它只是运行期缓存，只有「打开沙箱」和「面板绑定」两处会填充，而 run 启动时
+           这两处都还没跑。只读缓存会把"已绑定"读成"未绑定"——那正是 P0-2 要修的 bug
+           换了个位置复现。
+        2. 探测磁盘（`probe_root` 是全模块唯一做 I/O 的地方）。
+        3. 用纯函数解析状态、产出快照。
+
+        **不创建目录、不打开沙箱、不改绑定**：绑定根不可用只如实上报状态，
+        要不要失败由消费者按 `context.executable` 决定。
+        """
+        await self.load_and_bind_local_root(user_id, workspace_id)
+        root = self.local_root_of(workspace_id)
+        record = BindingRecord(
+            workspace_id=workspace_id,
+            local_root=root,
+            prefix=self.local_root_prefix_of(workspace_id) if root else "",
+        )
+        # 未绑定就不探测：`probe_root(None)` 没有意义，还会把"没绑定"和"探测失败"混成一件事
+        probe = probe_root(root) if root else None
+        return build_context(record, probe)
 
     async def on_delete(self, user_id: str, workspace_id: str) -> None:
         """删除工作区时调用：清理本地目录（绑定的是用户目录时只解绑）。"""
