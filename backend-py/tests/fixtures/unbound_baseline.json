@@ -1,0 +1,128 @@
+[
+  {
+    "input": "workspace",
+    "result": {
+      "type": "path",
+      "value": "workspace-volumes"
+    }
+  },
+  {
+    "input": "workspace/ws1",
+    "result": {
+      "type": "path",
+      "value": "workspace-volumes/ws1"
+    }
+  },
+  {
+    "input": "workspace/ws1/",
+    "result": {
+      "type": "path",
+      "value": "workspace-volumes/ws1"
+    }
+  },
+  {
+    "input": "workspace/ws1/a.txt",
+    "result": {
+      "type": "path",
+      "value": "workspace-volumes/ws1/a.txt"
+    }
+  },
+  {
+    "input": "workspace/./ws1/a.txt",
+    "result": {
+      "type": "path",
+      "value": "workspace-volumes/ws1/a.txt"
+    }
+  },
+  {
+    "input": "workspace/ws1/../ws1/a.txt",
+    "result": {
+      "type": "path",
+      "value": "workspace-volumes/ws1/a.txt"
+    }
+  },
+  {
+    "input": "workspace/ws1/../../x",
+    "result": {
+      "class": "SandboxPathError",
+      "type": "exception"
+    }
+  },
+  {
+    "input": "workspace/ws1/../ws2/x",
+    "result": {
+      "class": "SandboxPathError",
+      "type": "exception"
+    }
+  },
+  {
+    "input": "skills",
+    "result": {
+      "type": "path",
+      "value": "skills"
+    }
+  },
+  {
+    "input": "skills/x",
+    "result": {
+      "type": "path",
+      "value": "skills/x"
+    }
+  },
+  {
+    "input": "work/a.txt",
+    "result": {
+      "type": "path",
+      "value": "sandbox/u1/s1/work/a.txt"
+    }
+  },
+  {
+    "input": ".",
+    "result": {
+      "type": "path",
+      "value": "sandbox/u1/s1"
+    }
+  },
+  {
+    "input": "a.txt",
+    "result": {
+      "type": "path",
+      "value": "sandbox/u1/s1/a.txt"
+    }
+  },
+  {
+    "input": "/home/user/work/a.txt",
+    "result": {
+      "type": "path",
+      "value": "sandbox/u1/s1/work/a.txt"
+    }
+  },
+  {
+    "input": "/home/user/workspace/ws1/a.txt",
+    "result": {
+      "type": "path",
+      "value": "workspace-volumes/ws1/a.txt"
+    }
+  },
+  {
+    "input": "/etc/passwd",
+    "result": {
+      "class": "SandboxPathError",
+      "type": "exception"
+    }
+  },
+  {
+    "input": "C:/Windows",
+    "result": {
+      "class": "SandboxPathError",
+      "type": "exception"
+    }
+  },
+  {
+    "input": "../x",
+    "result": {
+      "class": "SandboxPathError",
+      "type": "exception"
+    }
+  }
+]
