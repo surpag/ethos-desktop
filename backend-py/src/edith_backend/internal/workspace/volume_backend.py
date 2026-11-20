@@ -13,6 +13,8 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 from ...config import data_root
@@ -30,6 +32,35 @@ _LOCAL_ROOT = (
     if _configured_volume_dir
     else data_root() / "workspace-volumes"
 )
+
+
+class LocalLookupKind(str, Enum):
+    """面板直读的三种结果。
+
+    **为什么不是一个 `Path | None`**：`None` 把三种完全不同的情况压成一个值，
+    调用方只能"不是本地就去读沙箱"。绑定目录被移动/删除时它恰好也是 `None`，
+    于是面板静默显示旧副本——用户以为自己在看绑定目录。这正是 P0-2 要消灭的
+    静默切换，只是换到了面板这条链上。
+    """
+
+    #: 本地没有对应的权威文件，交给沙箱（`skills/…`、`uploads/…`、
+    #: 未绑定且副本目录还没建出来、有前缀时前缀之外的路径）
+    SANDBOX = "sandbox"
+    #: 是工作区路径且本地路径已解析；**对应文件/目录是否存在由调用方判断**
+    READY = "ready"
+    #: 绑定目录不可用（被移动/改名/掉线）→ **必须报错，不得回落**
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class LocalLookup:
+    kind: LocalLookupKind
+    path: Path | None = None
+    #: 本地没有时是否允许回落读沙箱。**只有未绑定的工作区允许**：
+    #: 绑定态的权威就是本地目录，回落等于展示另一份数据。
+    fallback_allowed: bool = True
+    #: 不可用的原因（给用户看，`UNAVAILABLE` 时非空）
+    detail: str = ""
 
 
 class LocalRootError(ValueError):
@@ -161,32 +192,68 @@ class LocalVolumeBackend:
         # 读写直连：绑定 local_root 时所有存储操作都落在用户目录，否则退回副本
         return self._local_roots.get(workspace_id) or (self._root / workspace_id)
 
-    def resolve_workspace_path(self, relative: str) -> Path | None:
-        """仅当 relative 匹配 workspace/{id}/ 且对应本地目录存在时返回路径；否则 None。
+    def lookup_workspace_path(self, relative: str) -> LocalLookup:
+        """解析面板给的相对路径，并说明"本地不可用时该怎么办"。
 
-        路径安全：拒绝 .. 穿越与绝对路径子段。
+        分类依据是**权威根是谁**，不是"路径碰巧存在与否"：
+
+        | 情况 | 结果 |
+        | --- | --- |
+        | 不是 `workspace/{id}/…` | `SANDBOX` |
+        | 未绑定，副本目录还不存在 | `SANDBOX`（沙箱会按需初始化，与改造前一致） |
+        | 有前缀，路径在前缀之外 | `SANDBOX`（这是设计：虚拟根不对应本地目录） |
+        | 绑定态，绑定目录不可用 | `UNAVAILABLE` → 调用方必须报错 |
+        | 绑定态，子路径本地没有 | `READY` + `fallback_allowed=False` → 调用方按"没有"处理 |
+
+        最后一行是关键：绑定态的权威就是那个目录，本地没有就是没有。
+        回落到沙箱只会读到 `workspace-volumes/{id}` 那份旧数据。
+
+        路径安全：拒绝 `..` 穿越与绝对路径子段（与 `write_files` 同一规则）。
         """
         rel = (relative or "").strip().replace("\\", "/")
         if not rel or rel == ".":
-            return None
+            return LocalLookup(LocalLookupKind.SANDBOX)
         parts = rel.split("/")
         if len(parts) < 2 or parts[0] != "workspace" or not parts[1]:
-            return None
+            return LocalLookup(LocalLookupKind.SANDBOX)
+
         workspace_id = parts[1]
+        bound = workspace_id in self._local_roots
         target = self._dir(workspace_id)
         if not target.exists():
-            return None
+            if bound:
+                return LocalLookup(
+                    LocalLookupKind.UNAVAILABLE,
+                    fallback_allowed=False,
+                    detail=(
+                        f"工作区绑定的本地目录不可用：{target}"
+                        "（可能被移动、改名，或所在磁盘掉线）。"
+                        "已停止读取，避免显示另一份数据。"
+                    ),
+                )
+            # 未绑定：副本目录还没建出来是正常状态，交给沙箱按需初始化
+            return LocalLookup(LocalLookupKind.SANDBOX)
+
         sub = "/".join(parts[2:])
-        sub = self._strip_prefix(sub, workspace_id)
-        if sub is None:
-            # 该路径不在绑定的本地子树内（有前缀时，前缀之外不落在本地目录）
-            return None
-        if sub:
-            if sub.startswith("/") or ".." in sub.split("/"):
-                logger.warning("skip unsafe local sub path: %s", sub)
-                return None
-            target = target / sub
-        return target
+        stripped = self._strip_prefix(sub, workspace_id)
+        if stripped is None:
+            # 有前缀时，前缀之外不落在本地目录——这是定义的映射，不是故障
+            return LocalLookup(LocalLookupKind.SANDBOX)
+        if stripped:
+            if stripped.startswith("/") or ".." in stripped.split("/"):
+                logger.warning("skip unsafe local sub path: %s", stripped)
+                return LocalLookup(LocalLookupKind.SANDBOX)
+            target = target / stripped
+        return LocalLookup(LocalLookupKind.READY, target, fallback_allowed=not bound)
+
+    def resolve_workspace_path(self, relative: str) -> Path | None:
+        """`lookup_workspace_path` 的路径视图（`READY` 时有值，否则 `None`）。
+
+        保留是因为有调用方只关心路径；**新代码应当用 lookup**，
+        否则又会出现"`None` 到底是什么"的歧义。
+        """
+        found = self.lookup_workspace_path(relative)
+        return found.path if found.kind is LocalLookupKind.READY else None
 
     async def write_files(
         self, user_id: str, workspace_id: str, files: list[tuple[str, bytes]]

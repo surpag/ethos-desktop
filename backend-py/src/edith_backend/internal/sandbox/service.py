@@ -16,6 +16,7 @@ import aiosqlite
 
 from ..workspace.context import WorkspaceContext
 from ..workspace.store import WorkspaceStore
+from ..workspace.volume_backend import LocalLookup, LocalLookupKind
 from ..workspace.volume_service import WorkspaceVolumeService
 from .local import LocalSandbox
 
@@ -75,25 +76,29 @@ class Service:
         except FileNotFoundError as exc:
             raise SandboxNotFound("sandbox mapping not found") from exc
 
-    async def local_workspace_path(self, user_id: str, relative: str):
-        """`workspace/{id}/...` 对应的本地磁盘路径；不属于任何工作区时返回 None。
+    async def local_workspace_lookup(self, user_id: str, relative: str) -> LocalLookup:
+        """面板直读：本地路径 + **本地不可用时该怎么办**。
 
         文件面板命中后直接本地读，不必经过沙箱路径解析——列表/预览是最高频的操作，
         走一次解析只是多一次 resolve。归属校验仍然要做：路径里的 workspace_id
-        必须属于当前用户。
+        必须属于当前用户，否则交给沙箱（HTTP 层再判越权）。
+
+        返回 `LocalLookup` 而不是 `Path | None`：绑定目录不可用时必须是
+        `UNAVAILABLE`，让调用方报错而不是回落读旧副本。`None` 分不清
+        「不是工作区路径」和「绑定目录没了」——这两件事的处置完全相反。
         """
         if self._workspace_volumes is None:
-            return None
+            return LocalLookup(LocalLookupKind.SANDBOX)
         parts = (relative or "").strip().replace("\\", "/").split("/")
         if len(parts) >= 2 and parts[0] == "workspace" and self._workspaces is not None:
             workspace_id = parts[1]
             record = await self._workspaces.get(user_id, workspace_id)
             if record is None:
-                return None
+                return LocalLookup(LocalLookupKind.SANDBOX)
             # 懒绑定：DB 里记了 local_root 的工作区（用户选择的已有目录）在这里注册
             await self._workspace_volumes.load_and_bind_local_root(user_id, workspace_id)
         backend = self._workspace_volumes.backend
-        return backend.resolve_workspace_path(relative)
+        return backend.lookup_workspace_path(relative)
 
     async def workspace(
         self,

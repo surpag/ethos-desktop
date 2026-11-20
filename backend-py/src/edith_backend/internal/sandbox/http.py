@@ -12,6 +12,7 @@ from fastapi import APIRouter, UploadFile
 from fastapi.responses import StreamingResponse
 
 from ..http_utils import EDITHError
+from ..workspace.volume_backend import LocalLookupKind
 from .local import SandboxMountError
 from .service import SandboxNotFound, Service
 from .workspace import relative_path, workspace_path
@@ -79,12 +80,18 @@ class HTTP:
 
         @router.get("/internal/sandbox/files")
         async def list_files(userId: str = "", sessionId: str = "", path: str = "") -> dict:
-            # workspace/{id}/... 直接读本地磁盘（毫秒级），不必走路径解析。
-            # 但只在本地**确实存在**该目录时才直读；否则回落读沙箱——这样「克隆进沙箱、
-            # 还没同步回后端」的文件也能在文件面板里看到。
-            local_dir = await self.service.local_workspace_path(userId, path)
-            if local_dir is not None and local_dir.is_dir():
-                return {"path": path, "entries": _local_entries(path, local_dir)}
+            # 工作区路径优先直读本地磁盘（毫秒级）。本地没有时**是否回落取决于
+            # 权威根是谁**：未绑定工作区与非工作区路径回落到沙箱（沿用改造前行为），
+            # 绑定工作区不回落——那里的权威就是用户目录，回落只会读到
+            # `workspace-volumes/{id}` 那份旧副本，用户会以为自己看的是绑定目录。
+            lookup = await self.service.local_workspace_lookup(userId, path)
+            if lookup.kind is LocalLookupKind.UNAVAILABLE:
+                raise EDITHError(409, "workspace_unavailable", lookup.detail)
+            if lookup.kind is LocalLookupKind.READY and lookup.path is not None:
+                if lookup.path.is_dir():
+                    return {"path": path, "entries": _local_entries(path, lookup.path)}
+                if not lookup.fallback_allowed:
+                    return {"path": path, "entries": []}
             sandbox, real_path = await self._existing(userId, sessionId, path, allow_root=True)
             try:
                 entries = await sandbox.files.list(real_path, depth=1)
@@ -106,16 +113,21 @@ class HTTP:
 
         @router.get("/internal/sandbox/files/content")
         async def read_content(userId: str = "", sessionId: str = "", path: str = "") -> dict:
-            # P0 优化：同上，但只在本地**确实存在该文件**时才直读；
-            # 否则回落读沙箱（克隆进沙箱的文件不在后端磁盘上）。
-            local_file = await self.service.local_workspace_path(userId, path)
-            if local_file is not None and local_file.is_file():
-                data = local_file.read_text(encoding="utf-8", errors="replace")
-                truncated = len(data) > DEFAULT_READ_LIMIT
-                content = data[:DEFAULT_READ_LIMIT]
-                if "\x00" in content:
-                    raise EDITHError(422, "file_not_previewable", "only UTF-8 text files can be previewed")
-                return {"path": path, "content": content, "truncated": truncated}
+            # 与列表同一套判定：绑定态的文件不在本地就是不存在（404），
+            # 不回落——回落读的是另一份数据。
+            lookup = await self.service.local_workspace_lookup(userId, path)
+            if lookup.kind is LocalLookupKind.UNAVAILABLE:
+                raise EDITHError(409, "workspace_unavailable", lookup.detail)
+            if lookup.kind is LocalLookupKind.READY and lookup.path is not None:
+                if lookup.path.is_file():
+                    data = lookup.path.read_text(encoding="utf-8", errors="replace")
+                    truncated = len(data) > DEFAULT_READ_LIMIT
+                    content = data[:DEFAULT_READ_LIMIT]
+                    if "\x00" in content:
+                        raise EDITHError(422, "file_not_previewable", "only UTF-8 text files can be previewed")
+                    return {"path": path, "content": content, "truncated": truncated}
+                if not lookup.fallback_allowed:
+                    raise EDITHError(404, "file_not_found", f"{path} 不在绑定的工作区目录里")
             sandbox, real_path = await self._existing(userId, sessionId, path, allow_root=False)
             data = await sandbox.files.read(real_path)
             truncated = len(data) > DEFAULT_READ_LIMIT
