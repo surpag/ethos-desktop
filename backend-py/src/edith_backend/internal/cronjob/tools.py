@@ -47,6 +47,7 @@ class CronToolSet:
         user_id: str,
         session_id: str,
         workspace_id: str = "",  # 仅接口兼容（ToolRegistry 统一透传），本工具集不使用
+        context=None,  # 仅接口兼容（ToolRegistry 统一透传），本工具集不使用
     ) -> str:
         if name != "create_cron_job":
             return json.dumps({"error": f"unknown cron tool: {name}"}, ensure_ascii=False)

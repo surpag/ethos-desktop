@@ -128,8 +128,13 @@ class ToolRegistry:
         user_id: str,
         session_id: str,
         workspace_id: str = "",
+        context=None,
     ) -> str:
-        """统一执行入口（本次修改：透传 workspace_id 给各工具集，供 Sandbox 工具路径自动补全）。"""
+        """统一执行入口（透传 workspace_id 与 workspace context 给各工具集）。
+
+        `context`（S2）：本次执行的工作区快照，只对 Sandbox 工具集有意义，
+        决定 `workspace/{id}` 的真实落点。其余工具集为接口兼容接收但不使用。
+        """
         tool_set = self._by_name.get(name)
         if tool_set is None:
             # 模型幻觉出的工具名是**模型错误**，不是系统故障：写成 tool_failure 会被
@@ -145,7 +150,7 @@ class ToolRegistry:
             )
         try:
             return await tool_set.execute(
-                name, arguments, user_id, session_id, workspace_id
+                name, arguments, user_id, session_id, workspace_id, context=context
             )  # 执行三个不同类型的tool，systemtool,sandbox,CronTool
         except Exception as exc:  # noqa: BLE001 - 单个工具的任何异常都转成工具结果返回
             return tool_error_result(name, exc)

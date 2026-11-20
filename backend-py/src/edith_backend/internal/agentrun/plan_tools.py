@@ -124,6 +124,7 @@ class PlanToolSet:
         user_id: str,
         session_id: str,
         workspace_id: str = "",  # 仅接口兼容（ToolRegistry 统一透传），计划与工作区无关
+        context=None,  # 仅接口兼容（ToolRegistry 统一透传），本工具集不使用
     ) -> str:
         if name != "plan_update":
             return json.dumps(

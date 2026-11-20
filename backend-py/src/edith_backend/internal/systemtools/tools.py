@@ -43,6 +43,7 @@ class SystemToolSet:
         user_id: str,
         session_id: str,
         workspace_id: str = "",  # 仅接口兼容（ToolRegistry 统一透传），本工具集不使用
+        context=None,  # 仅接口兼容（ToolRegistry 统一透传），本工具集不使用
     ) -> str:
         if name != "get_current_time":
             return json.dumps({"error": f"unknown system tool: {name}"}, ensure_ascii=False)
