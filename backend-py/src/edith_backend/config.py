@@ -103,3 +103,16 @@ def database_path() -> str:
 def runtime_address() -> str:
     """HTTP 监听地址，对应 Go 版 EDITH_ADDR。"""
     return os.getenv("EDITH_ADDR", "127.0.0.1:8080")
+
+
+def runtime_token() -> str:
+    """本地 Runtime 的入站令牌（由桌面壳随机生成后注入）。
+
+    **为什么需要它**：Runtime 监听的是回环 TCP 端口，同机任何进程——包括任意网页
+    发起的跨站请求——都能打到它。端口是随机的，但那只是概率上的遮挡，不是边界。
+    令牌把「能连上端口」和「被允许调用接口」分开：只有拿到令牌的 BFF 能进来。
+
+    缺省为空串表示**不启用**校验，仅用于开发（`uv run edith-backend` 直连）与测试；
+    桌面壳与生产部署必须注入。空值不静默降级成某个内置默认值——那等于没有令牌。
+    """
+    return os.getenv("EDITH_RUNTIME_TOKEN", "").strip()

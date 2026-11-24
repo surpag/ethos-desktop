@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -143,6 +144,11 @@ async function startServices(): Promise<string> {
   const backendPort = await findFreePort();
   const webPort = await findFreePort();
 
+  // Runtime 的入站令牌：每次启动重新生成，只存在于这两个子进程的 env 里。
+  // 回环端口同机的任何进程（包括任意网页的跨站请求）都连得上，端口随机只是
+  // 遮挡而不是边界；令牌把「连得上」与「被允许调用」分开。不落盘：重启即换。
+  const runtimeToken = randomBytes(32).toString("hex");
+
   // 启动期任何一个子进程挂掉都意味着起不来了：用它中断 waitForHttp 的等待，
   // 不必等满 60 秒超时。失败最终由 bootstrap 的 catch 弹一次框。
   const startupAbort = new AbortController();
@@ -163,9 +169,11 @@ async function startServices(): Promise<string> {
       onUnexpectedExit: onChildExit,
       env: {
         ...process.env,
-        // 桌面模式：无认证、无 E2B、数据落 %APPDATA%\ETHOS
+        // 桌面模式：无 E2B、数据落 %APPDATA%\ETHOS。鉴权由随机令牌承担，
+        // 令牌只给本进程拉起的 BFF——外部进程拿不到，也猜不出。
         ETHOS_DESKTOP: "1",
         ETHOS_DATA_DIR: dataDir,
+        EDITH_RUNTIME_TOKEN: runtimeToken,
         PYTHONPATH: path.join(backendDir(), "src"),
         PYTHONUNBUFFERED: "1",
         PYTHONIOENCODING: "utf-8",
@@ -198,6 +206,8 @@ async function startServices(): Promise<string> {
       HOSTNAME: "127.0.0.1",
       ETHOS_DESKTOP: "1",
       EDITH_RUNTIME_URL: `http://127.0.0.1:${backendPort}`,
+      // BFF 用它给每个转发到 Runtime 的请求加 `X-ETHOS-RUNTIME-TOKEN`
+      EDITH_RUNTIME_TOKEN: runtimeToken,
     },
   });
 

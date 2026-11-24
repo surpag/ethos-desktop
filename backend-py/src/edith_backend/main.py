@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hmac
 import logging
 import os
 import time
@@ -14,6 +16,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 
@@ -111,6 +114,9 @@ if _log_file:
     logging.getLogger().addHandler(_file_handler)
 
 logger = logging.getLogger(__name__)
+
+#: 未配置令牌时只警告一次：每个请求刷一条会把有价值的日志淹掉。
+_warned_no_runtime_token = False
 
 
 @asynccontextmanager
@@ -287,11 +293,67 @@ def create_app() -> FastAPI:
     app = FastAPI(title="EDITH backend", version="0.1.0", lifespan=lifespan)
     http_utils.register_error_handler(app)
 
-    # 方案 C（2026-09-01）：允许浏览器直传大文件（绕过 Next.js BFF 流式转发不可靠问题）。
-    # 生产环境应收紧为前端域名白名单。
+    @app.middleware("http")
+    async def require_runtime_token(request: Request, call_next):
+        """本地 Runtime 的入站鉴权：只放行带令牌的 BFF。
+
+        这个进程监听回环端口，同机任意进程（包括任意网页发起的跨站请求）都能
+        连上来。端口随机只是遮挡，不是边界；令牌把「连得上」和「被允许调用」
+        分开。令牌由 Electron 随机生成，分别注入 backend 与 web 的 env。
+
+        放行的三种情况：
+        - 没配令牌（开发直连 / pytest）：放行并警告一次——**不降级成内置默认值**，
+          那样等于没有鉴权；
+        - `/health`：Electron 在拿到任何业务接口之前就要确认进程起来了；
+        - `OPTIONS`：CORS 预检本身不带自定义头，由外层 CORSMiddleware 处理。
+        """
+        global _warned_no_runtime_token
+
+        token = config.runtime_token()
+        if not token:
+            if not _warned_no_runtime_token:
+                _warned_no_runtime_token = True
+                logger.warning(
+                    "EDITH_RUNTIME_TOKEN 未设置：本地 Runtime 接口未鉴权，仅适用于开发与测试"
+                )
+            return await call_next(request)
+        if request.url.path == "/health" or request.method == "OPTIONS":
+            return await call_next(request)
+
+        supplied = request.headers.get("X-ETHOS-RUNTIME-TOKEN", "").strip()
+        if not supplied:
+            scheme, _, value = request.headers.get("Authorization", "").partition(" ")
+            value = value.strip()
+            if scheme.lower() == "bearer":
+                supplied = value
+            elif scheme.lower() == "basic":
+                # 兼容 `http://user:token@127.0.0.1:port` 形式的 base URL
+                try:
+                    decoded = base64.b64decode(value).decode("utf-8", "replace")
+                except Exception:  # noqa: BLE001 - 解析不了就当作没带
+                    decoded = ""
+                supplied = decoded.partition(":")[2]
+
+        if not hmac.compare_digest(supplied, token):
+            logger.warning(
+                "runtime_token_rejected path=%s client=%s",
+                request.url.path,
+                request.client.host if request.client else None,
+            )
+            return JSONResponse(
+                {"type": "unauthorized", "message": "missing or invalid runtime token"},
+                status_code=401,
+            )
+        return await call_next(request)
+
+    # 收紧到本地 Web 源。桌面端 Web 端口是随机分配的（`findFreePort()`），
+    # 所以用正则而不是固定白名单：`http://127.0.0.1:<任意端口>` / `localhost`。
+    # 原来的 `allow_origins=["*"]` 是为「浏览器直传大文件」（方案 C）留的，
+    # 该方案已废弃——现在所有请求都经 Next BFF 同源转发，浏览器不再直连 Runtime。
+    # 顺序：CORS 在外层，预检与 401 响应都能带上 CORS 头。
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origin_regex=r"^http://(127\.0\.0\.1|localhost)(:\d+)?$",
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=["X-Request-ID"],

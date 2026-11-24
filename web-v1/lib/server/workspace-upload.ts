@@ -23,6 +23,8 @@
  *   - `/internal/*` 仍然只在容器网络内可达，本模块是唯一出网口，nginx 不新增反代。
  */
 
+import { withRuntimeToken } from "./runtime-token.ts";
+
 /** 单次上传请求体的硬上限。前端分批（≤50MB/批）后不会触及。 */
 export const DEFAULT_MAX_UPLOAD_BYTES = 64 * 1024 * 1024;
 
@@ -70,7 +72,7 @@ async function workspaceOwnedBy(
   const url = new URL("/internal/workspaces", runtimeURL);
   url.searchParams.set("userId", userId);
   const response = await fetch(url, {
-    headers: { "X-Request-ID": requestId },
+    headers: withRuntimeToken({ "X-Request-ID": requestId }),
     cache: "no-store",
     signal: AbortSignal.timeout(OWNERSHIP_TIMEOUT_MS),
   });
@@ -162,7 +164,10 @@ export async function handleWorkspaceUpload(
     const response = await fetch(target, {
       method: "POST",
       // 原样带上 boundary；不要自己拼 Content-Type
-      headers: { "Content-Type": contentType, "X-Request-ID": requestId },
+      headers: withRuntimeToken({
+        "Content-Type": contentType,
+        "X-Request-ID": requestId,
+      }),
       // Buffer 是 Uint8Array 子类，undici 直接接受；TS 5.7+ 把 Uint8Array 的
       // buffer 参数化为 ArrayBufferLike，与 DOM 的 BodyInit 不兼容，故断言。
       body: body as unknown as BodyInit,
