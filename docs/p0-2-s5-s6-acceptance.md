@@ -154,7 +154,10 @@ except WorkspaceUnavailableError:
 
 **剩余（独立立项）**：
 
-- `P0-SEC-1`：面板直读路径绕过敏感检查与越界核验（只读先行）
+- ~~`P0-SEC-1`：面板直读路径绕过敏感检查与越界核验（只读先行）~~ **已完成**：
+  列表 / 预览 / 下载 / 上传统一走 `permissions.paths.check_path`（第一遍：请求路径）
+  与 `guard_real_path`（第二遍：解析后的真实路径 + 越界），用例见
+  `tests/test_panel_path_guard.py`
 - 原生程序不认 MSYS 路径形式（`python /home/user/x.py`），见 S4 文档 §6
 - `_run` 启动前取消导致租约残留
 - `_background` 跨请求生命周期

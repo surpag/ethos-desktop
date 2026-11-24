@@ -16,7 +16,7 @@
 from .catalog import MCP_CAPABILITIES, capabilities_of, is_readonly
 from .chain import resolve_effective_level
 from .context import bind_level, current_level
-from .paths import check_path
+from .paths import PathRejected, check_path, guard_real_path
 from .policy import (
     InvalidLevelValue,
     Resolution,
@@ -51,6 +51,7 @@ __all__ = [
     "InvalidLevelValue",
     "MCP_CAPABILITIES",
     "PERMISSION_DENIED",
+    "PathRejected",
     "PermissionLevel",
     "Resolution",
     "TOOL_FAILURE",
@@ -62,6 +63,7 @@ __all__ = [
     "current_level",
     "evaluate",
     "evaluate_call",
+    "guard_real_path",
     "is_readonly",
     "kind_counts_toward_breaker",
     "kind_is_retryable",

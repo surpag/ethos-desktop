@@ -61,6 +61,10 @@ class LocalLookup:
     fallback_allowed: bool = True
     #: 不可用的原因（给用户看，`UNAVAILABLE` 时非空）
     detail: str = ""
+    #: `READY` 时的权威根（工作区目录本身）。调用方用它做**真实路径**的越界核验：
+    #: 逻辑路径可以完全干净，落点却是 `~/.ssh` 或根之外的链接。
+    #: 没有它，直读面板只能相信"路径是拼出来的"——而链接不这么想。
+    root: Path | None = None
 
 
 class LocalRootError(ValueError):
@@ -239,12 +243,16 @@ class LocalVolumeBackend:
         if stripped is None:
             # 有前缀时，前缀之外不落在本地目录——这是定义的映射，不是故障
             return LocalLookup(LocalLookupKind.SANDBOX)
+        base = target
         if stripped:
             if stripped.startswith("/") or ".." in stripped.split("/"):
                 logger.warning("skip unsafe local sub path: %s", stripped)
                 return LocalLookup(LocalLookupKind.SANDBOX)
             target = target / stripped
-        return LocalLookup(LocalLookupKind.READY, target, fallback_allowed=not bound)
+        # 根与子路径都交出去：调用方要拿它们做真实路径核验（链接可以指向根外）
+        return LocalLookup(
+            LocalLookupKind.READY, target, fallback_allowed=not bound, root=base
+        )
 
     def resolve_workspace_path(self, relative: str) -> Path | None:
         """`lookup_workspace_path` 的路径视图（`READY` 时有值，否则 `None`）。

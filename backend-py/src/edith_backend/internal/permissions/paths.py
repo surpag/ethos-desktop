@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 #: 段级精确匹配（小写比较）
 _SEGMENT_EXACT = frozenset(
@@ -131,4 +132,59 @@ def first_sensitive_entry(root: str) -> str:
                 if entry.is_dir(follow_symlinks=False):
                     stack.append((f"{shown}/", entry.path))
     return ""
+
+
+class PathRejected(PermissionError):
+    """真实路径不满足访问约束（命中敏感段，或解析后越出给定的根）。
+
+    继承 `PermissionError`：HTTP 层原本就把 `PermissionError` 映射成 403，
+    新增这一层不需要再引入一套错误家族。
+    """
+
+
+def guard_real_path(raw: object, *, root: object = None) -> str:
+    """对**已解析的真实路径**做敏感段与越界检查，返回归一化后的真实路径。
+
+    这是与文件工具同一套规则（`check_path`）的**第二遍**。为什么面板也需要它：
+    面板直读本地磁盘时不经过沙箱 `resolve()`，而目录联接 / 符号链接能让一个
+    逻辑上完全干净的路径（`workspace/{id}/k/config`）落到 `~/.ssh/id_rsa`
+    或绑定根之外。第一遍看的是"用户说要看哪个文件"，这一遍看的是"最后读的是哪个
+    文件"——只有两遍都干净才算干净。
+
+    `root` 为空时只判敏感段：沙箱分支的越界由 `LocalSandbox.resolve()` 保证，
+    这里重复判会因根的定义不同而产生假阳性。
+
+    无法判定（无法规范化、根为空串）一律拒绝：「说不清它指向哪」不能当成
+    「没问题」。`root` 本身命中敏感段时同样拒绝——把工作区绑到 `~/.ssh` 上
+    不应该换来一条绕过规则的通道。
+    """
+    if not isinstance(raw, (str, os.PathLike)):
+        return ""
+    text = os.fspath(raw)
+    if not text.strip():
+        return ""
+    # 第一遍：用户写下的路径本身
+    hit = check_path(text)
+    if hit:
+        raise PathRejected(f"敏感路径不可访问：{text}（命中 {hit}）")
+    try:
+        real = os.path.realpath(text)
+    except OSError as exc:
+        raise PathRejected(f"路径无法解析为真实位置：{text}（{exc}）") from exc
+
+    if root is not None and os.fspath(root):
+        try:
+            base = os.path.realpath(os.fspath(root))
+        except OSError as exc:
+            raise PathRejected(f"根目录无法解析为真实位置：{root}（{exc}）") from exc
+        if not Path(real).is_relative_to(Path(base)):
+            raise PathRejected(
+                f"路径解析后越出根目录（疑似链接指向外部）：{text} → {real}"
+            )
+
+    # 第二遍：链接指向的真实落点
+    hit = check_path(real)
+    if hit:
+        raise PathRejected(f"敏感路径不可访问：{text} → {real}（命中 {hit}）")
+    return real
 
