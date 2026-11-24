@@ -8,6 +8,7 @@ from __future__ import annotations
 from fastapi import APIRouter, status
 
 from ..http_utils import EDITHError
+from ..sandbox import processes as sandbox_processes
 from ..session.store import WorkspaceSessionConflict
 from .history import ConversationNotFound, History
 from .types import (
@@ -99,6 +100,10 @@ class HTTP:
             if not userId.strip() or not session_id.strip():
                 raise EDITHError(400, "invalid_request", "userId and sessionID are required")
             deleted = await self.history.delete(userId, session_id)
+            # 会话是后台进程的归属单位，删会话即回收它的进程。**无论 deleted 与否都做**：
+            # 没有消息的会话也可能跑过 start_process；漏掉这一步，进程会活到后端退出，
+            # 期间一直占着工作区文件（"会话删了但目录删不掉"就是这么来的）。
+            sandbox_processes.release_session(userId, session_id)
             if not deleted:
                 raise EDITHError(404, "conversation_not_found", "conversation not found")
 

@@ -62,10 +62,10 @@
 | --- | --- |
 | `LocalSandbox.open(user, session)` | 打开或**重建**（目录被外部删掉时直接重建，代价为零） |
 | `LocalSandbox.attach(...)` | 只打开已存在的；不存在抛 `FileNotFoundError` |
-| `LocalSandbox.kill()` | 只结束后台进程，**不删目录**（工作区文件是用户的） |
+| `LocalSandbox.kill()` | 结束**本会话**的全部后台进程，**不删目录**（工作区文件是用户的） |
 | `LocalFiles.read/write/list/make_dir/remove/rename/get_info` | 文件原语；`remove` 对目录递归 |
 | `LocalCommands.run(...)` | 执行命令，返回 `CommandResult`（`exitCode` 为 camelCase） |
-| `LocalCommands.start/list/kill` | 后台进程登记（pid → 子进程），进程退出后自动摘除 |
+| `LocalCommands.run/list/kill`（后台） | 经 `processes` 台账登记（pid + 元数据，**跨实例共享**）；只允许结束本会话登记的 pid |
 
 ## 第三部分：与其他模块的联系
 
@@ -84,5 +84,23 @@
   Agent 工具发起的 HTTP，不约束 shell）。
 - **`user_sandboxes.sandbox_id` 是派生值**（`local-{user}-{session}`）：它只用来让
   面板与 `existing_workspace` 判断「这个会话有没有沙箱」，不代表任何远端资源。
-- **后台进程不跨重启**：`_background` 是进程内字典，后端退出后 orphan 进程仍在，
-  但列表里看不到。
+- **后台进程的生命周期是会话，不是 run**：`sandbox_start_process` 起的进程在对话
+  结束后继续跑（`dev server` 这类用法就是靠它）。删会话与后端正常退出时按归属回收。
+- **异常退出靠落盘登记恢复**：后端被强杀时 `lifespan` 不执行，登记写在
+  `<data_root>/sandbox/background-processes.json`。下次启动 `processes.recover()`
+  读回，只有「创建时刻 + 镜像路径」都对得上才终结；拿不到证据的保留为
+  `suspected`（日志 warning + 审计行），**不杀**。台账本身只是本进程的内存表，
+  不要把它描述成"跨进程共享注册表"。
+- **登记失败必须回滚**：`register` 落盘失败会抛 `PersistenceFailed`，工具层据此
+  终结刚启动的进程树、等待退出，再向模型返回 `background_registration_failed`。
+  终结失败时写 `severity=high` 的审计（pid / 创建时刻 / 镜像 / 命令 / 错误）。
+- **终结必须走核验绑定路径**：后台进程一律 `terminate_verified(pid, create_time=...,
+  image=...)`——它在同一个进程句柄（Windows）/ `pidfd`（Linux）上再次复核身份并终结，
+  消除"核验之后 pid 被复用"的窗口。`terminate_tree(pid)` 只留给前台命令的超时/取消。
+- **多实例写入**：`process_store.save(..., instance_id=...)` 只替换本实例的条目；
+  删除或修改**其他实例**的遗留记录必须显式传 `drop_pids` / `patch_pids`，否则合并写
+  会把它们当成"不是我的，别动"。
+- **遗留记录的人工处置**：`edith-processes inspect`（只读）/ `retry <pid>`
+  （重新核验，只有确认归属才终结）/ `acknowledge <pid> --reason ...`（暂不处理：
+  不杀、不删记录与审计，启动时不再告警）。**没有 `kill` 子命令是刻意的**——
+  人工按 pid 直接杀会绕过归属校验。

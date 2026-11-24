@@ -20,12 +20,14 @@ from ..gitops import (
     resolve_git_identity,
     run_git,
 )
+from .. import isolation
 from ..permissions.paths import check_path, first_sensitive_entry
 from ..permissions.types import PERMISSION_DENIED
 from ..skills.budget import charge_skill_load
 from ..skills.types import SKILL_FILE, SKILLS_PATH
 from ..tools import COMMAND_ERROR, TOOL_FAILURE, command_stderr_hint, tool_error_result
 from ..workspace.context import WorkspaceContext, WorkspaceUnavailableError
+from . import processes as process_registry
 from .local import LocalSandbox, SandboxPathError
 from .service import Service
 from .types import FileType
@@ -535,6 +537,30 @@ class SandboxToolSet:
         session_id: str,
         workspace_id: str = "",
         context: WorkspaceContext | None = None,
+        tool_call_id: str = "",
+    ) -> str:
+        """统一执行入口（附带审计绑定）。
+
+        `tool_call_id` 只用于**归属**：把这次执行与模型的那条 tool_call 对上，
+        不参与任何权限判定。绑定用 ContextVar，这样命令层与 git 层不必各自
+        再传一遍（漏传一次就会出现"日志里有执行、但不知道属于哪次调用"）。
+        """
+        token = isolation.audit.bind_tool_call(tool_call_id)
+        try:
+            return await self._execute(
+                name, arguments, user_id, session_id, workspace_id, context
+            )
+        finally:
+            isolation.audit.reset_tool_call(token)
+
+    async def _execute(
+        self,
+        name: str,
+        arguments: dict,
+        user_id: str,
+        session_id: str,
+        workspace_id: str = "",
+        context: WorkspaceContext | None = None,
     ) -> str:
         """统一执行入口。
 
@@ -552,7 +578,8 @@ class SandboxToolSet:
         if handler is None:
             return json.dumps({"error": f"unknown sandbox tool: {name}", "kind": TOOL_FAILURE})
         if name == "git_remote_branches":
-            # 只读远端查询不依赖沙箱：不该为一次查询去启动沙箱
+            # 只读远端查询不起本地沙箱（不需要工作区克隆），但**仍然**经过隔离层：
+            # 它要联网且要带凭据，是执行链的一部分，不是"宿主的只读小工具"。
             try:
                 return json.dumps(
                     await self._op_git_remote_branches(user_id, workspace_id),
@@ -681,6 +708,28 @@ class SandboxToolSet:
                     _audit_digest(arguments),
                 )
             return json.dumps(result, ensure_ascii=False)
+        except process_registry.PersistenceFailed as exc:
+            # 单独一条：这不是"命令写错了"。模型重试同一个命令既不会让目录变成
+            # 可写，也不该被鼓励（每次重试都会再起一个进程）。明确告诉它停止。
+            terminated = exc.terminated is True
+            return json.dumps(
+                {
+                    "error": (
+                        f"后台进程无法登记（pid={exc.entry.pid}）："
+                        + ("已终止该进程。" if terminated else "终止未确认，详见审计。")
+                    ),
+                    "kind": TOOL_FAILURE,
+                    "retryable": False,
+                    "reason": "background_registration_failed",
+                    "detail": exc.rollback_detail or exc.detail,
+                    "suggestion": (
+                        "这是本机数据目录写入失败导致的，与命令本身无关。"
+                        "请检查数据目录下 sandbox/ 是否可写（磁盘空间 / 权限），"
+                        "在修复前不要重复启动长期进程。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
         except Exception as exc:  # noqa: BLE001 - 工具错误转为结果返回（业务错误 → command_error，系统故障 → tool_failure）
             return tool_error_result(name, exc)
 

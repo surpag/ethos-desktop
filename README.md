@@ -60,6 +60,38 @@ electron (desktop/dist/main.js)
 进行中的 SSE 断开、会话状态丢失，还可能再撞一次库锁。启动期的子进程退出会立刻
 中断就绪等待，不用等满 60 秒超时。
 
+### 后台进程（Agent 起的进程）
+
+模型用 `sandbox_start_process` 起的 dev server 之类，生命周期是**会话**而不是 run：
+一轮对话结束不回收，删会话或后端正常退出时才按归属回收。
+
+后端被强杀时 `lifespan` 跑不到，内存台账随进程消失——这一层由落盘登记补：
+`<data_root>/sandbox/background-processes.json` 只记身份（pid、创建时刻、镜像路径、
+归属会话、实例 id），不记输出、不记凭据。
+
+下次启动 `recover()` 逐条核验，**只有证据齐全才动手**：
+
+| 判定 | 依据 | 动作 |
+|---|---|---|
+| `confirmed` | 创建时刻一致 + 镜像一致 | 终结整棵进程树；核验与终结绑在同一个句柄（Windows）/ `pidfd`（Linux）上，消除"核验完 pid 被复用"的窗口 |
+| `gone` / `reused` | 进程不在 / 创建时刻对不上（pid 已复用） | 只删记录，**不杀** |
+| `unknown` | 拿不到创建时刻或镜像、或镜像对不上 | 保留为 `suspected`（warning + 审计行），**不杀** |
+
+`unknown` 不算"恢复成功"：恢复是幂等的（再启动得到同样的报告），误杀不可逆。
+
+人工处置走 `edith-processes`：`inspect`（只读，带实时核验值）/ `retry <pid>`
+（重新核验，确认归属才终结）/ `acknowledge <pid> --reason ...`（暂不处理，启动时不再
+告警）。**没有 `kill` 子命令是刻意的**——按 pid 直接杀会绕过归属校验，而归属校验正是
+这套登记存在的理由。恢复与处置的每一行都追加进 `process-recovery.jsonl`。
+
+登记写不进磁盘不静默放行：`register` 落盘失败会终结刚起来的进程树、回滚内存条目，
+向模型返回 `background_registration_failed`；回滚也失败时写 `severity=high` 审计。
+
+这一层的回归在 `backend-py/tests/` 的 6 个专门文件里（`test_background_processes`、
+`test_process_registration_atomicity`、`test_process_recovery`、`test_process_identity_race`、
+`test_processes_cli`、`test_multi_instance_ledger`，共 49 例）。全量结论是
+`809 passed, 1 skipped`——不是"全部通过"，有 1 例被跳过。
+
 ## 数据位置
 
 一切可变数据在 `%APPDATA%\ETHOS`：
@@ -71,6 +103,9 @@ electron (desktop/dist/main.js)
 ├── workspace-volumes/   工作区文件（未绑定本地目录时落这里）
 ├── runtime/             子进程台账（只在运行期存在；文件还在 = 上次异常退出）
 └── sandbox/             每会话的沙箱目录（uploads / work / artifacts + 两个联接）
+    ├── background-processes.json   后台进程登记（只记身份，不记输出与凭据）
+    ├── process-recovery.jsonl      恢复与人工处置的审计（JSONL 追加）
+    └── .processes.lock             登记 / 审计的跨进程写锁
 ```
 
 由 `backend-py/.../config.py` 的 `data_root()` 单点推导；Electron 也把
@@ -140,6 +175,7 @@ LWW、事务、校验）、`migrate.py`（527 行迁移工具）、`overview.md`
 | M3 | 桌面化：托盘常驻、关窗不退出、崩溃残留回收 | 完成 |
 | M3.5 | 凭据加密：`api_key` 目前只是混淆，未接 DPAPI | 未开始 |
 | M4 | 分发：隔离、签名、自动更新 | 未开始 |
+| P2 | 启动预检：拉起 uvicorn 前检查 `fastapi` / `uvicorn` 可导入，失败直接提示 `uv sync`；不改启动流程与依赖安装行为；补「预检成功 / 依赖缺失」两种测试 | 待办 |
 
 ## 本地沙箱（M1）
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 
+from .isolation.errors import SandboxUnavailable
 from .permissions.types import COMMAND_ERROR, TOOL_FAILURE
 
 # 工具错误分类：取值定义在 `permissions.types`（唯一权威源）——因为「谁该重试、
@@ -40,6 +41,13 @@ _BUSINESS_ERRORS: tuple[tuple[type[Exception], str], ...] = (
     (IsADirectoryError, "目标路径是目录而非文件，请核对目标类型后重试。"),
     (NotADirectoryError, "目标路径是文件而非目录，请核对目标类型后重试。"),
     (PermissionError, "权限不足，请检查目标路径的读写权限，或换用有权限的目录重试。"),
+    (
+        # 后台进程台账的归属校验：未登记 / 已退出 / pid 被复用都归到这里。
+        # 不要重试同一个 pid——它要么不属于本会话，要么已经是另一个进程了。
+        ProcessLookupError,
+        "该 PID 不属于当前会话的沙箱，或对应进程已经退出（pid 可能已被系统复用）。"
+        "请先用 sandbox_list_processes 查看仍存活的进程，再按其中的 pid 操作。",
+    ),
 )
 
 
@@ -47,8 +55,24 @@ def tool_error_result(tool_name: str, exc: Exception) -> str:
     """把工具异常转成结构化错误结果 JSON。
 
     业务错误（文件/路径/权限）→ command_error + retryable=true + suggestion，交给模型自救；
+    沙箱不可用 → tool_failure + retryable=false + 明确的安装/诊断指引（不是命令问题）；
     系统故障（超时/SDK 异常等）→ tool_failure + retryable=false，参与熔断统计。
     """
+    if isinstance(exc, SandboxUnavailable):
+        # 单独一条：这类失败换命令、换路径、重试都不会成功，而且用户需要的是
+        # "去装后端/看设置"这样的动作，不是"再试一次"。文案里不要出现"系统故障"，
+        # 否则模型会误判成偶发问题并重试到熔断。
+        return json.dumps(
+            {
+                "error": f"命令未执行：{exc}",
+                "kind": TOOL_FAILURE,
+                "retryable": False,
+                "reason": f"sandbox_{exc.reason}",
+                "suggestion": "这是本机沙箱配置问题，与你写的命令无关。请按错误信息里的指引修复后重试；"
+                "在修复之前，所有命令类工具都会被拒绝执行（不会回落到直接运行）。",
+            },
+            ensure_ascii=False,
+        )
     for err_type, suggestion in _BUSINESS_ERRORS:
         if isinstance(exc, err_type):
             return json.dumps(

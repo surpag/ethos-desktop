@@ -17,6 +17,10 @@ dependencies = [
     "croniter>=6.0",
     "tzdata>=2024.1",
     "python-multipart>=0.0.9",
+    # 凭据加密：非 Windows 平台用 AES-256-GCM（Windows 走系统 DPAPI，不依赖它）。
+    # 之前是隐式依赖（mcp 等间接带进来），这里显式声明，免得干净环境装完才在
+    # 第一次保存 API Key 时 ModuleNotFoundError。
+    "cryptography>=43",
     # 上游缺失声明：`internal/userconfig/mcp_runtime.py` 直接 import，
     # 但 pyproject 与 uv.lock 里都没有，只有开发机的 venv 里手工装过。
     # 干净环境安装后启动即 `ModuleNotFoundError: No module named 'mcp'`。
@@ -27,6 +31,7 @@ dependencies = [
 edith-backend = "edith_backend.main:main"
 edith-trace = "edith_backend.internal.trace.viewer:main"
 edith-skill-migrate = "edith_backend.internal.skills.migrate:main"
+edith-processes = "edith_backend.internal.sandbox.processes_cli:main"
 
 [build-system]
 requires = ["uv_build>=0.12.1,<0.13.0"]

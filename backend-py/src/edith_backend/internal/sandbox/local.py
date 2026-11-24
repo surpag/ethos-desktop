@@ -7,12 +7,19 @@
 「换一条路走」的分支要维护。
 
 **安全边界（诚实说明）**
+
 文件原语做了路径约束：只允许 `WORKSPACE.root`（`/home/user`）之下，`..` 与
 符号链接逃逸都会被拒。这是**应用层**约束，不是内核约束。
-`commands.run` 执行的是本机真实进程，没有 OS 级隔离——它能读写用户有权限的一切。
-所以：本地后端的适用前提是"用户在自己的机器上跑自己的 Agent"。
-给别人分发时需要额外一层（受限 token / AppContainer / 容器），那是 M4 的事，
-不能靠本文件补。
+
+`commands.run` 不再自己决定怎么起进程：argv 与环境变量由 `internal/isolation`
+生成（ASRT / AppContainer 后端 + 按工作区的策略）。**沙箱不可用时它抛
+`SandboxUnavailable`，进程根本不会启动**——没有"先跑着看"的降级路径。
+唯一例外是显式打开 `ETHOS_SANDBOX_ALLOW_UNSAFE_HOST=1`（仅 pytest 使用，
+见 `tests/conftest.py`），那条路径会在审计里以 `backend=unsafe-host` 落一条
+warning。
+
+所以本文件现在的职责只剩两件：把虚拟路径翻译成真实路径（`resolve`），
+以及把隔离层给的 argv 落到 `asyncio` 子进程上。**边界不在这个文件里**。
 """
 
 from __future__ import annotations
@@ -27,14 +34,17 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ...config import data_root
+from .. import isolation
 from ..skills.types import SKILLS_PATH
 from ..workspace.context import BindingState, WorkspaceContext, WorkspaceUnavailableError
 from ..workspace.layout import WORKSPACE
+from . import processes as process_registry
 from .types import FileType
 
 logger = logging.getLogger(__name__)
@@ -534,20 +544,33 @@ class LocalSandbox:
     ) -> None:
         self._root = root
         self.sandbox_id = sandbox_id
+        # 审计用标识：由 `open()` / `attach()` 填。`__init__` 收不到它们，
+        # 而改构造函数签名会波及所有调用点，所以放在这里按需补。
+        self._user_id = ""
+        self._session_id = ""
         #: 本次执行的工作区上下文快照。`None` = 调用方没有提供（面板 / 旧调用路径），
         #: 此时完全走改造前的路径（`workspace-volumes/{id}` + 按需创建）。
         #: **它是一次执行认定的根，不是"当前绑定"**：run 内不重新读取，换绑不影响。
         self._context = context
         self.files = LocalFiles(self)
         self.commands = LocalCommands(self)
-        # 后台进程登记表：pid → asyncio 子进程。只用于 list/kill，
-        # 进程退出后由 `_reap` 摘掉，避免无限增长。
-        self._background: dict[int, asyncio.subprocess.Process] = {}
 
     @property
     def workspace_context(self) -> WorkspaceContext | None:
         """本次执行认定的工作区上下文（可能为 `None`，见 `__init__`）。"""
         return self._context
+
+    @property
+    def _process_owner(self) -> process_registry.Owner:
+        """后台进程的归属键（跨实例稳定）。
+
+        **台账不能挂在实例上**：`Service.workspace()` 每次工具调用都新建一个
+        `LocalSandbox`，挂在实例上等于"启动完就丢"——下一次 list 看到空表，
+        kill 只能退回按 pid 盲杀（无归属校验）。见 `sandbox/processes.py`。
+        """
+        return process_registry.owner_of(
+            self._user_id, self._session_id, self.sandbox_id
+        )
 
     # ---- 生命周期 ----
 
@@ -580,6 +603,8 @@ class LocalSandbox:
             f"local-{_safe_segment(user_id)}-{_safe_segment(session_id)}",
             context=context,
         )
+        sandbox._user_id = user_id
+        sandbox._session_id = session_id
         sandbox._ensure_skills_mount()
         return sandbox
 
@@ -594,17 +619,22 @@ class LocalSandbox:
         root = sandbox_root_for(user_id, session_id)
         if not root.is_dir():
             raise FileNotFoundError(f"本地沙箱目录不存在: {root}")
-        return cls(
+        sandbox = cls(
             root,
             f"local-{_safe_segment(user_id)}-{_safe_segment(session_id)}",
             context=context,
         )
+        sandbox._user_id = user_id
+        sandbox._session_id = session_id
+        return sandbox
 
     async def kill(self) -> None:
-        """结束所有后台进程。**不删目录**：工作区文件是用户的，不能随沙箱一起没。"""
-        for pid in list(self._background):
-            await self.commands.kill(pid)
-        self._background.clear()
+        """结束本会话所有后台进程。**不删目录**：工作区文件是用户的，不能随沙箱一起没。
+
+        走台账而不是本实例的字典：同一个会话的命令可能由多个实例启动，
+        "结束这个沙箱"必须指向会话，而不是某一次工具调用拿到的那个对象。
+        """
+        process_registry.release(self._process_owner)
 
     # ---- 路径 ----
 
@@ -1062,14 +1092,74 @@ class LocalCommands:
         env.setdefault("LC_ALL", "C.UTF-8")
 
         command = self._translate(cmd)
-        argv = [POSIX_SHELL, "-c", command] if POSIX_SHELL else command
+
+        # **唯一执行入口**：argv 与 env 由隔离层生成（见 internal/isolation）。
+        # 后端不可用时这里抛 `SandboxUnavailable`——**不捕获、不回落**，进程根本
+        # 不会被启动。这是 spec 里「沙箱初始化失败禁止无保护执行」的落点。
+        try:
+            exec_plan = isolation.plan(
+                sandbox_root=self._sb.root,
+                cwd=work_dir,
+                command=command,
+                env=env,
+                shell_exe=POSIX_SHELL,
+                bound_root=self._bound_root(),
+                background=background,
+                session_id=self._sb._session_id,
+                workspace_id=(self._sb.workspace_context.workspace_id if self._sb.workspace_context else ""),
+            )
+        except isolation.SandboxUnavailable as exc:
+            # 拒绝也要留痕：安全事件的价值在于"事后能查到何时被拒、为什么"。
+            await isolation.record_refusal(
+                exc,
+                command=command,
+                session_id=self._sb._session_id,
+                workspace_id=(self._sb.workspace_context.workspace_id if self._sb.workspace_context else ""),
+            )
+            raise
+        argv, env = exec_plan.argv, exec_plan.env
+        started = time.monotonic()
+
+        async def _finish(exit_code: int, outcome: str, pid: int | None = None) -> None:
+            duration_ms = (time.monotonic() - started) * 1000
+            isolation.finish(
+                exec_plan, exit_code=exit_code, duration_ms=duration_ms, outcome=outcome
+            )
+            # 审计落库：await 而不是 fire-and-forget，避免 run 结束/取消时把任务
+            # 一起取消掉（那会留下"执行过但没有记录"的空洞）。
+            await isolation.record(
+                exec_plan,
+                exit_code=exit_code,
+                duration_ms=duration_ms,
+                outcome=outcome,
+                pid=pid,
+            )
 
         if background:
             proc = await self._spawn(argv, work_dir, env, devnull=True)
             assert proc.pid is not None
-            self._sb._background[proc.pid] = proc
-            # 退出后由 commands.list() 摘除。调用方不一定会 list，所以表可能
-            # 残留已退出项；它们不占资源（Process 对象很小），且 kill 前会先判 returncode。
+            # 登记到**模块级台账**：下一次工具调用是新实例，只有台账能看见它。
+            # `cmd` 存原始命令（翻译前的写法），`cwd` 存虚拟路径——工具结果会
+            # 原样回给模型，宿主路径会让下一轮调用被判越界。
+            # 不把 process 对象交给台账：它绑在这个事件循环上，而台账比循环活得久。
+            try:
+                process_registry.register(
+                    self._sb._process_owner,
+                    pid=proc.pid,
+                    cmd=cmd,
+                    cwd=self._sb.virtual(work_dir),
+                )
+            except process_registry.PersistenceFailed as exc:
+                # 登记失败**不能**当作启动成功返回：模型会以为这个进程受管理，
+                # 重启后却没有任何人知道它存在。立即回滚，再把失败如实抛上去。
+                await self._rollback_background(proc, exc, command=cmd)
+                await _finish(1, "failed", proc.pid)
+                raise
+            # 必须有人 wait：否则 POSIX 上每次启动都留一个 zombie，且 transport
+            # 会活过事件循环、GC 时对已失效的句柄报警。台账不持有 Process，
+            # 回收责任交给这个后台 task。
+            process_registry.reap(proc)
+            await _finish(0, "started", proc.pid)
             return LocalCommandInfo(pid=proc.pid, cmd=cmd, cwd=self._sb.virtual(work_dir))
 
         proc = await self._spawn(argv, work_dir, env, devnull=False)
@@ -1077,6 +1167,7 @@ class LocalCommands:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except (asyncio.TimeoutError, TimeoutError):
             await self._kill_tree(proc)
+            await _finish(124, "timeout", proc.pid)
             return LocalCommandResult(
                 stdout="",
                 stderr=f"命令超时（{timeout} 秒）已被终止: {cmd}",
@@ -1085,13 +1176,30 @@ class LocalCommands:
         except asyncio.CancelledError:
             # 用户点了停止 / run 被取消：不能把子进程留成孤儿继续占着文件。
             await self._kill_tree(proc)
+            await _finish(130, "canceled", proc.pid)
             raise
 
+        await _finish(proc.returncode or 0, "exited", proc.pid)
         return LocalCommandResult(
             stdout=self._normalize(_decode_output(out or b"")),
             stderr=self._normalize(_decode_output(err or b"")),
             exit_code=proc.returncode or 0,
         )
+
+    def _bound_root(self) -> str | None:
+        """本次执行的绑定工作区根（未绑定 / 无上下文返回 None）。
+
+        隔离策略据此决定"哪里可写"：绑定态必须只放行用户选定的那个目录，
+        而不是整个 `workspace-volumes`。
+        """
+        context = self._sb.workspace_context
+        if (
+            context is not None
+            and context.state is BindingState.BOUND_READY
+            and context.root
+        ):
+            return str(context.root)
+        return None
 
     def _normalize(self, text: str) -> str:
         """把输出里的宿主真实路径还原成虚拟路径。
@@ -1233,25 +1341,54 @@ class LocalCommands:
         return await asyncio.create_subprocess_shell(argv, **kwargs)
 
     async def list(self) -> list[LocalCommandInfo]:
-        alive: list[LocalCommandInfo] = []
-        for pid, proc in list(self._sb._background.items()):
-            if proc.returncode is not None:
-                self._sb._background.pop(pid, None)
-                continue
-            alive.append(LocalCommandInfo(pid=pid, cmd="", cwd=self._sb.virtual(self._sb.root)))
-        return alive
+        """本会话存活的后台进程（含**其它工具调用实例**启动的）。
+
+        已退出 / pid 被复用的条目在这里顺手摘掉，台账不会无限增长。
+        """
+        return [
+            LocalCommandInfo(pid=entry.pid, cmd=entry.cmd, cwd=entry.cwd)
+            for entry in process_registry.list_processes(self._sb._process_owner)
+        ]
 
     async def kill(self, pid: int) -> None:
-        proc = self._sb._background.get(pid)
-        if proc is None:
-            # 不是本会话登记的后台进程：仍然尝试按 pid 结束（可能是 run 里
-            # background=True 之外启动、但被模型用 pid 引用的进程）。
-            self._kill_pid(pid)
-            return
-        await self._kill_tree(proc)
-        self._sb._background.pop(pid, None)
+        """结束本会话登记的进程。
+
+        **不再按 pid 盲杀**：pid 属于别的会话（或别的用户）时直接拒绝。旧实现
+        对未登记的 pid 仍会 `taskkill`，等于任何一个会话都能结束同机任意进程——
+        归属校验是这次改造的第二个目标，不是附带清理。
+        """
+        process_registry.kill(self._sb._process_owner, pid)
 
     # ---- 内部 ----
+
+    async def _rollback_background(
+        self,
+        proc: asyncio.subprocess.Process,
+        exc: process_registry.PersistenceFailed,
+        *,
+        command: str,
+    ) -> None:
+        """登记失败后的回滚：终结 → 等待退出 → 回收 → 失败留高优先级审计。
+
+        `terminate_tree` 只发出结束请求，进程不一定会立刻消失。**必须 wait**：
+        否则 transport 还挂着子进程，工具返回失败的同时进程仍在跑，用户看到的
+        是"报错了但端口被占着"。
+        """
+        killed, detail = process_registry.rollback(exc.entry)
+        exc.terminated = killed
+        exc.rollback_detail = detail
+        if not killed:
+            # 杀不掉 / 无法确认身份：这是"登记没落盘 + 进程还在"的双重残留，
+            # 必须留下可追的审计（要求里点名要高优先级）。
+            process_registry.record_rollback_failure(exc.entry, exc.owner, detail=detail)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+        except RuntimeError:
+            # 跨事件循环：Process 的 waiter 绑在别的循环上。进程树已经由
+            # terminate_tree 结束，这里等不到完成信号是正常的。
+            pass
 
     def _spawn_kwargs(self) -> dict[str, Any]:
         if sys.platform == "win32":
@@ -1267,31 +1404,20 @@ class LocalCommands:
             await asyncio.wait_for(proc.wait(), timeout=5)
         except (asyncio.TimeoutError, TimeoutError):
             pass
+        except RuntimeError:
+            # 跨事件循环：进程对象是在别的 loop 里创建的（测试用多次 asyncio.run
+            # 分别调 run / kill），它的完成 Future 绑在原循环上，这里 await 会抛
+            # "attached to a different loop"。taskkill /T /F 已经同步结束进程树，
+            # 不需要再等 —— 继续等反而会让 kill 失败、后台表里留下僵尸项。
+            pass
 
     def _kill_pid(self, pid: int) -> None:
-        """结束进程及其子进程。
+        """结束进程及其子进程（实现见 `processes.terminate_tree`）。
 
-        只 kill 父进程会留下孤儿：`cmd1 && cmd2`、`python x.py` 派生的解释器
-        都还在跑，继续占着工作区文件（Windows 上表现为"文件被占用无法删除"）。
+        前台超时/取消与台账回收必须用同一份终结逻辑：两处各写一遍，会出现
+        "一个说已结束、另一个说还在"的分歧，而且子进程树只有一处会带走。
         """
-        if sys.platform == "win32":
-            try:
-                subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    capture_output=True,
-                    timeout=10,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                )
-            except (OSError, subprocess.SubprocessError):
-                pass
-            return
-        try:
-            os.killpg(os.getpgid(pid), 9)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                os.kill(pid, 9)
-            except (ProcessLookupError, PermissionError, OSError):
-                pass
+        process_registry.terminate_tree(pid)
 
 
 # ---- 供 Service 使用的小工具 ----

@@ -1725,6 +1725,8 @@ async def chat(
                             session_id,
                             workspace_id_arg,
                             context=workspace_context,
+                            # 审计归属：哪条 tool_call 触发了哪次执行
+                            tool_call_id=str(tc.get("id") or ""),
                         )
                     else:
                         result = json.dumps(

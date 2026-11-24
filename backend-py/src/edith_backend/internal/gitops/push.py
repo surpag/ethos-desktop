@@ -1,9 +1,14 @@
 """后端侧 push：在本地临时仓库里 fetch bundle 并推送到远端。
 
-凭据只经**环境变量**注入本地 git 进程：
+凭据只经**环境变量**注入 git 进程：
 `GIT_CONFIG_COUNT=1` / `GIT_CONFIG_KEY_0=http.extraHeader` /
-`GIT_CONFIG_VALUE_0="Authorization: Basic ..."` —— 不落盘、不进命令行（`ps` 看不到）、
-不进入任何沙箱。remote URL 保持干净（不含 token），因此不会被写进 `.git/config`。
+`GIT_CONFIG_VALUE_0="Authorization: Basic ..."` —— 不落盘、不进命令行（`ps` 看不到）。
+remote URL 保持干净（不含 token），因此不会被写进 `.git/config`。
+
+**git 进程本身走隔离后端**（`isolation.plan`）：这是执行链上原本唯一的宿主绕过
+入口——它以宿主用户身份运行、继承 `os.environ`、可任意联网。现在它与 Shell 一样
+受同一套策略约束：可写范围只有本次的临时仓库目录，网络只放行远端域名，
+沙箱不可用时直接拒绝（`PushError`），不会回落到宿主直执行。
 """
 
 from __future__ import annotations
@@ -11,9 +16,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from .. import isolation
 from .redact import redact_git_output
 
 PUSH_TIMEOUT = 300  # 秒；大仓首次推送可能较久
@@ -77,8 +87,32 @@ def _auth_env(token: str) -> dict[str, str]:
     }
 
 
-async def _run_git(args: list[str], cwd: str, token: str | None) -> tuple[int, str, str]:
-    """在本机执行 git（非交互、无系统配置），返回 (exitCode, stdout, stderr)。"""
+def _remote_domains(remote_url: str) -> tuple[str, ...]:
+    """只放行远端仓库的域名（含端口语义交给 ASRT 代理层）。
+
+    这是 git 唯一需要联网的地方；其余 git 子命令（init/fetch）不出网，
+    不给任何域名。
+    """
+    try:
+        host = urlsplit(remote_url).hostname or ""
+    except ValueError:
+        host = ""
+    return (host,) if host else ()
+
+
+async def _run_git(
+    args: list[str],
+    cwd: str,
+    token: str | None,
+    *,
+    purpose: str = "git",
+    domains: tuple[str, ...] = (),
+) -> tuple[int, str, str]:
+    """在**隔离后端**里执行 git（非交互、无系统配置），返回 (exitCode, stdout, stderr)。
+
+    隔离层不可用时抛 `PushError`：push 是用户可见动作，需要一句人能读懂的原因；
+    而"拒绝执行"本身不可协商——不会因为它是用户点的就绕开沙箱。
+    """
     env = dict(os.environ)
     env.update(
         {
@@ -87,21 +121,66 @@ async def _run_git(args: list[str], cwd: str, token: str | None) -> tuple[int, s
             "GIT_CONFIG_NOSYSTEM": "1",
         }
     )
-    if token:
-        env.update(_auth_env(token))
+    summary = "git " + " ".join(args)
+    try:
+        exec_plan = isolation.plan(
+            sandbox_root=Path(cwd),
+            cwd=Path(cwd),
+            command=summary,
+            argv=["git", *args],
+            env=env,
+            shell_exe=None,
+            # 临时仓库目录是本次唯一可写范围（不是用户家目录）
+            extra_writable=(str(cwd),),
+            extra_domains=domains,
+            # 凭据只进环境变量；`plan` 只把键名写进审计
+            extra_env=_auth_env(token) if token else None,
+            purpose=purpose,
+        )
+    except isolation.SandboxUnavailable as exc:
+        await isolation.record_refusal(exc, command=summary)
+        raise PushError(f"命令未执行：{exc}") from exc
+
+    started = time.monotonic()
+    spawn_kwargs: dict = (
+        {"creationflags": subprocess.CREATE_NO_WINDOW}
+        if sys.platform == "win32"
+        else {"start_new_session": True}
+    )
     proc = await asyncio.create_subprocess_exec(
-        "git",
-        *args,
+        *exec_plan.argv,
         cwd=cwd,
-        env=env,
+        env=exec_plan.env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        **spawn_kwargs,
     )
+
+    async def _finish(exit_code: int, outcome: str) -> None:
+        duration_ms = (time.monotonic() - started) * 1000
+        isolation.finish(
+            exec_plan, exit_code=exit_code, duration_ms=duration_ms, outcome=outcome
+        )
+        await isolation.record(
+            exec_plan,
+            exit_code=exit_code,
+            duration_ms=duration_ms,
+            outcome=outcome,
+            pid=proc.pid,
+        )
+
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=PUSH_TIMEOUT)
     except TimeoutError as exc:
         proc.kill()
+        await _finish(124, "timeout")
         raise PushError(f"git {args[0]} 超时（>{PUSH_TIMEOUT}s）") from exc
+    except asyncio.CancelledError:
+        proc.kill()
+        await _finish(130, "canceled")
+        raise
+
+    await _finish(proc.returncode or 0, "exited")
     return (
         proc.returncode or 0,
         out.decode("utf-8", errors="replace"),
@@ -140,7 +219,7 @@ async def push_bundle(
         # 用 **bare** 临时仓库接收：没有 checked-out 的分支，fetch 到任意
         # refs/heads/* 都不会被 git 拒绝（非 bare 时会报
         # "refusing to fetch into branch 'refs/heads/<b>' checked out at ..."）。
-        code, _, err = await _run_git(["init", "--bare", "-q"], tmp, None)
+        code, _, err = await _run_git(["init", "--bare", "-q"], tmp, None, purpose="git-init")
         if code != 0:
             raise PushError(f"git init 失败：{err[:200]}")
 
@@ -148,6 +227,7 @@ async def push_bundle(
             ["fetch", str(bundle_path), f"refs/heads/{branch}:refs/heads/{branch}"],
             tmp,
             None,
+            purpose="git-fetch",
         )
         if code != 0:
             raise PushError(f"从 bundle 载入提交失败：{err[:200]}")
@@ -156,6 +236,8 @@ async def push_bundle(
             ["push", remote_url, f"refs/heads/{branch}:refs/heads/{target}"],
             tmp,
             token,
+            purpose="git-push",
+            domains=_remote_domains(remote_url),
         )
         if code != 0:
             detail = err[:300]
@@ -179,7 +261,11 @@ async def list_remote_branches(remote_url: str, token: str) -> dict:
         raise PushError("缺少远端仓库地址")
     with tempfile.TemporaryDirectory(prefix="edith-lsremote-") as tmp:
         code, out, err = await _run_git(
-            ["ls-remote", "--heads", remote_url], tmp, token
+            ["ls-remote", "--heads", remote_url],
+            tmp,
+            token,
+            purpose="git-ls-remote",
+            domains=_remote_domains(remote_url),
         )
         if code != 0:
             raise PushError(f"读取远端分支失败：{err[:300]}")
@@ -193,7 +279,11 @@ async def list_remote_branches(remote_url: str, token: str) -> dict:
         # 默认分支：--symref 会给出 `ref: refs/heads/xxx  HEAD`
         default_branch = ""
         code, out, _ = await _run_git(
-            ["ls-remote", "--symref", remote_url, "HEAD"], tmp, token
+            ["ls-remote", "--symref", remote_url, "HEAD"],
+            tmp,
+            token,
+            purpose="git-ls-remote",
+            domains=_remote_domains(remote_url),
         )
         if code == 0:
             for line in out.splitlines():

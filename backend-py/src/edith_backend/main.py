@@ -12,7 +12,6 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
 
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
@@ -21,6 +20,8 @@ from starlette.requests import Request
 from . import config
 from .database import open_database
 from .internal import http_utils
+from .internal import isolation as isolation_layer
+from .internal import log_context
 from .internal.agentrun import Dependencies, Service
 from .internal.agentrun.plan_tools import PlanToolSet
 from .internal.agentrun.run_plan import RunPlanRegistry
@@ -41,6 +42,7 @@ from .internal.sandbox import AgentInput as SandboxAgentInput
 from .internal.sandbox import SandboxToolSet
 from .internal.sandbox import Service as SandboxService
 from .internal.sandbox import create_schema as create_sandbox_schema
+from .internal.sandbox import processes as sandbox_processes
 from .internal.session import SessionStore
 from .internal.session import create_schema as create_session_schema
 from .internal.session.approval_store import ApprovalStore
@@ -77,14 +79,10 @@ logging.basicConfig(
     format=_LOG_FORMAT,
 )
 
-# 定义一个 ContextVar，用于在整个请求生命周期中传递 request_id
-_request_id_var: ContextVar[str] = ContextVar("request_id", default="no-request")
-
-
 # 自定义日志过滤器，自动给所有日志加上 request_id
 class RequestIDFilter(logging.Filter):
     def filter(self, record):
-        record.request_id = _request_id_var.get("no-request")
+        record.request_id = log_context.current_request_id()
         return True
 
 
@@ -126,6 +124,32 @@ async def lifespan(app: FastAPI):
     await create_cronjob_schema(db)
     await create_models_schema(db)
     await create_trace_schema(db)
+
+    # 上一次运行可能是被强杀的：`lifespan` 没机会执行下面的 `release_all()`，
+    # 后台进程还在跑，而内存台账已经随进程消失。这里读回持久化登记并尝试回收。
+    # 只有"创建时刻 + 镜像路径"都对得上的进程才会被终结，其余只留记录（结果与
+    # 审计由 `processes.recover()` 自己记录，这里只补一条人工处置的指引——
+    # 恢复报告里 unknown 不计入成功，必须有可执行的下一步）。
+    recovery = sandbox_processes.recover()
+    if recovery.registry_status not in ("ok", "missing"):
+        # 空集合在这里的含义是"读不出来"，不是"没有遗留进程"。这条日志是启动
+        # 序列里唯一能把它与"系统干净"区分开的地方。
+        logger.error(
+            "sandbox_process_registry_unreadable status=%s —— 本轮未执行任何恢复；"
+            "用 `edith-processes inspect` 查看损坏备份与详情",
+            recovery.registry_status,
+        )
+    if recovery.unknown:
+        logger.warning(
+            "sandbox_process_recovery_pending pids=%s —— 归属无法确认，未做任何处理；"
+            "用 `edith-processes inspect` 查看详情，`retry <pid>` 重新核验，"
+            "`acknowledge <pid> --reason ...` 确认暂不处理",
+            list(recovery.unknown),
+        )
+
+    # 沙箱执行审计：表由隔离层自己维护（它比 trace 更靠近执行链），
+    # 连接注入后 `isolation.record()` 才真正落库；未注入时只写日志。
+    await isolation_layer.store.configure(db).ensure_schema()
 
     # trace 保留期：默认 14 天（失败/降级 run 内部翻倍）。多租户下不清理会无限增长。
     traces = TraceStore(db)
@@ -247,6 +271,14 @@ async def lifespan(app: FastAPI):
         await scheduler_task
     except asyncio.CancelledError:
         pass
+    # 后台进程不随会话对象消失：run 结束不回收（`sandbox_start_process` 的语义就是
+    # "长期进程"），但**后端退出必须一起带走**。否则它们成为没有主人的孤儿，
+    # 继续占着工作区文件——Windows 上表现为"目录删不掉"，且没有任何界面能看见它们。
+    # 每个会话的回收条数由 `processes.release()` 自己记日志，这里不再重复统计。
+    sandbox_processes.release_all()
+    # 先摘掉审计单例再关连接：否则后续若有命令落一条记录，会写到一个已关闭的
+    # 连接上（表现为 "Cannot operate on a closed database" 的噪声日志）。
+    isolation_layer.store.reset()
     await db.close()
 
 
@@ -271,7 +303,7 @@ def create_app() -> FastAPI:
         request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
 
         # 绑定到 ContextVar（之后所有日志自动带上它）
-        token = _request_id_var.set(request_id)
+        token = log_context.bind_request_id(request_id)
 
         # 记录请求开始（结构化日志）
         logger.info(
@@ -304,11 +336,43 @@ def create_app() -> FastAPI:
             raise  # 交给 FastAPI 的全局异常处理器
         finally:
             # 重置 ContextVar，避免污染其他请求
-            _request_id_var.reset(token)
+            log_context.reset_request_id(token)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/internal/sandbox/health")
+    async def sandbox_health() -> dict:
+        """执行隔离的能力与选择结果（设置页 / 诊断用）。
+
+        只报告后端类型、版本、能力缺口与拒绝原因，不返回策略内容与用户绝对路径。
+        注意它与 `/health` 不同：`/health` 是进程存活探针（免令牌、必须极快），
+        这里是**安全状态**，走正常鉴权。
+        """
+        return isolation_layer.health()
+
+    @app.get("/internal/sandbox/audit")
+    async def sandbox_audit(
+        sessionId: str = "",
+        requestId: str = "",
+        workspaceId: str = "",
+        limit: int = 50,
+    ) -> dict:
+        """按会话 / 请求 / 工作区查询沙箱执行审计（Trace 面板数据源）。
+
+        只返回已脱敏的字段：命令文本在入库前已处理，环境变量只有键名。
+        """
+        target = isolation_layer.store.current()
+        if target is None:
+            return {"entries": []}
+        entries = await target.query(
+            session_id=sessionId,
+            request_id=requestId,
+            workspace_id=workspaceId,
+            limit=limit,
+        )
+        return {"entries": entries}
 
     return app
 
