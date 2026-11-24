@@ -105,7 +105,11 @@ cd backend-py
 | `EDITH_ADDR` | `127.0.0.1:8080` | 监听地址（壳会覆盖为随机端口） |
 | `EDITH_DB_PATH` | `data_root()/edith-v2.db` | 填相对路径会相对**当前目录**解析 |
 | `ETHOS_DATA_DIR` | 见上 | 可变数据根目录 |
-| `EDITH_SECRET_KEY` | 内置 fallback | 混淆落盘的 API Key / MCP Header |
+| `EDITH_RUNTIME_TOKEN` | 空（不鉴权） | 本地 Runtime 的入站令牌；桌面壳每次启动随机生成并注入 backend 与 web。留空仅供开发与测试 |
+| `ETHOS_SANDBOX_BACKEND` | `auto` | 执行隔离后端：`auto` / `asrt` / `appcontainer` / `host` / `off`。**`off` 表示拒绝执行，不是裸跑** |
+| `ETHOS_SANDBOX_ALLOWED_DOMAINS` | 空（全禁网） | 沙箱内允许访问的域名，逗号分隔；空值 = 完全禁止外网 |
+| `ETHOS_SANDBOX_ALLOW_UNSAFE_HOST` | 未设置 | 仅 pytest 使用：与 `ETHOS_SANDBOX_BACKEND=host` 同时在场才允许宿主直执行 |
+| `EDITH_SECRET_KEY` | 内置 fallback | **仅用于解 v1 旧密文**。新写入的凭据由系统密钥保护（Windows DPAPI / 其他平台主密钥 AES-GCM），不读这个变量 |
 | `EDITH_MAX_TOOL_ROUNDS` | `30` | 单轮工具调用上限 |
 | `EDITH_WORKSPACE_VOLUME_DIR` | `workspace-volumes` | 工作区目录名（相对 `data_root()`） |
 | `EDITH_WORKSPACE_LOCAL_ROOTS` | 空 | 可绑定为工作区的本地目录允许清单（`os.pathsep` 分隔）；**留空 = 放行任意目录**，只打一条 warning |

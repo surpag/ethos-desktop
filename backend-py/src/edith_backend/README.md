@@ -150,7 +150,8 @@ Web 前端（BFF 同源代理，服务端注入 userId）
 | `ETHOS_DESKTOP` | 未设置 | `config.py` | `"1"` 表示跑在壳内，数据落 `%APPDATA%\ETHOS` |
 | `EDITH_DB_PATH` | `data_root()/edith-v2.db` | `config.database_path()` | SQLite 文件路径（相对路径相对 cwd，勿用） |
 | `EDITH_ADDR` | `127.0.0.1:8080` | `config.runtime_address()` | HTTP 监听地址 |
-| `EDITH_SECRET_KEY` | 内置 fallback | `userconfig/secret.py` | 混淆落盘的 API Key / MCP Header（非强加密） |
+| `EDITH_RUNTIME_TOKEN` | 空（不鉴权） | `config.runtime_token()` | 入站令牌：配了之后除 `/health` 外都要带 `X-ETHOS-RUNTIME-TOKEN`（或 Bearer）。桌面壳随机生成 |
+| `EDITH_SECRET_KEY` | 内置 fallback | `userconfig/secret.py` | **仅用于解 v1 旧密文**；新写入由系统密钥保护（Windows DPAPI / 其他平台 AES-GCM） |
 | `EDITH_TRACE_RETENTION_DAYS` | `14` | `main.py` | trace 保留天数 |
 | `EDITH_LOG_FILE` | 未设置 | `main.py` | 设置后日志滚动落盘（10MB × 5） |
 

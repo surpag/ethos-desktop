@@ -21,14 +21,31 @@ user-skills/
 project-skills/
 conflicts/
 
+# OS 级隔离的运行期状态：ACL 备份、策略快照、锁文件都是**本机**派生的，
+# 换台机器毫无意义。注意锚定到 backend-py 下——源码目录是
+# `src/edith_backend/internal/isolation/`，写成 `isolation/` 会连源码一起挡掉。
+/backend-py/isolation/
+
 # 配置与密钥
 .env
 .env.local
 .env.*.local
+.env.*
+!.env.example
+
+# 密钥材料兜底：本仓库任何位置都不该有私钥。写成裸文件名（不带 `/`）会匹配
+# 任意层级——需要的正是这个效果：无论谁在哪个子目录放了一份，都进不了库。
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.pem
+*.key
 
 # 打包产物
 release/
 build/
+.next-verify/
 
 # 会话记忆（本地工作日志，不入库）
 .workbuddy/
