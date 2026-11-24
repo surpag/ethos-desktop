@@ -213,7 +213,7 @@ models/http.py: GET /internal/available-models ──▶ providers.list_statuses
 | --- | --- | --- |
 | `users` | `user_id` | 用户记录（首次访问自动创建）。 |
 | `user_agents` | `user_id` | 用户 Agent 设置（personality / default_model_id / timezone）。 |
-| `user_providers` | `(user_id, provider_id)` | 用户供应商密钥（api_key 明文仅服务端可读）。 |
+| `user_providers` | `(user_id, provider_id)` | 用户供应商密钥（api_key 由 `secret.protect` 保护后落库：Windows DPAPI / 其他平台 AES-GCM）。 |
 | `user_mcp_servers` | `server_id` | MCP 服务配置（name / url / transport / enabled / 时间戳）。 |
-| `user_mcp_headers` | `(server_id, header_name)` | MCP 请求头（值密文与否由上层决定，当前为明文存储）。 |
-| `user_git_credentials` | `(user_id, provider)` | Git 推送凭据（token 混淆后落库）。 |
+| `user_mcp_headers` | `(server_id, header_name)` | MCP 请求头（值由 `secret.protect` 保护，与 API Key 同一套）。 |
+| `user_git_credentials` | `(user_id, provider)` | Git 推送凭据（token 由 `secret.protect` 保护后落库）。 |

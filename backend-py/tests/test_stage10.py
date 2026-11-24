@@ -524,10 +524,11 @@ def test_git_credentials_roundtrip() -> None:
         assert await creds.list_connected("u1") == ["github"]
         assert await creds.load_token("u1", "github") == "ghp_secret123"
 
-        # 落盘必须是混淆值，不含明文
+        # 落盘必须是系统密钥保护的密文（v2），不含明文。
+        # v1 是历史异或混淆：只保留读取兼容，新写入不再产生它。
         cursor = await db.execute("SELECT token FROM user_git_credentials")
         row = await cursor.fetchone()
-        assert row["token"].startswith("enc:v1:")
+        assert row["token"].startswith("enc:v2:")
         assert "ghp_secret123" not in row["token"]
 
         # 覆盖与隔离（不同用户互不可见）

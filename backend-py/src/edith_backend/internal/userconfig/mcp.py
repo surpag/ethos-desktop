@@ -15,7 +15,7 @@ import aiosqlite
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
-from .secret import deobfuscate, obfuscate
+from .secret import protect, unprotect
 from .store import ensure_user
 
 
@@ -176,7 +176,7 @@ class MCP:
             if value is not None:
                 await self._db.execute(
                     "INSERT INTO user_mcp_headers (server_id, header_name, header_value) VALUES (?, ?, ?)",
-                    (server.id, name, obfuscate(value)),
+                    (server.id, name, protect(value)),
                 )
         await self._db.commit()
         server.headers = [MCPHeader(name=n, value=v or "") for n, v in input_.headers if v is not None]
@@ -198,7 +198,7 @@ class MCP:
             await self._db.execute(
                 "INSERT INTO user_mcp_headers (server_id, header_name, header_value) VALUES (?, ?, ?) "
                 "ON CONFLICT(server_id, header_name) DO UPDATE SET header_value = excluded.header_value",
-                (server_id, name, obfuscate(value)),
+                (server_id, name, protect(value)),
             )
         await self._db.commit()
         return await self._load_one(user_id, server_id)
@@ -221,7 +221,7 @@ class MCP:
         rows = await cursor.fetchall()
         await cursor.close()
         return [
-            MCPHeader(name=r["header_name"], value=deobfuscate(r["header_value"]))
+            MCPHeader(name=r["header_name"], value=unprotect(r["header_value"]))
             for r in rows
         ]
 

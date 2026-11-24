@@ -1,17 +1,17 @@
 """用户 Git 凭据（PAT）的读写能力。
 
 定位：凭据**只在后端使用**（注入 git 执行环境跑 push/pull），永不下沉到 Agent 可达的环境。
-存储复用 `secret.obfuscate`，与 user_providers 保持一致（单一权威源）。
+存储复用 `secret.protect`，与 user_providers 保持一致（单一权威源）。
 
-⚠️ 上云前必须解决（见 secret.py 自述）：obfuscate 是基础混淆而非强加密，
-其"真正的边界是本机单用户"。云端多租户部署前必须换成 KMS / 信封加密。
+保护强度取决于平台密钥：Windows 走 DPAPI（绑定当前用户 + 机器），其他平台走
+本地主密钥的 AES-256-GCM。云端多租户部署前必须换成 KMS / 信封加密。
 """
 
 from __future__ import annotations
 
 import aiosqlite
 
-from .secret import deobfuscate, obfuscate
+from .secret import protect, unprotect
 from .store import ensure_user
 
 # 先只支持 GitHub（凭据语义清晰：fine-grained PAT 或 classic PAT）
@@ -54,7 +54,7 @@ class GitCredentials:
             ON CONFLICT(user_id, provider) DO UPDATE SET
                 token = excluded.token, updated_at = CURRENT_TIMESTAMP
             """,
-            (user_id, provider, obfuscate(token)),
+            (user_id, provider, protect(token)),
         )
         await self._db.commit()
 
@@ -75,4 +75,4 @@ class GitCredentials:
         )
         row = await cursor.fetchone()
         await cursor.close()
-        return deobfuscate(row["token"]) if row else None
+        return unprotect(row["token"]) if row else None

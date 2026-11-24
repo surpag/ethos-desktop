@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import aiosqlite
 
-from .secret import deobfuscate, obfuscate
+from .secret import protect, unprotect
 from .store import ensure_user
 from .types import ProviderStatus
 
@@ -60,7 +60,7 @@ class Providers:
                 VALUES (?, ?, ?)
                 ON CONFLICT(user_id, provider_id) DO UPDATE SET api_key = excluded.api_key
                 """,
-                (user_id, provider_id, obfuscate(api_key.strip())),
+                (user_id, provider_id, protect(api_key.strip())),
             )
         await self._db.commit()
 
@@ -74,7 +74,7 @@ class Providers:
         await cursor.close()
         if row is None:
             raise LookupError(f"provider key not found: {user_id}/{provider_id}")
-        return deobfuscate(row["api_key"])
+        return unprotect(row["api_key"])
 
     async def try_load_api_key(self, user_id: str, provider_id: str) -> str:
         """读取密钥，缺失时返回空串（用于「可选凭据」的探测路径）。"""
