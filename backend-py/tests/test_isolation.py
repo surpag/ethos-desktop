@@ -22,6 +22,7 @@ from edith_backend.internal.isolation.policy import (
     build_policy,
     windows_acl_denied_paths,
 )
+from edith_backend.config import data_root
 from edith_backend.internal.tools import tool_error_result
 
 
@@ -199,14 +200,18 @@ def test_policy_binds_only_the_authorized_workspace(tmp_path: Path) -> None:
 
     policy = build_policy(sandbox_root=sandbox_root, cwd=workspace, bound_root=str(workspace))
     assert str(workspace.resolve()) in policy.writable_roots
-    assert policy.denied_read  # SSH / 云凭据 / 应用数据必须出现在拒绝列表里
     # Windows 上 `.ssh` 等由 ACL 加固承担，ASRT 策略里会去重掉（双重拒绝会让
     # `srt acl` 与 `denyRead` 互相干扰，且对主目录子项 stamp 会空转）。
     # 所以这条断言要看的是"被覆盖"，而不是"必须出现在 denyRead 里"。
     acl_handled = {path.casefold() for path in windows_acl_denied_paths()}
+    assert policy.denied_read or acl_handled
     assert any(".ssh" in item.casefold() for item in policy.denied_read) or any(
         path.endswith(".ssh") for path in acl_handled
     )
+    # v2 的关键回归点：整个 data_root() **不能**进 denyRead。桌面模式下它是
+    # `%APPDATA%\ETHOS`（几万个 Electron 缓存文件），每次执行要 44.5s，
+    # 而兜底超时是 30s——结果是每条命令都被超时杀掉。
+    assert str(data_root()) not in policy.denied_read
 
 
 def test_policy_sets_are_stable_and_digest_depends_on_content(tmp_path: Path) -> None:

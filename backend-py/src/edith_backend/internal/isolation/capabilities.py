@@ -24,6 +24,12 @@ ASRT_PACKAGE = "@anthropic-ai/sandbox-runtime"
 ASRT_MIN_NODE = (22, 12)
 #: 探测命令的超时：`srt --version` 要起一个 Node 进程，冷启动可能上秒级
 PROBE_TIMEOUT_SECONDS = 15
+#: 行为验证的超时。**不是"容忍卡死"的预算，而是"覆盖首次建授权"的预算**：
+#: 实测同一条 `echo` 首次 23.8s（`acl grant --persistent`）、授权建好后 3.9s。
+#: 定成 25s 会让通过与否取决于当时的机器负载——那是最糟的一类失败：同一台机器
+#: 时好时坏，用户只能反复重装。120s 是 4.7 倍余量，真卡死（600s 那个 bug）仍会被
+#: 判失败，只是要等久一点。
+VERIFY_TIMEOUT_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -275,7 +281,7 @@ def _default_probe_root() -> Path:
 def verify_asrt(
     capability: BackendCapability,
     *,
-    timeout: int = 25,
+    timeout: int = VERIFY_TIMEOUT_SECONDS,
     probe_root: Path | None = None,
 ) -> tuple[bool, str]:
     """**行为验证**：真在沙箱里跑一条 `echo`，看它是否返回。
@@ -284,6 +290,12 @@ def verify_asrt(
     正常返回 0.0.83，但真正执行时卡在 `srt-win acl grant --persistent` 上，
     直到它自己的 600 秒超时才失败。`available=true` 在这种机器上是**假阳性**，
     会让用户以为隔离生效，实际每条命令都吊死 10 分钟。
+
+    **超时阈值必须覆盖"首次建授权"的正常开销**：实测同一条 `echo`，首次
+    （要 `acl grant --persistent`）23.8s，授权建好后 3.9s。曾经把阈值定成 25s，
+    结果验证通过与否取决于机器负载——应用启动时 Electron/DB 一起抢 IO 就翻过
+    25s，被误判成"后端坏了"，再被 `_failure` 缓存放大成"整个会话不能执行"。
+    所以阈值取 `VERIFY_TIMEOUT_SECONDS`，**靠近但不超过它不算失败**。
 
     所以：探测分两级——`--version` 决定"装没装"，这里决定"能不能用"。
     验证失败即视为不可用（fail-closed），并且把真实原因带进错误信息。
@@ -332,8 +344,13 @@ def verify_asrt(
 
     if timed_out:
         return False, (
-            f"沙箱行为验证超时（>{timeout}s）：srt 卡在初始化（Windows 常见于 "
-            "`srt-win acl grant` 需要提权或工作区落在受保护目录）"
+            f"沙箱行为验证超时（>{timeout}s）：srt 在初始化阶段没有返回。"
+            "注意 Windows 上**首次**建目录授权（`srt-win acl grant --persistent`）"
+            "本身就要 20s 以上，这属于正常开销；超过 "
+            f"{timeout}s 才说明真的卡住。常见原因：工作区/数据目录落在受保护位置"
+            "（Program Files、OneDrive 同步目录），或以普通权限首次建持久授权失败。"
+            "**不要**一上来就 `acl forget`——那会清掉已建好的授权，下次再慢一遍；"
+            "只有每条命令都这样、持续多轮之后才按 ACL 恢复步骤处理。"
         )
     stdout = out.decode("utf-8", "replace")
     stderr = err.decode("utf-8", "replace").strip()

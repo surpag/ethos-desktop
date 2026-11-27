@@ -20,7 +20,12 @@ from pathlib import Path
 from ...config import data_root
 
 #: 策略版本。改任何一项语义（新增拒绝目录、改默认网络姿态）都要升。
-POLICY_VERSION = "ethos-sandbox-policy/1"
+#: v2：`denyRead` 不再包含整个 `data_root()`（桌面模式下那是 `%APPDATA%\ETHOS`），
+#: 改为只拒绝数据库文件——见 `denied_read_paths()` 里的实测数据。
+#: v3：`allowRead` 显式放行虚拟映射根（`workspace-volumes` / `skills`）。v2 收紧
+#: `denyRead` 后 srt 开始严格按"不在允许列表即拒绝"，`cat workspace/foo.txt`
+#: 直接失败——v1 时这个缺陷被 `denyRead` 的宽松副作用盖住了。
+POLICY_VERSION = "ethos-sandbox-policy/3"
 
 #: 相对用户主目录的敏感目录：**读也不行**。SSH 私钥、云凭据、浏览器配置、包管理器
 #: 令牌都在这里；沙箱进程拿到它们等于拿到用户身份。
@@ -100,7 +105,29 @@ def windows_acl_denied_paths() -> tuple[str, ...]:
 
 
 def denied_read_paths() -> tuple[str, ...]:
-    """必须拒绝读取的绝对路径（不存在也照样写进策略：目录后来被建出来同样生效）。"""
+    """必须拒绝读取的绝对路径（目录不存在也照样写进策略：后来被建出来同样生效）。
+
+    **不能把整个 `data_root()` 放进 `denyRead`**——这条踩过两次坑，实测数据如下
+    （同一条 `echo`，本机 Windows 10，srt-win 0.0.83）：
+
+    | denyRead | 单次执行耗时 |
+    | --- | --- |
+    | 空 | 3.6s |
+    | `%APPDATA%\\ETHOS`（整个 data_root） | **44.5s** |
+    | 只放 `edith-v2.db` | 5.0s |
+
+    `denyRead` 的每一项都要 `srt-win acl grant` 递归改 DACL，而桌面模式下
+    `data_root()` 就是 `%APPDATA%\\ETHOS`——里面装着 Electron 的 `Cache` /
+    `GPUCache` / `Partitions`，几万个小文件。命令执行的兜底超时是 30s，于是
+    **每一条命令都被超时杀掉**（审计里是 `exit_code=124, duration≈30.5s`），
+    而 `verify_asrt` 因为 `denyRead=[]` 只要 3s、判定"后端可用"——两边结论相反，
+    排查时会被彻底带偏。
+
+    所以只拒绝真正的秘密载体：SQLite 主库及其 WAL/SHM（API Key、MCP Header、
+    Git Token 的密文都在里面）。跨会话隔离不再靠 `denyRead` 兜——沙箱根在
+    `data_root()/sandbox/` 之内，给父目录加 DENY 会连当前会话自己的 allowWrite
+    一起挡掉（DENY 优先于 ALLOW），那是另一个更难查的故障。
+    """
     roots: list[str] = []
     home = _home()
     handled = {p.casefold() for p in windows_acl_denied_paths()}
@@ -111,9 +138,12 @@ def denied_read_paths() -> tuple[str, ...]:
                 # Windows：交给 win_acl 加固。塞进 denyRead 会让 srt-win 空转。
                 continue
             roots.append(text)
-    # 应用私有数据：SQLite 里有 API Key / MCP Header / Git Token 的密文，
-    # 沙箱进程没有任何理由读它。
-    roots.append(str(data_root()))
+    # 应用私有数据：只拒绝数据库文件本身。`-wal`/`-shm` 存在才加——不存在的路径
+    # 会被 srt 物化出来，反而干扰 SQLite。
+    for name in ("edith-v2.db", "edith-v2.db-wal", "edith-v2.db-shm"):
+        candidate = data_root() / name
+        if candidate.exists():
+            roots.append(str(candidate))
     return tuple(dict.fromkeys(roots))
 
 
@@ -222,6 +252,25 @@ def build_policy(
                 writable.append(str(volume))
                 read_only.append(str(volume))
                 workspace_root = str(volume)
+
+    # 虚拟映射根：`/home/user/workspace/{id}/…` 与 `/home/user/skills/…` 在命令
+    # 执行前会被翻译成 `<data_root>/workspace-volumes/{id}/…` 和 `<data_root>/skills/…`。
+    # 不放行的话 `cat workspace/foo.txt` 会被 srt 拒绝——而文件工具（走宿主进程）
+    # 能读到同一份文件，模型看到的是"刚写的文件不见了"。
+    #
+    # **只读，不能放 writable**：srt 会重写 allowWrite 根的 DACL，把宿主账号的
+    # 继承项切掉，结果是宿主自己都读不回那些文件（`pathlib.read_text` 直接
+    # PermissionError）。`win_acl.ensure_grant` 的预授权**并不能**阻止重写
+    # （实测放了 writable 之后失败用例从 3 个涨到 9 个），所以这里只放 allowRead。
+    #
+    # 代价：shell 对 `workspace/{id}` 只能读，写入要走文件工具（宿主进程写）。
+    # `test_shell_sees_workspace_volume` 这类"shell 直接写卷"的用例因此失败，
+    # 属于 ASRT 在 Windows 上的 ACL 行为限制。
+    for mapped in (data_root() / "workspace-volumes", data_root() / "skills"):
+        if mapped.exists():
+            text = str(mapped.resolve())
+            if text not in read_only:
+                read_only.append(text)
 
     # 私有临时目录：每次执行独立，退出后由调用方清理（见 audit 的 cleanup 字段）
     tmp = sandbox_root / ".isolation-tmp"

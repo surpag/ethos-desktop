@@ -27,6 +27,7 @@ from .internal import isolation as isolation_layer
 from .internal import log_context
 from .internal.agentrun import Dependencies, Service
 from .internal.agentrun.plan_tools import PlanToolSet
+from .internal.browser import BrowserService, BrowserToolSet, bind_browser_service
 from .internal.agentrun.run_plan import RunPlanRegistry
 from .internal.conversation import new_module as new_conversation_module
 from .internal.cronadapter import Adapter as CronAdapter
@@ -206,8 +207,21 @@ async def lifespan(app: FastAPI):
     cron_jobs = await new_cronjob_module(db, users.settings)
     images = await new_images_module(db, config.data_root() / "images")
 
+    # 浏览器工具只在桌面壳里真正可用：服务从 env 取 RPC 地址与令牌，
+    # 拿不到时 `enabled=False`，工具会明确返回「浏览器不可用」而不是假装成功。
+    browser_service = BrowserService()
+    browser_tools = BrowserToolSet(browser_service)
+    # 让 run 的 finally 能主动交还控制权（取消/异常路径同样生效）。
+    bind_browser_service(browser_service)
+
     tools = ToolRegistry(
-        [SystemToolSet(), sandbox_tools, cron_jobs.tools, PlanToolSet(run_plans, plan_store)]
+        [
+            SystemToolSet(),
+            sandbox_tools,
+            cron_jobs.tools,
+            PlanToolSet(run_plans, plan_store),
+            browser_tools,
+        ]
     )
     mcp_runtime = MCPRuntime(users.mcp)
 
@@ -277,6 +291,10 @@ async def lifespan(app: FastAPI):
         await scheduler_task
     except asyncio.CancelledError:
         pass
+
+    # httpx 连接池不关会在退出时打出 "Unclosed client" 警告；桌面壳那边 RPC 已经先关了，
+    # 这里只是把本地连接对象释放掉。
+    await browser_service.aclose()
     # 后台进程不随会话对象消失：run 结束不回收（`sandbox_start_process` 的语义就是
     # "长期进程"），但**后端退出必须一起带走**。否则它们成为没有主人的孤儿，
     # 继续占着工作区文件——Windows 上表现为"目录删不掉"，且没有任何界面能看见它们。

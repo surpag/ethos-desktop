@@ -33,7 +33,12 @@ from ..permissions.types import (
 )
 from ..session.store import SessionStore
 from ..skills.budget import bind_skill_load_budget, new_skill_load_budget
-from ..tools import tool_error_result
+from ..tools import (
+    redact_tool_input,
+    redact_tool_output,
+    tool_error_result,
+    tool_trace_scope,
+)
 from ..workspace.context import WorkspaceContext
 from ..trace import (
     DEGRADE_SUMMARY,
@@ -58,7 +63,7 @@ from .tool_result import (
 
 # 工具调用轮次上限：安全网而非调度器（正常任务不该撞到，仅异常循环时兜底）。
 # 耗尽时 end_reason=rounds_exhausted 且保持 task_status=in_progress，下次可续跑。
-MAX_TOOL_ROUNDS = int(os.getenv("EDITH_MAX_TOOL_ROUNDS", "30"))
+MAX_TOOL_ROUNDS = int(os.getenv("EDITH_MAX_TOOL_ROUNDS", "1000"))
 
 
 def elapsed_ms(started_at: float) -> int:
@@ -519,7 +524,9 @@ def _strip_plan_block(text: str) -> str:
     return text[:index]
 
 
-def _current_plan_block(plans: RunPlanRegistry | None, user_id: str, session_id: str) -> str:
+def _current_plan_block(
+    plans: RunPlanRegistry | None, user_id: str, session_id: str
+) -> str:
     """当前计划的渲染文本（没有活跃计划时为空串）。"""
     if plans is None:
         return ""
@@ -1034,7 +1041,9 @@ async def _compact_in_memory(
     kept_head: list[dict[str, Any]] = []
     for message in head:
         if is_summary_message(message):
-            old_summary = _strip_plan_block((message.get("content") or "").split("\n", 1)[-1])
+            old_summary = _strip_plan_block(
+                (message.get("content") or "").split("\n", 1)[-1]
+            )
         else:
             kept_head.append(message)
 
@@ -1441,9 +1450,7 @@ async def chat(
                     if first_content_ms is None:
                         first_content_ms = (time.monotonic() - call_started) * 1000
                     content_parts.append(delta.content)
-                    emit(
-                        decoder.content_delta("text", "message.delta", delta.content)
-                    )
+                    emit(decoder.content_delta("text", "message.delta", delta.content))
                     # 兼容openai
                 if getattr(delta, "tool_calls", None):
                     for tc in delta.tool_calls:
@@ -1587,9 +1594,7 @@ async def chat(
         # 有工具调用：发 tool.started，执行，发 tool.finished，回传结果继续循环
         ordered = [tool_calls[i] for i in sorted(tool_calls)]
         for tc in ordered:
-            emit(
-                decoder.tool_started(tc["id"], tc["name"], tc["arguments"])
-            )
+            emit(decoder.tool_started(tc["id"], tc["name"], tc["arguments"]))
 
         assistant_msg: dict[str, Any] = {"role": "assistant", "content": content}
         assistant_msg["tool_calls"] = [
@@ -1644,7 +1649,8 @@ async def chat(
             async with tracer.step(
                 TOOL_CALL,
                 name,
-                input=tc.get("arguments", ""),
+                # 入参进 trace 前脱敏：browser_fill 的 value 可能是密码或隐私输入。
+                input=redact_tool_input(name, tc.get("arguments", "")),
                 metadata={"source": source},
             ) as tool_step:
                 arguments, arguments_invalid = _parse_arguments(tc.get("arguments", ""))
@@ -1712,22 +1718,29 @@ async def chat(
                     name,
                     source,
                 )
+                # 工具自报的追踪字段（tab_id / action / observation_id / rpc_ms ...）。
+                # 走 ContextVar 旁路，不污染返回给模型的结果字符串。
+                tool_trace: dict[str, object] = {}
                 try:
                     if is_mcp:
                         result = await mcp_tools.execute(name, arguments)
                     elif tool_executor is not None:
                         # 透传当前会话 workspace_id，使 Sandbox 工具层能自动补全工作区路径；
                         # 同时透传本次执行的上下文快照，决定工作区路径的真实落点（S2）
-                        result = await tool_executor.execute(
-                            name,
-                            arguments,
-                            user_id,
-                            session_id,
-                            workspace_id_arg,
-                            context=workspace_context,
-                            # 审计归属：哪条 tool_call 触发了哪次执行
-                            tool_call_id=str(tc.get("id") or ""),
-                        )
+                        with tool_trace_scope() as tool_trace:
+                            result = await tool_executor.execute(
+                                name,
+                                arguments,
+                                user_id,
+                                session_id,
+                                workspace_id_arg,
+                                context=workspace_context,
+                                # 审计归属：哪条 tool_call 触发了哪次执行
+                                tool_call_id=str(tc.get("id") or ""),
+                                # 控制权归属（阶段 6）：哪个 run 在操作浏览器。
+                                # 浏览器之外的工具集接收但不使用。
+                                request_id=request_id,
+                            )
                     else:
                         result = json.dumps(
                             {
@@ -1743,12 +1756,23 @@ async def chat(
                         "tool_call_error request_id=%s tool_name=%s", request_id, name
                     )
                     result = tool_error_result(name, exc)
+                if tool_trace:
+                    # 身份字段在 trace 顶层已有（traces.request_id / session_id），
+                    # 这里再落到步骤 metadata 是为了「只查 trace_steps 也能还原一次
+                    # 浏览器操作链」，不必每次都 join 回 traces 表。
+                    tool_trace.setdefault("run_id", request_id)
+                    tool_trace.setdefault("session_id", session_id)
+                    tool_trace.setdefault("tool_call_id", str(tc.get("id") or ""))
+                    tool_step.metadata.update(tool_trace)
                 if cache_key:
                     read_cache[cache_key] = result
-                # trace 保留原始结果（审计/排障要看真东西），模型历史用定型版本
-                tool_step.output = result
+                # trace 用脱敏摘要：保留可还原操作链的字段（tab/action/obs/status/error），
+                # 去掉快照明细与用户填写的表单内容。模型历史仍用原始 result。
+                tool_step.output = redact_tool_output(name, result)
                 materialized = materialize_tool_result(
-                    name, result, is_error=kind_status(_parse_result_kind(result)) == "failed"
+                    name,
+                    result,
+                    is_error=kind_status(_parse_result_kind(result)) == "failed",
                 )
                 _record_materialize(tool_step, materialized)
                 return (

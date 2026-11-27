@@ -19,6 +19,7 @@ from openai import AsyncOpenAI
 
 from ..agentstream.outcome import derive_outcome
 from ..agentstream.types import APIError, Event, SessionUsage
+from ..browser import release_browser_control
 from ..models.catalog import DEFAULT_MODEL_ID, Catalog, ModelDefinition
 from ..permissions.chain import resolve_effective_level
 from ..session.approval_store import ApprovalStore
@@ -762,6 +763,9 @@ class Service:
                 )
             )
         finally:
+            # 先交还浏览器控制权：run 结束（完成/取消/异常）后，别的任务不该再等
+            # 20s 租约过期才能操作页面。失败由 runtime 吞掉，不影响终态。
+            await release_browser_control(request.request_id)
             if mcp_tools is not None:
                 await mcp_tools.close()
             # 计划生命周期跟着 run 走：无论正常收尾、取消还是异常，都要关掉，

@@ -63,6 +63,22 @@ TOOL_CAPABILITIES: dict[str, frozenset[Capability]] = {
     "create_cron_job": _F({Capability.WRITE, Capability.EXTERNAL}),
     # ---- plan ----
     "plan_update": _F({Capability.METADATA}),
+    # ---- browser ----
+    # 导航与点击/填写会改变外部站点的状态（提交表单、下单、发消息），效果不在本次
+    # run 的边界内，所以是 EXTERNAL 而不是 WRITE（本地一个字节都没动）。
+    "browser_open_url": _F({Capability.EXTERNAL}),
+    "browser_click": _F({Capability.EXTERNAL}),
+    "browser_fill": _F({Capability.EXTERNAL}),
+    "browser_press": _F({Capability.EXTERNAL}),
+    # 下面三个是「看」，但**不能声明成纯 READ**：只读工具会进 run 级结果缓存
+    # （key = 工具名 + 参数），`browser_get_page_snapshot` 第二次以 `{}` 调用会命中
+    # 缓存、拿回上一份已经过期的 observation_id，紧接着的点击必然失败。
+    # 加 METADATA 让它不进只读缓存，同时在只读档/审批档仍然放行。
+    "browser_get_page_snapshot": _F({Capability.READ, Capability.METADATA}),
+    "browser_get_url": _F({Capability.READ, Capability.METADATA}),
+    # 滚动只改视口，但会触发懒加载（出网）。按 READ 处理是明示取舍：
+    # 若算 EXTERNAL，审批档下每滚一屏都要用户点一次确认。
+    "browser_scroll": _F({Capability.READ, Capability.METADATA}),
 }
 
 

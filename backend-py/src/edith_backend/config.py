@@ -116,3 +116,24 @@ def runtime_token() -> str:
     桌面壳与生产部署必须注入。空值不静默降级成某个内置默认值——那等于没有令牌。
     """
     return os.getenv("EDITH_RUNTIME_TOKEN", "").strip()
+
+
+def browser_rpc_url() -> str:
+    """内置浏览器的 RPC 地址（由桌面壳启动时注入，形如 `http://127.0.0.1:<port>`）。
+
+    **为什么是「后端当客户端」**：浏览器的真实资源是 Electron 主进程里的
+    `WebContentsView`，只能在主进程里操作；后端拿到的只是一个受控的 HTTP 入口。
+    没有注入时返回空串——非桌面模式（`uv run edith-backend`）下浏览器工具一律不可用，
+    而不是退化成一个假的浏览器。
+    """
+    return os.getenv("ETHOS_BROWSER_RPC_URL", "").strip()
+
+
+def browser_rpc_token() -> str:
+    """浏览器 RPC 的令牌。
+
+    与 `runtime_token()` **刻意不同**：这个令牌只允许操作浏览器，拿到它也调不了
+    会话、文件、工具等内部接口。两个令牌复用等于把浏览器能力提权成全部内部能力。
+    空串同样表示不启用，由调用方显式报「浏览器不可用」。
+    """
+    return os.getenv("ETHOS_BROWSER_RPC_TOKEN", "").strip()

@@ -538,6 +538,7 @@ class SandboxToolSet:
         workspace_id: str = "",
         context: WorkspaceContext | None = None,
         tool_call_id: str = "",
+        request_id: str = "",  # 仅接口兼容（ToolRegistry 统一透传），沙箱不使用
     ) -> str:
         """统一执行入口（附带审计绑定）。
 
@@ -981,7 +982,9 @@ class SandboxToolSet:
             background=True,
         )
         pid = handle.pid if hasattr(handle, "pid") else 0
-        return {"pid": pid, "logPath": ""}
+        # 后台进程的输出落到沙箱内的日志文件。服务没起来时模型得先能看见它的
+        # 报错——否则只能靠猜，而"进程起了又没了"极容易被误判成权限/配置问题。
+        return {"pid": pid, "logPath": getattr(handle, "log_path", "") or ""}
 
     async def _op_sandbox_list_processes(self, sandbox: LocalSandbox, args: dict) -> dict:
         processes = await sandbox.commands.list()

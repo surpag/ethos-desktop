@@ -47,6 +47,8 @@ from edith_backend.internal.permissions.types import (
     Capability,
     PermissionLevel,
 )
+from edith_backend.internal.browser.service import BrowserService
+from edith_backend.internal.browser.tools import BrowserToolSet
 from edith_backend.internal.sandbox.local import LocalSandbox
 from edith_backend.internal.sandbox.tools import SandboxToolSet
 from edith_backend.internal.systemtools import SystemToolSet
@@ -68,6 +70,9 @@ def _all_tool_names() -> set[str]:
         SandboxToolSet(None),
         CronToolSet(None),
         PlanToolSet(None, None),
+        # 浏览器工具集不依赖外部资源：服务对象构造不连 RPC（懒连接），
+        # 这里只需要拿到它的工具定义。
+        BrowserToolSet(BrowserService()),
     ]
     return {d["function"]["name"] for s in sets for d in s.tool_definitions()}
 

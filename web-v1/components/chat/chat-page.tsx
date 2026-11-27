@@ -1,9 +1,11 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { PanelRightClose, PanelRightOpen } from "lucide-react";
+import { Globe, PanelRightClose, PanelRightOpen } from "lucide-react";
 
 import { AccountMenu } from "@/components/account-menu";
+import { BrowserPanel } from "@/components/browser/browser-panel";
+import { getBrowserBridge } from "@/lib/browser/bridge";
 import { AppSidebar } from "@/components/app-sidebar";
 import { SettingsDialog } from "@/components/settings/settings-dialog";
 import { emptySessionUsage } from "@/lib/chat/type";
@@ -209,6 +211,23 @@ export function ChatPage() {
   const [reasoningOptionID, setReasoningOptionID] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sandboxOpen, setSandboxOpen] = useState(false);
+  // 浏览器面板与 Sandbox 面板共用右侧槽位：同时打开时原生网页视图会盖住文件树，
+  // 所以两者互斥。面板显隐的单一真相源在这里（主进程只发快捷键事件，不存状态）。
+  const [browserOpen, setBrowserOpen] = useState(false);
+
+  // Ctrl+Shift+B：主进程只通知，不决定显隐。
+  useEffect(() => {
+    const bridge = getBrowserBridge();
+    if (!bridge) return;
+    // 快捷键同样要遵守「与 Sandbox 面板互斥」：只翻转 browserOpen 会让两个面板
+    // 同时占着右侧槽位，原生网页视图会盖住文件树。
+    // `setSandboxOpen(false)` 放在 updater 外面：updater 必须是纯函数（StrictMode 会
+    // 双调用），在里面改另一个 state 属于副作用。
+    return bridge.onToggleRequest(() => {
+      setBrowserOpen((current) => !current);
+      setSandboxOpen(false);
+    });
+  }, []);
   // 提示也按会话分槽：原来只有一个槽位，两个会话同时断流时后一个会覆盖前一个，
   // 被覆盖的那个会话就变成「看起来正常、其实没连上」。
   const [sessionRunNotices, setSessionRunNotices] = useState<Record<string, TimelineRunNotice>>({});
@@ -1107,7 +1126,21 @@ export function ChatPage() {
             <SessionUsageView menuPosition="down" usage={activeSession.usage} />
             <button
               className="ui-icon-button"
-              onClick={() => setSandboxOpen((current) => !current)}
+              onClick={() => {
+                setSandboxOpen(false);
+                setBrowserOpen((current) => !current);
+              }}
+              title={browserOpen ? "收起内置浏览器" : "展开内置浏览器"}
+              aria-label={browserOpen ? "收起内置浏览器" : "展开内置浏览器"}
+            >
+              <Globe className={browserOpen ? "size-5 text-accent" : "size-5"} />
+            </button>
+            <button
+              className="ui-icon-button"
+              onClick={() => {
+                setBrowserOpen(false);
+                setSandboxOpen((current) => !current);
+              }}
               title={sandboxOpen ? "关闭 Sandbox 文件" : "展开 Sandbox 文件"}
               aria-label={sandboxOpen ? "关闭 Sandbox 文件" : "展开 Sandbox 文件"}
             >
@@ -1164,6 +1197,12 @@ export function ChatPage() {
         sessionID={activeSession.id}
         workspaceId={activeWorkspaceID}
         open={sandboxOpen}
+      />
+
+      <BrowserPanel
+        open={browserOpen}
+        suspended={settingsOpen}
+        onClose={() => setBrowserOpen(false)}
       />
 
       <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />

@@ -273,7 +273,10 @@ def plan(
                 detail=f"敏感目录 ACL 校验失败：{acl_detail}",
             )
             raise SandboxUnavailable(
-                f"敏感目录 ACL 校验失败，命令已拒绝执行：{acl_detail}",
+                f"敏感目录 ACL 校验失败，命令已拒绝执行：{acl_detail}\n"
+                "若取不到沙箱账户 SID（srt-sandbox 不存在），重跑一次 "
+                "`npx @anthropic-ai/sandbox-runtime windows-install`（UAC 一次）"
+                "后**重启应用**。",
                 reason=SandboxUnavailable.INIT_FAILED,
             )
 
@@ -369,7 +372,14 @@ def plan(
     return plan_
 
 
-def finish(plan_: ExecPlan, *, exit_code: int, duration_ms: float, outcome: str) -> None:
+def finish(
+    plan_: ExecPlan,
+    *,
+    exit_code: int,
+    duration_ms: float,
+    outcome: str,
+    keep_script: bool = False,
+) -> None:
     audit.record_finish(
         backend=plan_.backend,
         command=plan_.command,
@@ -377,6 +387,12 @@ def finish(plan_: ExecPlan, *, exit_code: int, duration_ms: float, outcome: str)
         duration_ms=duration_ms,
         outcome=outcome,
     )
+    # 后台进程必须 `keep_script=True`：srt 是 `bash <script>` 跑的，启动成功那一刻
+    # 就把脚本删掉，bash 会立刻报 "No such file or directory" 退出——现象是
+    # `start_process` 返回了 pid，随后 `list_processes` 空、端口从未监听。
+    # 这类进程的脚本要等它真正退出后再删。
+    if keep_script:
+        return
     # 命令脚本只在本次执行期间有意义；留着等于把用户命令长期写在沙箱树里
     if plan_.script_path:
         try:

@@ -126,6 +126,8 @@ class LocalCommandInfo:
     args: list[str] = field(default_factory=list)
     cwd: str = ""
     tag: str = ""
+    #: 后台进程的 stdout/stderr 落盘位置（沙箱虚拟路径）。空表示未采集。
+    log_path: str = ""
 
 
 def sandbox_root_for(user_id: str, session_id: str) -> Path:
@@ -1120,10 +1122,20 @@ class LocalCommands:
         argv, env = exec_plan.argv, exec_plan.env
         started = time.monotonic()
 
-        async def _finish(exit_code: int, outcome: str, pid: int | None = None) -> None:
+        async def _finish(
+            exit_code: int,
+            outcome: str,
+            pid: int | None = None,
+            *,
+            keep_script: bool = False,
+        ) -> None:
             duration_ms = (time.monotonic() - started) * 1000
             isolation.finish(
-                exec_plan, exit_code=exit_code, duration_ms=duration_ms, outcome=outcome
+                exec_plan,
+                exit_code=exit_code,
+                duration_ms=duration_ms,
+                outcome=outcome,
+                keep_script=keep_script,
             )
             # 审计落库：await 而不是 fire-and-forget，避免 run 结束/取消时把任务
             # 一起取消掉（那会留下"执行过但没有记录"的空洞）。
@@ -1136,7 +1148,8 @@ class LocalCommands:
             )
 
         if background:
-            proc = await self._spawn(argv, work_dir, env, devnull=True)
+            log_path = self.background_log_path()
+            proc = await self._spawn(argv, work_dir, env, log_path=log_path)
             assert proc.pid is not None
             # 登记到**模块级台账**：下一次工具调用是新实例，只有台账能看见它。
             # `cmd` 存原始命令（翻译前的写法），`cwd` 存虚拟路径——工具结果会
@@ -1157,12 +1170,26 @@ class LocalCommands:
                 raise
             # 必须有人 wait：否则 POSIX 上每次启动都留一个 zombie，且 transport
             # 会活过事件循环、GC 时对已失效的句柄报警。台账不持有 Process，
-            # 回收责任交给这个后台 task。
-            process_registry.reap(proc)
-            await _finish(0, "started", proc.pid)
-            return LocalCommandInfo(pid=proc.pid, cmd=cmd, cwd=self._sb.virtual(work_dir))
+            # 回收责任交给这个后台 task。进程真正退出后再收尾删脚本。
+            process_registry.reap(
+                proc,
+                on_exit=lambda: isolation.finish(
+                    exec_plan, exit_code=0, duration_ms=0.0, outcome="exited"
+                ),
+            )
+            # **必须 `keep_script=True`**：脚本是 srt 的运行入口（`bash <script>`），
+            # 启动成功就删会在几十毫秒内把它掐死。以前的表现是"返回了 pid，
+            # 随后 list_processes 空、端口从未监听"，而日志里只有一行
+            # `bash: ...isolation-cmd/xxx.sh: No such file or directory`。
+            await _finish(0, "started", proc.pid, keep_script=True)
+            return LocalCommandInfo(
+                pid=proc.pid,
+                cmd=cmd,
+                cwd=self._sb.virtual(work_dir),
+                log_path=self._sb.virtual(log_path),
+            )
 
-        proc = await self._spawn(argv, work_dir, env, devnull=False)
+        proc = await self._spawn(argv, work_dir, env, log_path=None)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except (asyncio.TimeoutError, TimeoutError):
@@ -1327,18 +1354,56 @@ class LocalCommands:
         work_dir: Path,
         env: dict[str, str],
         *,
-        devnull: bool,
+        log_path: Path | None,
     ) -> asyncio.subprocess.Process:
-        kwargs: dict[str, Any] = {
-            "cwd": str(work_dir),
-            "env": env,
-            "stdout": asyncio.subprocess.DEVNULL if devnull else asyncio.subprocess.PIPE,
-            "stderr": asyncio.subprocess.DEVNULL if devnull else asyncio.subprocess.PIPE,
-            **self._spawn_kwargs(),
-        }
-        if isinstance(argv, list):
-            return await asyncio.create_subprocess_exec(*argv, **kwargs)
-        return await asyncio.create_subprocess_shell(argv, **kwargs)
+        """启动子进程。
+
+        `log_path is None` → 走 PIPE（前台，调用方要读 stdout/stderr）。
+        否则两路输出**写文件**，而不是 `DEVNULL`。
+
+        **为什么后台不能用 `DEVNULL`**：实测 `sandbox_start_process("python app.py")`
+        返回了 pid、登记也成功，但 `list_processes` 立刻是空的、端口从未监听。
+        同一份 argv 改成 PIPE 或文件重定向就能稳定存活 45s 以上。DevNull 在
+        Proactor 上给子进程的是 NUL 句柄，srt 启动时拿不到可用的 stdout 就直接
+        退出了——它不会报错，所以现象是"起了又没了"。
+
+        写文件顺带解决第二个问题：后台服务的日志以前被完全丢弃，模型排查时
+        没有任何线索（这次的 Flask 启动失败正是因为看不到日志而绕了很久）。
+        """
+        handle = None
+        if log_path is not None:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(log_path, "wb")
+            kwargs: dict[str, Any] = {
+                "cwd": str(work_dir),
+                "env": env,
+                "stdout": handle,
+                "stderr": asyncio.subprocess.STDOUT,
+                **self._spawn_kwargs(),
+            }
+        else:
+            kwargs = {
+                "cwd": str(work_dir),
+                "env": env,
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+                **self._spawn_kwargs(),
+            }
+        try:
+            if isinstance(argv, list):
+                return await asyncio.create_subprocess_exec(*argv, **kwargs)
+            return await asyncio.create_subprocess_shell(argv, **kwargs)
+        finally:
+            # 创建完成后子进程已持有自己的句柄副本，父进程这侧必须关掉，
+            # 否则文件一直占着，用户/其它工具读不到最新内容。
+            if handle is not None:
+                handle.close()
+
+    def background_log_path(self) -> Path:
+        """后台进程日志文件的位置（每次启动一个新文件）。"""
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        unique = time.time_ns() % 1_000_000
+        return self._sb.root / ".isolation-logs" / f"{stamp}-{unique:06d}.log"
 
     async def list(self) -> list[LocalCommandInfo]:
         """本会话存活的后台进程（含**其它工具调用实例**启动的）。

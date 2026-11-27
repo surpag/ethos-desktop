@@ -4,6 +4,9 @@ import path from "node:path";
 
 import { BrowserWindow, Menu, Tray, app, dialog, nativeImage, shell } from "electron";
 
+import { BrowserManager } from "./main/browser/browser-manager";
+import { registerBrowserIpc } from "./main/browser/browser-ipc";
+import { startBrowserRpcServer, type BrowserRpcHandle } from "./main/browser/browser-rpc-server";
 import { backendDir, pythonExecutable, trayIconPath, webStandaloneDir } from "./paths";
 import {
   ChildRegistry,
@@ -32,6 +35,14 @@ let webUrl = "";
 let shuttingDown = false;
 /** 服务与窗口都就绪之后才为 true：启动期的失败由 bootstrap 的 catch 统一报，避免双弹窗。 */
 let ready = false;
+/**
+ * 内置浏览器。阶段 2：多标签页 + preload 桥 + 由渲染进程量出视口矩形。
+ * 管理器绑定在具体窗口实例上，窗口被销毁重建时必须跟着重建（`attachBrowser`）。
+ */
+let browser: BrowserManager | null = null;
+let browserIpcDispose: (() => void) | null = null;
+/** Python 后端操作浏览器的唯一入口；端口+令牌随启动生成，退出即失效。 */
+let browserRpc: BrowserRpcHandle | null = null;
 
 function createWindow(url: string): BrowserWindow {
   const win = new BrowserWindow({
@@ -67,8 +78,41 @@ function createWindow(url: string): BrowserWindow {
     return { action: "deny" };
   });
 
+  // Ctrl+Shift+B 切换浏览器面板。
+  //
+  // 这里只**通知**渲染进程，不直接改主进程状态：面板显隐的单一真相源在 React
+  // （用户也可能点工具栏按钮收起）。主进程若自己也存一份「是否打开」，两边迟早不一致。
+  //
+  // 用快捷键而不是应用菜单：菜单被 `autoHideMenuBar` 藏起来，用户找不到。
+  // 不用 `globalShortcut`：那会抢走系统级按键，且应用隐藏到托盘后依然生效。
+  win.webContents.on("before-input-event", (event, input) => {
+    if (input.type !== "keyDown") return;
+    if (!input.control || !input.shift) return;
+    if (input.key.toLowerCase() !== "b") return;
+    event.preventDefault();
+    if (!win.isDestroyed()) win.webContents.send("browser:toggle-request");
+  });
+
   void win.loadURL(url);
   return win;
+}
+
+/**
+ * 把浏览器管理器与 IPC 绑到指定窗口。
+ *
+ * 窗口销毁重建时必须重跑：`contentView` 与 `webContents` 都是**窗口级**对象，
+ * 旧管理器手里只有一个 `isDestroyed()` 为 true 的引用，继续用会静默失效
+ * （所有命令都被来源校验挡掉，UI 看起来就是「点了没反应」）。
+ */
+function attachBrowser(win: BrowserWindow): void {
+  browserIpcDispose?.();
+  browserIpcDispose = null;
+  browser?.dispose();
+  const manager = new BrowserManager(win);
+  browser = manager;
+  browserIpcDispose = registerBrowserIpc(win, manager);
+  // RPC 服务在 backend 启动前就已监听，这里把真正的管理器接上。
+  browserRpc?.attach(manager);
 }
 
 function showWindow(): void {
@@ -76,7 +120,9 @@ function showWindow(): void {
   // 重新按同一个 URL 建一个，而不是对着一个空引用调 show。
   if (!window || window.isDestroyed()) {
     if (!webUrl) return;
-    window = createWindow(webUrl);
+    const win = createWindow(webUrl);
+    window = win;
+    attachBrowser(win);
     return;
   }
   if (window.isMinimized()) window.restore();
@@ -149,6 +195,12 @@ async function startServices(): Promise<string> {
   // 遮挡而不是边界；令牌把「连得上」与「被允许调用」分开。不落盘：重启即换。
   const runtimeToken = randomBytes(32).toString("hex");
 
+  // 浏览器 RPC 必须比 backend 先起：端口与令牌要写进后端子进程的 env，
+  // 后端启动时才能连上。此时浏览器管理器还不存在（窗口还没建），
+  // 服务先挂空挡，所有方法返回 browser_not_ready，`attachBrowser()` 之后再接上。
+  browserRpc?.dispose();
+  browserRpc = await startBrowserRpcServer();
+
   // 启动期任何一个子进程挂掉都意味着起不来了：用它中断 waitForHttp 的等待，
   // 不必等满 60 秒超时。失败最终由 bootstrap 的 catch 弹一次框。
   const startupAbort = new AbortController();
@@ -174,6 +226,11 @@ async function startServices(): Promise<string> {
         ETHOS_DESKTOP: "1",
         ETHOS_DATA_DIR: dataDir,
         EDITH_RUNTIME_TOKEN: runtimeToken,
+        // 浏览器 RPC 的令牌与 Runtime 令牌**刻意不同**：前者只允许操作浏览器，
+        // 后者能访问全部内部接口；混用一个等于把「网页操作」提权成「全部内部 API」。
+        ...(browserRpc
+          ? { ETHOS_BROWSER_RPC_URL: browserRpc.url, ETHOS_BROWSER_RPC_TOKEN: browserRpc.token }
+          : {}),
         PYTHONPATH: path.join(backendDir(), "src"),
         PYTHONUNBUFFERED: "1",
         PYTHONIOENCODING: "utf-8",
@@ -217,6 +274,17 @@ async function startServices(): Promise<string> {
 }
 
 async function shutdown(): Promise<void> {
+  // 浏览器视图挂在主窗口上，必须在窗口销毁之前摘掉：contentView 持有已关闭
+  // webContents 的子视图时，Electron 退出阶段会打析构警告，甚至卡住退出。
+  // 顺序放在最前面，因为它不依赖任何子进程。
+  // 先关 RPC：它可能在等一个正在处理的导航，晚关会让退出卡在 keep-alive 上。
+  browserRpc?.dispose();
+  browserRpc = null;
+  browserIpcDispose?.();
+  browserIpcDispose = null;
+  browser?.dispose();
+  browser = null;
+
   // 先停 web 再停 backend：web 仍可能持有进行中的 SSE 连接，
   // 反过来会让后端在关闭时打印一堆客户端断开错误。
   await web?.stop();
@@ -228,7 +296,10 @@ async function shutdown(): Promise<void> {
 async function bootstrap(): Promise<void> {
   try {
     webUrl = await startServices();
-    window = createWindow(webUrl);
+    const win = createWindow(webUrl);
+    window = win;
+    // 浏览器必须在窗口建好之后初始化：视图要挂到 win.contentView 上。
+    attachBrowser(win);
     tray = createTray();
     ready = true;
   } catch (error) {

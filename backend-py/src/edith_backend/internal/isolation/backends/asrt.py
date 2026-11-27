@@ -177,15 +177,33 @@ def srt_win_exe(srt_exe: str | Path) -> Path | None:
     return None
 
 
+def acl_recovery_hint() -> str:
+    """ACL 状态**确实**卡死时的恢复动作。
+
+    先决条件必须写清楚：首次验证要 `acl grant --persistent`，本身就是 20s 以上的
+    正常开销（实测 23.8s vs 授权建好后的 3.9s）。误把"慢"当成"卡死"去 `acl forget`，
+    会清掉已经建好的授权——下一次又要重慢一遍，于是"偶尔慢"被改造成"永远慢"，
+    用户只能反复重装。所以这条只给"每条命令都停在初始化、持续多轮"的场景。
+
+    **必须带"重启应用"**：`manager._failure` 把探测失败缓存在进程内，只执行
+    `acl forget` 而不重启，用户仍然会收到同一条错误。
+    """
+    return (
+        "# 仅当**每条命令都**停在初始化、且持续多轮时才做下面这步"
+        "（首次慢 20s 属于建授权的正常开销，不要清）：\n"
+        "# 用**管理员**终端执行一次\n"
+        "  <node 全局目录>\\@anthropic-ai\\sandbox-runtime\\vendor\\srt-win\\x64\\srt-win.exe "
+        "acl forget --all --force\n"
+        "# 然后**重启应用**（探测结果在进程内缓存，不重启会一直报同一条错误）。"
+    )
+
+
 def install_hint() -> str:
     """给用户看的安装指引（tool 错误信息里直接用这段）。"""
     return (
         "安装并初始化 ASRT 后重试：\n"
         "  npm i -g @anthropic-ai/sandbox-runtime\n"
         "  npx @anthropic-ai/sandbox-runtime windows-install   # Windows：UAC 一次，创建本地账户 + WFP 过滤\n"
-        "# 若之前**反复超时**过（尤其命令被强制结束），srt 的 ACL 状态会卡在死循环里，\n"
-        "# 之后每条命令都停在初始化。用**管理员**终端执行一次即可恢复：\n"
-        "  <node 全局目录>\\@anthropic-ai\\sandbox-runtime\\vendor\\srt-win\\x64\\srt-win.exe "
-        "acl forget --all --force\n"
+        f"{acl_recovery_hint()}\n"
         "注意：沙箱不可用时命令会被**拒绝**执行，不会回落到宿主直接运行。"
     )

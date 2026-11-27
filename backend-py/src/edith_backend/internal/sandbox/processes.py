@@ -12,7 +12,9 @@ loop"（`LocalCommands._kill_tree` 里那条 `RuntimeError` 分支就是为此�
 终结进程本来就不需要它：`taskkill /T /F`（Windows）与 `killpg`（POSIX）只认 pid，
 而且能带走整棵子进程树。反过来，**持有它会让对象活过事件循环**：GC 落在循环
 关闭之后时，`Popen.__del__` 拿到的是已失效的句柄（WinError 6），只能打一条
-无用的警告。登记完就放手——后台进程的输出走 DEVNULL，与父进程的管道已经解耦。
+无用的警告。登记完就放手——后台进程的输出重定向到日志文件（不是 DEVNULL：
+DevNull 在 Proactor 上会让 srt 启动即退出，见 `LocalCommands._spawn`），父进程
+不持有任何管道，容器退出也不影响子进程继续写。
 
 **归属是 `(user_id, session_id)`，不是 run。** run 结束**不**回收：`sandbox_start_process`
 的语义就是"长期进程"，跑完一轮对话就杀掉等于让 dev server 不可用。回收点只有两个：
@@ -39,6 +41,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from . import process_store
@@ -1141,27 +1144,39 @@ registry = BackgroundRegistry()
 _reapers: set[asyncio.Task] = set()
 
 
-async def _wait_quietly(proc: object) -> None:
+async def _wait_quietly(proc: object, on_exit: Callable[[], None] | None = None) -> None:
+    exited = False
     try:
         await proc.wait()  # type: ignore[attr-defined]
+        exited = True
     except asyncio.CancelledError:
         raise
     except (RuntimeError, OSError):
         # 跨事件循环 / 句柄已失效：这个对象已经不代表进程了，忽略即可。
         pass
+    # 只有**确认退出**才回调：取消不代表进程死了，那时删掉它的启动脚本
+    # 等于把还在跑的服务掐掉。
+    if exited and on_exit is not None:
+        try:
+            on_exit()
+        except Exception:  # pragma: no cover - 收尾失败不影响业务
+            logger.debug("background_on_exit_failed", exc_info=True)
 
 
-def reap(proc: object) -> None:
+def reap(proc: object, on_exit: Callable[[], None] | None = None) -> None:
     """后台监听进程退出。
 
-    目的不是拿退出码（台账只认 pid），而是修两个真实问题：
+    目的不是拿退出码（台账只认 pid），而是修三个真实问题：
 
     1. POSIX 上父进程不 `wait` 会留下 zombie，进程数随会话增长；
     2. `asyncio.Process` 的 transport 只有在 `wait()` 返回后才正常收尾。不等待的
        话对象会活过事件循环，GC 时拿着已失效的句柄报警（WinError 6）——
-       这正是旧实现只留一个字典、没有 `_reap` 所留下的空洞。
+       这正是旧实现只留一个字典、没有 `_reap` 所留下的空洞；
+    3. `on_exit`：后台进程的命令脚本必须等它退出后才能删（启动期间删会让
+       bash 立刻报 "No such file or directory" 退出）。放在这里是因为这个 task
+       由 `_reapers` 持有，不会因为没人引用而被 GC 掉。
     """
-    task = asyncio.ensure_future(_wait_quietly(proc))
+    task = asyncio.ensure_future(_wait_quietly(proc, on_exit))
     _reapers.add(task)
     task.add_done_callback(_reapers.discard)
 

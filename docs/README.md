@@ -22,6 +22,8 @@
 | `permissions-p2-approval.md` | 权限系统 P2-2/P2-3：审批挂起/恢复的终止路径枚举、为什么是原地等待、授权范围与风险；§14 含前端审批面板与档位开关 |
 | `permissions-p4-project.md` | 项目级档位：**覆盖**用户级（不是上限）、为什么能放宽、与定时任务快照的关系、取不到数的三种情况与边界 |
 | `workspace-local-root-p0-preplan.md` | 工作区 local_root 补绑定 pre-plan：只读核验 + junction/MSYS 实测、`resolve()` 判定缺陷（比较前只解析了一侧）、宿主路径泄漏、P0 范围与验收表。§11.8 是实施记录：**路径契约阶段已完成，沙箱层接入（命令/Git）尚未开始** |
+| `design/browser-architecture.md` | 内置浏览器与 Browser Agent：阶段 0 技术设计（对方案的 7 处修正）+ 阶段 3~8 实施记录（工具注册、快照/ref、预算分页、控制权、下载策略、Trace/E2E）。§13 起是逐阶段验证数据 |
+| `design/browser-model-tasks.md` | 阶段 8 的五组真实模型任务：发送话术、期望轨迹、A/B/C 判定与记录表。**尚未运行**（无模型凭据），阶段结论按 PARTIAL |
 
 `archive/` 存的是 2026-11-12 之前的设计稿。它们大多描述的是「云端多租户 Agent
 平台」这条路线，而桌面版走的是相反方向：单用户、本机执行、无远端沙箱、无对象
